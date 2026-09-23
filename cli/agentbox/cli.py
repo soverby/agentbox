@@ -11,11 +11,13 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import (
@@ -32,6 +34,7 @@ from . import (
     network,
     paths,
     presets,
+    schedule,
     secretstore,
     term,
 )
@@ -44,6 +47,7 @@ from .profile import (
     CLAUDE_TOKEN,
     PROFILE_NAME_RE,
     ProfileError,
+    code_mount_problem,
     load_profile,
     parse_profile,
     secret_name_problem,
@@ -133,6 +137,7 @@ def cmd_up(args) -> int:
     b = boxmod.load(resolve(args.profile))
     with boxmod.session_lock(b):
         ensure_up(b, args.accept_mount_change, explicit=True)
+        boxmod.pin(b)
     print(f"{b.name}: up ({b.project})")
     return 0
 
@@ -163,6 +168,7 @@ def cmd_ls(args) -> int:
 def session(b: boxmod.Box, cmd: list[str], env: dict[str, str] | None = None) -> int:
     with boxmod.session_lock(b):
         ensure_up(b)
+        boxmod.pin(b)
         wd = launch.container_workdir(b.profile, os.getcwd())
         argv = launch.exec_argv(b.project, str(b.compose_file), wd, cmd, is_tty(), env)
         return subprocess.call(argv)
@@ -182,25 +188,60 @@ def cmd_agent(args) -> int:
 
 def cmd_run(args) -> int:
     b = boxmod.load(args.profile)
-    prompt_file = Path(args.prompt_file)
+    timeout = schedule.parse_timeout(args.timeout) if args.timeout else None
+    rc, rd = run_headless(b, args.agent, Path(args.prompt_file), args.model, os.getcwd(),
+                          timeout=timeout)  # fmt: skip
+    print(term.clean(f"run: {rd} (exit {rc})"))
+    return rc
+
+
+Terminated = schedule.Terminated
+RC_TIMEOUT = 124
+RC_TERMINATED = 143
+
+
+def kill_run(b: boxmod.Box, run_id: str, proc: subprocess.Popen) -> None:
+    """Kill the `docker compose exec` client and the run's processes in the box."""
+    with contextlib.suppress(Exception):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        boxmod.dc(b, "exec", "-T", "agent", "sh", "-c", runsmod.kill_script(run_id),
+                  check=False, timeout=60)  # fmt: skip
+
+
+def run_headless(
+    b: boxmod.Box,
+    agent: str,
+    prompt_file: Path,
+    model: str | None,
+    host_dir: str,
+    made: list[Path] | None = None,
+    timeout: float | None = None,
+) -> tuple[int, Path]:
+    """`run` bookkeeping; `made` gets the run dir as soon as it exists.
+    Always ends with stop_if_idle (a pinned box stays up)."""
     try:
         prompt = prompt_file.read_bytes()
     except OSError as e:
         raise CliError(f"cannot read prompt file: {e}") from None
-    route = launch.parse_model(b.profile, args.model)
-    ln = launch.agent_launch(b.profile, args.agent, [], headless=True, model=route)
+    route = launch.parse_model(b.profile, model)
+    ln = launch.agent_launch(b.profile, agent, [], headless=True, model=route)
     argv = ln.argv
-    rd = runsmod.new_run_dir(b.state / "runs", args.agent)
+    rd = runsmod.new_run_dir(b.state / "runs", agent)
+    if made is not None:
+        made.append(rd)
+    runsmod.prune(b.state / "runs", b.cfg.runs_keep, current=rd)
     meta = {
         "profile": b.name,
-        "agent": args.agent,
-        "model": args.model,
+        "agent": agent,
+        "model": model,
         "argv": argv,
         "env": ln.env,
         "prompt": "stdin",
         "prompt_file": str(prompt_file.resolve()),
         "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
         "started": datetime.now(UTC).isoformat(timespec="seconds"),
+        "timeout": timeout,
     }
     transcript = runsmod.transcript_path(rd)
     rc = 125  # the box could not start / the run did not happen
@@ -208,36 +249,68 @@ def cmd_run(args) -> int:
     with boxmod.session_lock(b):
         was_running = boxmod.is_running(b)
         meta["box_was_running"] = was_running
+        if not was_running:  # a pin from an earlier `up` no longer describes this box
+            (b.state / boxmod.PIN_FILE).unlink(missing_ok=True)
         try:
             try:
                 ensure_up(b)
             except Exception as e:
                 transcript.write_text(f"agentbox: box start failed: {e}\n")
                 raise
-            wd = launch.container_workdir(b.profile, os.getcwd())
+            wd = launch.container_workdir(b.profile, host_dir)
             meta["workdir"] = wd
-            cmd = launch.exec_argv(b.project, str(b.compose_file), wd, argv, tty=False, env=ln.env)
-            with transcript.open("w") as t, prompt_file.open("rb") as stdin:
-                rc = subprocess.run(cmd, stdout=t, stderr=subprocess.STDOUT, stdin=stdin).returncode
+            env = {**ln.env, runsmod.RUN_ENV: rd.name}
+            cmd = launch.exec_argv(b.project, str(b.compose_file), wd, argv, tty=False, env=env)
+            with transcript.open("wb") as t, prompt_file.open("rb") as stdin:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        stdin=stdin)  # fmt: skip
+                copier = threading.Thread(target=runsmod.copy_capped, args=(proc.stdout, t),
+                                          daemon=True)  # fmt: skip
+                copier.start()
+                try:
+                    rc = proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    kill_run(b, rd.name, proc)
+                    proc.wait()
+                    rc = RC_TIMEOUT
+                    meta["killed"] = f"timeout after {timeout:.0f} s"
+                except BaseException as e:
+                    kill_run(b, rd.name, proc)
+                    with contextlib.suppress(Exception):
+                        proc.wait(timeout=30)
+                    rc = RC_TERMINATED if isinstance(e, Terminated | KeyboardInterrupt) else rc
+                    meta["killed"] = str(e) or type(e).__name__
+                    raise
+                finally:
+                    copier.join(timeout=30)
+                    if "killed" in meta:
+                        t.write(f"\n[agentbox: run killed: {meta['killed']}]\n".encode())
             runsmod.finish(rd, rc, meta)
             done = True
+        except (Terminated, KeyboardInterrupt) as e:
+            rc = RC_TERMINATED
+            meta.setdefault("killed", str(e) or type(e).__name__)
+            raise
         finally:
             if not done:
                 runsmod.finish(rd, rc, meta)
-            if not was_running:
-                stop_if_idle(b)
-    print(term.clean(f"run: {rd} (exit {rc})"))
-    return rc
+            why = stop_if_idle(b)
+            if why:
+                meta["left_up"] = why
+                runsmod.finish(rd, rc, meta)
+    return rc, rd
 
 
-def stop_if_idle(b: boxmod.Box) -> None:
-    """Stop a box `run` started, unless another session joined it."""
+def stop_if_idle(b: boxmod.Box) -> str | None:
+    """Stop the box after a headless run unless it is pinned or in use."""
     try:
         why = boxmod.stop_if_idle(b)
     except Exception as e:  # noqa: BLE001
         why = f"stop failed ({e})"
-    if why:
+    if why and why != boxmod.PINNED:
         err(f"{b.name}: {why}; leaving it up")
+        return why
+    return None
 
 
 def cmd_allow(args) -> int:
@@ -623,6 +696,285 @@ def cmd_login(args) -> int:
     return session(b, cmd)
 
 
+# ---------------------------------------------------------------- schedule
+class RunFailed(Exception):
+    def __init__(self, msg: str, run_dir: Path | None, rc: int | None = None) -> None:
+        super().__init__(msg)
+        self.run_dir = run_dir
+        self.rc = rc
+
+
+def sched_runner(profile: str, agent: str, prompt: str, model: str | None, timeout=None):
+    """In-process `run` for `schedule _fire`; the host dir "/" selects the first mount."""
+    made: list[Path] = []
+    try:
+        b = boxmod.load(profile)
+        return run_headless(b, agent, Path(prompt), model, "/", made, timeout=timeout)
+    except Terminated as e:
+        raise RunFailed(str(e), made[0] if made else None, RC_TERMINATED) from e
+    except Exception as e:
+        raise RunFailed(str(e), made[0] if made else None) from e
+
+
+def secret_fix(prof, m) -> str:
+    if m.name == CLAUDE_TOKEN:
+        return f"{m.name} is missing: run `agentbox setup` (it stores the shared token)"
+    scope = prof.secrets[m.name].scope
+    where = "--shared" if scope == "shared" else prof.name
+    how = f"`agentbox secret set {where} {m.name}`" if scope else f"store it at {m.ref}"
+    return f"{m.name} ({m.ref}) is missing: {how}"
+
+
+def agent_credential(prof, agent: str, model: str | None) -> str | None:
+    """The secret the chosen agent itself needs, if a missing one is detectable.
+    Claude needs the shared token unless --model routes to ollama/ or remote/.
+    Codex and Pi log in inside the box (not cheaply detectable): None."""
+    if agent != "claude":
+        return None
+    route = launch.parse_model(prof, model)
+    if route is not None and route.kind in ("ollama", "remote"):
+        return None
+    return CLAUDE_TOKEN
+
+
+def sched_check(prof, cfg, agent: str, model: str | None) -> tuple[str | None, list[str]]:
+    """(error, warnings): error only for the agent's own missing credential."""
+    need = agent_credential(prof, agent, model)
+    error, warnings = None, []
+    for m in delivery.collect(prof, cfg, None).missing:
+        if m.name == need:
+            error = secret_fix(prof, m)
+        elif m.name != CLAUDE_TOKEN:  # not needed by this agent/route
+            warnings.append(secret_fix(prof, m))
+    return error, warnings
+
+
+def sched_preflight(profile: str, agent: str, model: str | None = None, code: tuple = ()):
+    try:
+        b = boxmod.load(profile)
+        if agent not in b.profile.box.agents:
+            return f"{agent} is not in [box] agents of {profile}", []
+        if msg := code_mount_problem(b.profile, tuple(code)):
+            return msg, []
+        return sched_check(b.profile, b.cfg, agent, model)
+    except Exception as e:  # noqa: BLE001
+        return f"preflight failed: {e}", []
+
+
+def _schedule_name(profile: str | None, name: str | None = None) -> None:
+    if profile is not None and not PROFILE_NAME_RE.fullmatch(profile):
+        raise CliError(f"profile name {profile!r} must match {PROFILE_NAME_RE.pattern}")
+    if name is not None:
+        schedule.validate_name(name)
+
+
+def cmd_schedule_add(args) -> int:
+    _schedule_name(args.profile, args.name)
+    b = boxmod.load(args.profile)
+    if args.agent not in b.profile.box.agents:
+        raise CliError(f"{args.agent} is not in [box] agents of {b.name}")
+    launch.parse_model(b.profile, args.model)
+    spec = schedule.make_spec(args.cron, args.every, args.at, args.days)
+    schedule.validate_for_platform(spec)
+    now = datetime.now()
+    fires = schedule.next_fires(spec, now)
+    if not fires or fires[0] - now > timedelta(days=366):
+        raise CliError(f"{spec.text()} never fires within a year; check the day and month fields")
+    timeout = schedule.parse_timeout(args.timeout) if args.timeout else schedule.DEFAULT_TIMEOUT
+    jd = schedule.job_dir(b.name, args.name)
+    old = None
+    if (jd / "job.json").is_file():
+        if not args.force:
+            raise CliError(f"schedule {args.name} exists for {b.name}; use --force to replace it")
+        old = schedule.load_job(b.name, args.name)
+    try:
+        prompt = Path(args.prompt_file).read_bytes()
+    except OSError as e:
+        raise CliError(f"cannot read prompt file: {e}") from None
+    prog, extra = schedule.program_args()
+    label = schedule.label_for(b.name, args.name)
+    job = {
+        "profile": b.name,
+        "name": args.name,
+        "agent": args.agent,
+        "model": args.model,
+        "schedule": spec.as_json(),
+        "timeout": timeout,
+        "dir": str(jd),
+        "label": label,
+        "plist": str(schedule.launchagents_dir() / f"{label}.plist"),
+        "argv": schedule.fire_argv(prog, b.name, args.name),
+        "env": schedule.job_env(extra),
+        "created": schedule.now_iso(),
+    }
+    if msg := code_mount_problem(b.profile, schedule.job_code_paths(job)):
+        raise CliError(msg)
+    schedule.check_render(job)  # before anything is written
+    if old is not None:
+        schedule.uninstall(old)
+    existed = jd.exists()
+    try:
+        jd.mkdir(parents=True, exist_ok=True)
+        os.chmod(jd, 0o700)
+        schedule.write_private(jd / "prompt.md", prompt)
+        schedule.write_private(jd / "job.json", (json.dumps(job, indent=1) + "\n").encode())
+        schedule.install(job)
+    except BaseException:
+        with contextlib.suppress(Exception):
+            schedule.uninstall(job)
+        if not existed:
+            shutil.rmtree(jd, ignore_errors=True)
+        else:
+            (jd / "job.json").unlink(missing_ok=True)
+        raise
+    where = job["plist"] if schedule.is_macos() else "crontab"
+    tmo = schedule.fmt_every(timeout) if timeout else "none"
+    print(term.clean(f"{b.name}/{args.name}: {spec.text()}, timeout {tmo} ({where})"))
+    approx = " (approximate: launchd counts the interval from load and wake)" if spec.every else ""
+    print("next runs" + approx + ":")
+    for t in fires:
+        print(f"  {t.astimezone().isoformat(timespec='minutes')}")
+    print(f"test it now: agentbox schedule run-now {b.name} {args.name}")
+    names = sorted(k for k in job["env"] if k not in ("PATH", "HOME"))
+    print("job environment: PATH, HOME" + (", " + ", ".join(names) if names else ""))
+    for w in schedule_warnings(b, args.agent, args.model, extra):
+        err(w)
+    return 0
+
+
+def schedule_warnings(b: boxmod.Box, agent: str, model: str | None, extra: dict) -> list[str]:
+    error, warns = sched_check(b.profile, b.cfg, agent, model)
+    out = [f"warning: {x}" for x in ([error] if error else []) + warns]
+    if "PYTHONPATH" in extra:
+        out.append(
+            "warning: no installed `agentbox` command was found, so the job runs "
+            f"{sys.executable} -m agentbox.cli; install it with `uv tool install -e ./cli` "
+            "and re-add the job with --force"
+        )
+    uses_op = b.cfg.secret_backend == "op" or any(
+        s.scope is None and s.ref.startswith("op://") for s in b.profile.secrets.values()
+    )
+    if uses_op and not secretstore.exists(secretstore.sa_token_ref(b.cfg, b.name)):
+        out.append(
+            f"warning: {b.name} reads secrets from 1Password without a service-account token; "
+            "a scheduled job cannot answer a 1Password prompt. Store one: "
+            f"`agentbox secret set {b.name} {secretstore.OP_SA_NAME}`"
+        )
+    if agent in ("codex", "pi"):
+        out.append(
+            f"note: {agent} login is not checked here; if the job fails with an auth "
+            f"error, run `agentbox login {b.name} {agent}`"
+        )
+    return out
+
+
+def cmd_schedule_edit(args) -> int:
+    _schedule_name(args.profile, args.name)
+    job = schedule.load_job(args.profile, args.name)
+    if args.prompt_file is None and args.timeout is None:
+        raise CliError("give --prompt-file and/or --timeout")
+    jd = Path(job["dir"])
+    if args.prompt_file is not None:
+        try:
+            prompt = Path(args.prompt_file).read_bytes()
+        except OSError as e:
+            raise CliError(f"cannot read prompt file: {e}") from None
+        schedule.write_private(jd / "prompt.md", prompt)
+        print(f"{args.profile}/{args.name}: prompt replaced")
+    if args.timeout is not None:
+        job["timeout"] = schedule.parse_timeout(args.timeout)
+        schedule.write_private(jd / "job.json", (json.dumps(job, indent=1) + "\n").encode())
+        print(f"{args.profile}/{args.name}: timeout {args.timeout}")
+    return 0
+
+
+def cmd_schedule_ls(args) -> int:
+    _schedule_name(args.profile)
+    jobs = schedule.list_jobs(args.profile)
+    if not jobs:
+        print("no schedules; add one with `agentbox schedule add`")
+        return 0
+    now = datetime.now()
+    for j in jobs:
+        spec = schedule.Spec.from_json(j["schedule"])
+        jd = Path(j["dir"])
+        try:
+            nxt = schedule.next_fires(spec, now, 1)
+            nxt_s = nxt[0].astimezone().isoformat(timespec="minutes") if nxt else "-"
+            if spec.every:
+                nxt_s = "~" + nxt_s
+        except schedule.ScheduleError:
+            nxt_s = "-"
+        last = schedule.read_last(j["profile"], j["name"]) or {}
+        status = last.get("status", "-")
+        if status == "running" and schedule.lock_free(jd):
+            status = "running (stale: the fire process is gone)"
+        rc = last.get("exit_code")
+        lines = [
+            f"{j['profile']}/{j['name']}  agent={j['agent']}  {spec.text()}  "
+            f"[{schedule.installed(j)}]",
+            f"  next: {nxt_s}",
+            f"  last: {last.get('start', 'never')}  status={status}  "
+            f"exit={'-' if rc is None else rc}",
+            f"  transcript: {last.get('transcript') or '-'}",
+        ]
+        if last.get("message"):
+            lines.append(f"  message: {last['message']}")
+        if last.get("left_up"):
+            lines.append(f"  {last['left_up']}")
+        for w in last.get("warnings") or []:
+            lines.append(f"  warning: {w}")
+        if sk := schedule.skip_summary(jd):
+            lines.append(f"  {sk}")
+        print(term.clean("\n".join(lines), multiline=True))
+    return 0
+
+
+def cmd_schedule_rm(args) -> int:
+    _schedule_name(args.profile, args.name)
+    jd = schedule.job_dir(args.profile, args.name)
+    try:
+        job = schedule.load_job(args.profile, args.name)
+    except schedule.ScheduleError:
+        label = schedule.label_for(args.profile, args.name)
+        job = {"profile": args.profile, "name": args.name, "label": label,
+               "plist": str(schedule.launchagents_dir() / f"{label}.plist")}  # fmt: skip
+        if not jd.exists() and not Path(job["plist"]).exists():
+            raise
+    schedule.uninstall(job)
+    shutil.rmtree(jd, ignore_errors=True)
+    print(f"{args.profile}/{args.name}: removed (run records stay in runs/)")
+    return 0
+
+
+def cmd_schedule_run_now(args) -> int:
+    _schedule_name(args.profile, args.name)
+    job = schedule.load_job(args.profile, args.name)
+    print(term.clean(f"running as the scheduler would: {' '.join(job['argv'])}"), flush=True)
+    rc = subprocess.run(job["argv"], env=job["env"], cwd="/", stdin=subprocess.DEVNULL).returncode
+    if rc == schedule.RC_SKIPPED:
+        print(schedule.SKIP_MSG)
+        return rc
+    last = schedule.read_last(args.profile, args.name) or {}
+    print(term.clean(f"exit {rc}; transcript: {last.get('transcript') or '-'}"))
+    if last.get("message"):
+        print(term.clean(f"message: {last['message']}"))
+    return rc
+
+
+def cmd_schedule_fire(args) -> int:
+    _schedule_name(args.profile, args.name)
+
+    def on_signal(signum, frame):
+        for s in (signal.SIGTERM, signal.SIGINT):  # one unwind; cleanup is not interrupted
+            signal.signal(s, signal.SIG_IGN)
+        raise Terminated(signum)
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    return schedule.fire(args.profile, args.name, sched_runner, sched_preflight)
+
+
 # ---------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentbox", description="Docker sandboxes for AI agents")
@@ -679,6 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--agent", required=True, choices=AGENTS)
     p.add_argument("--prompt-file", required=True)
     p.add_argument("--model", help=model_help)
+    p.add_argument("--timeout", help="kill the run after this long: 30m, 2h (rc 124)")
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("allow", help="allow a domain: allow [profile] <domain>")
@@ -724,6 +1077,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("agent", choices=("codex", "pi"))
     p.set_defaults(func=cmd_login)
 
+    p = sub.add_parser("schedule", help="scheduled headless runs: add / ls / rm / run-now / edit")
+    ssub = p.add_subparsers(dest="schedule_command", metavar="<add|ls|rm|run-now|edit>")
+    ssub.required = True
+    q = ssub.add_parser("add", help="add a job: add <profile> --name N --agent A --prompt-file F")
+    q.add_argument("profile")
+    q.add_argument("--name", required=True)
+    q.add_argument("--agent", required=True, choices=AGENTS)
+    q.add_argument("--prompt-file", required=True, help="copied into the state dir at add")
+    q.add_argument("--model", help=model_help)
+    q.add_argument("--cron", help='5 fields, local time: "m h dom mon dow"')
+    q.add_argument("--every", help="interval: 30m, 2h, 1d")
+    q.add_argument("--at", help="HH:MM local time, every day or --days")
+    q.add_argument("--days", help="with --at: mon-fri, sat-sun, mon,wed,fri")
+    q.add_argument("--timeout", help="kill a run after this long (default 2h; none = no limit)")
+    q.add_argument("--force", action="store_true", help="replace a job with the same name")
+    q.set_defaults(func=cmd_schedule_add)
+    q = ssub.add_parser("ls", help="jobs, next run, last result")
+    q.add_argument("profile", nargs="?")
+    q.set_defaults(func=cmd_schedule_ls)
+    for cmd, fn, hlp in (
+        ("rm", cmd_schedule_rm, "unload and remove a job"),
+        ("run-now", cmd_schedule_run_now, "run a job now, exactly as the scheduler does"),
+        ("edit", cmd_schedule_edit, "replace the prompt: edit <profile> <name> --prompt-file F"),
+        ("_fire", cmd_schedule_fire, None),  # hidden: the scheduler calls it
+    ):
+        q = ssub.add_parser(cmd, **({"help": hlp} if hlp else {}))
+        q.add_argument("profile")
+        q.add_argument("name")
+        if cmd == "edit":
+            q.add_argument("--prompt-file")
+            q.add_argument("--timeout", help="30m, 2h, 1d, or none")
+        q.set_defaults(func=fn)
+
     p = sub.add_parser("update", help="bump versions.env, rebuild, doctor")
     p.add_argument("--check", action="store_true", help="only list current vs latest")
     p.set_defaults(func=cmd_update)
@@ -757,6 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
         presets.PresetError,
         mountstate.MountChangeError,
         secretstore.SecretError,
+        schedule.ScheduleError,
     ) as e:
         err(str(e))
         return 1

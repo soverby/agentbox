@@ -73,7 +73,7 @@ def test_mount_hook_called(monkeypatch):
     # P3: the host check runs only with host_checks=True (the CLI always sets it).
     seen = []
     monkeypatch.setattr(
-        "agentbox.profile.check_mount_host", lambda h, dot=False: seen.append((h, dot)) or h
+        "agentbox.profile.check_mount_host", lambda h, dot=False, **kw: seen.append((h, dot)) or h
     )
     parse({"mount": [{"host": "/srv/a"}, {"host": "/srv/b"}]})
     assert seen == []

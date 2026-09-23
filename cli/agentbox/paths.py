@@ -65,7 +65,7 @@ def state_dir(name: str, create: bool = True) -> Path:
 BACKENDS = ("keychain", "op", "env")
 PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 OP_VAULT_RE = re.compile(r"[^/\s\"\\]+")
-CONFIG_KEYS = ("subnet_base", "secret_backend", "secret_prefix", "op_vault")
+CONFIG_KEYS = ("subnet_base", "secret_backend", "secret_prefix", "op_vault", "runs_keep")
 
 
 @dataclass(frozen=True)
@@ -78,6 +78,7 @@ class Config:
     # Tests set it to agentbox-test-<rand> so they never touch real items.
     secret_prefix: str = "agentbox"
     op_vault: str | None = None  # needed when secret_backend = "op"
+    runs_keep: int = 200  # headless run dirs kept per profile (oldest pruned)
 
 
 def config_file() -> Path:
@@ -115,7 +116,11 @@ def load_config() -> Config:
         raise ConfigError(f"{f}: op_vault is not a valid 1Password vault name")
     if backend == "op" and vault is None:
         raise ConfigError(f'{f}: secret_backend = "op" needs op_vault')
-    return Config(subnet_base=base, secret_backend=backend, secret_prefix=prefix, op_vault=vault)
+    keep = data.get("runs_keep", "200")
+    if not keep.isdigit() or int(keep) < 1:
+        raise ConfigError(f'{f}: runs_keep must be a whole number >= 1, as a string ("200")')
+    return Config(subnet_base=base, secret_backend=backend, secret_prefix=prefix, op_vault=vault,
+                  runs_keep=int(keep))  # fmt: skip
 
 
 def write_config(values: dict[str, str]) -> Path:

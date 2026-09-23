@@ -24,3 +24,64 @@ def test_prompt_digest():
     assert runs.prompt_digest("x") == (
         "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
     )
+
+
+def test_copy_capped():
+    import io
+
+    from agentbox import runs
+
+    out = io.BytesIO()
+    n = runs.copy_capped(io.BufferedReader(io.BytesIO(b"a" * 100)), out, cap=10)
+    assert n == 100
+    assert out.getvalue() == b"a" * 10 + runs.TRUNC_MARK.format(cap=10).encode()
+    out = io.BytesIO()
+    runs.copy_capped(io.BufferedReader(io.BytesIO(b"abc")), out, cap=10)
+    assert out.getvalue() == b"abc"
+
+
+def test_kill_script_targets_run_env():
+    from agentbox import runs
+
+    s = runs.kill_script("20260101T000000Z-claude")
+    assert "AGENTBOX_RUN=20260101T000000Z-claude" in s and "kill -KILL" in s
+
+
+def test_runs_keep_config(tmp_path, monkeypatch):
+    import pytest
+    from agentbox import paths
+
+    monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path))
+    assert paths.load_config().runs_keep == 200
+    (tmp_path / "config.toml").write_text('runs_keep = "5"\n')
+    assert paths.load_config().runs_keep == 5
+    (tmp_path / "config.toml").write_text('runs_keep = "0"\n')
+    with pytest.raises(paths.ConfigError):
+        paths.load_config()
+
+
+def test_new_run_dir_same_second_no_collision(tmp_path):
+    import threading
+    from datetime import UTC, datetime
+
+    from agentbox import runs
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    out, errs = [], []
+
+    def mk():
+        try:
+            out.append(runs.new_run_dir(tmp_path, "claude", now))
+        except Exception as e:  # noqa: BLE001
+            errs.append(e)
+
+    ts = [threading.Thread(target=mk) for _ in range(20)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errs and len({p.name for p in out}) == 20
+    # a dir that appears between check and create is skipped, not an error
+    (tmp_path / "x").mkdir()
+    assert runs.new_run_dir(tmp_path / "x", "pi", now).name == "20260101T000000Z-pi"
+    assert runs.new_run_dir(tmp_path / "x", "pi", now).name == "20260101T000000Z-pi-2"

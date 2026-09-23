@@ -505,8 +505,22 @@ def down(box: Box, volumes: bool = False) -> None:
         down_locked(box, volumes)
 
 
+PIN_FILE = "pinned"
+PINNED = "pinned by `agentbox up` or an interactive session (cleared at `agentbox down`)"
+
+
+def pin(box: Box) -> None:
+    """Mark the box as wanted by the user: `stop_if_idle` never stops it."""
+    (box.state / PIN_FILE).touch(mode=0o600)
+
+
+def is_pinned(box: Box) -> bool:
+    return (box.state / PIN_FILE).exists()
+
+
 def down_locked(box: Box, volumes: bool = False) -> None:
     """`down` for a caller that already holds up.lock."""
+    (box.state / PIN_FILE).unlink(missing_ok=True)
     if box.compose_file.is_file():
         args = ["down", "--remove-orphans", "--timeout", "3"]
         if volumes:
@@ -577,6 +591,8 @@ def stop_if_idle(box: Box) -> str | None:
     for the whole decision, so no `up` can start a session in between.
     Returns why the box stays up, or None when it was stopped."""
     with up_lock(box):
+        if is_pinned(box):
+            return PINNED
         if sessions_active(box):
             return "another agentbox session uses the box"
         try:
@@ -584,7 +600,8 @@ def stop_if_idle(box: Box) -> str | None:
         except Exception as e:  # noqa: BLE001
             return f"cannot list box processes ({e})"
         if others:
-            return f"other processes run in the box ({others[0]!r})"
+            short = ", ".join(x[:60] for x in others[:3]) + (", ..." if len(others) > 3 else "")
+            return f"other processes ({short})"
         down_locked(box)
         return None
 

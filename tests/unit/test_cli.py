@@ -1,5 +1,6 @@
 """CLI flows without Docker: init, allow (reload + restore), argv split."""
 
+import os
 import subprocess
 import tomllib
 
@@ -18,7 +19,7 @@ def roots(tmp_path, monkeypatch):
 
 def test_init_refuses_overwrite(roots, monkeypatch):
     # A path accepted by host checks (stub the check to accept anything).
-    monkeypatch.setattr("agentbox.profile.check_mount_host", lambda h, d=False: h)
+    monkeypatch.setattr("agentbox.profile.check_mount_host", lambda h, d=False, **kw: h)
     assert cli.main(["init", "p2", "--mount", str(roots), "--agents", "claude,pi", "--open"]) == 0
     f = paths.profile_file("p2")
     doc = tomllib.loads(f.read_text())
@@ -95,10 +96,10 @@ def test_allow_invalid(roots, monkeypatch):
     assert paths.profile_file("demo").read_text() == text and calls == []
 
 
-def run_box(roots, monkeypatch, up_fails=False, others=()):
+def run_box(roots, monkeypatch, up_fails=False, others=(), running=False, wait=None):
     setup_running_box(roots, monkeypatch, {})
     events = []
-    monkeypatch.setattr(boxmod, "is_running", lambda b: False)
+    monkeypatch.setattr(boxmod, "is_running", lambda b: running)
 
     def ensure_up(b, accept=False):
         events.append("up")
@@ -107,14 +108,26 @@ def run_box(roots, monkeypatch, up_fails=False, others=()):
 
     seen = {}
 
-    def run(cmd, stdout, stderr, stdin):
-        seen["cmd"] = cmd
-        seen["stdin"] = stdin.read()
-        stdout.write("Not logged in\n")
-        return subprocess.CompletedProcess(cmd, 1)
+    class Popen:  # the `docker compose exec` of a headless run
+        def __init__(self, cmd, stdout, stderr, stdin):
+            seen["cmd"] = cmd
+            seen["stdin"] = stdin.read()
+            r, w = os.pipe()
+            os.write(w, b"Not logged in\n")
+            os.close(w)
+            self.stdout = os.fdopen(r, "rb")
+
+        def wait(self, timeout=None):
+            if wait is not None and not seen.get("waited"):
+                seen["waited"] = timeout
+                wait(timeout)
+            return 1
+
+        def kill(self):
+            events.append("kill")
 
     monkeypatch.setattr(cli, "ensure_up", ensure_up)
-    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli.subprocess, "Popen", Popen)
     monkeypatch.setattr(boxmod, "other_processes", lambda b: list(others))
     monkeypatch.setattr(boxmod, "down", lambda b, volumes=False: events.append("down"))
     monkeypatch.setattr(boxmod, "down_locked", lambda b, volumes=False: events.append("down"))
@@ -152,6 +165,9 @@ def test_run_leaves_box_up_when_joined(roots, monkeypatch):
     pf.write_text("hi")
     cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
     assert events == ["up"]  # no down
+    rd = sorted((paths.state_dir("demo") / "runs").iterdir())[-1]
+    meta = __import__("json").loads((rd / "meta.json").read_text())
+    assert meta["left_up"] == "other processes (/usr/local/bin/with-secrets sleep 40)"
 
 
 def test_run_leaves_box_up_when_session_lock_held(roots, monkeypatch):
@@ -180,3 +196,101 @@ def test_fast_failure_message(roots, monkeypatch):
         cli.ensure_up(b)
     msg = str(e.value)
     assert "FAIL 1: default route present" in msg and "agentbox up demo" in msg
+
+
+def test_run_stops_running_unpinned_box(roots, monkeypatch):
+    """Reviewer repro: overlapping runs; the one that found the box running
+    must stop it too (else the box stays up after both)."""
+    events, _ = run_box(roots, monkeypatch, running=True)
+    pf = roots / "p.txt"
+    pf.write_text("hi")
+    cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
+    assert events == ["up", "down"]
+
+
+def test_run_keeps_pinned_box(roots, monkeypatch, capsys):
+    events, _ = run_box(roots, monkeypatch, running=True)
+    b = boxmod.load("demo")
+    boxmod.pin(b)
+    pf = roots / "p.txt"
+    pf.write_text("hi")
+    cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
+    assert events == ["up"] and boxmod.is_pinned(b)
+    assert "leaving it up" not in capsys.readouterr().err
+
+
+def test_stale_pin_cleared_when_box_not_running(roots, monkeypatch):
+    events, _ = run_box(roots, monkeypatch, running=False)
+    boxmod.pin(boxmod.load("demo"))
+    pf = roots / "p.txt"
+    pf.write_text("hi")
+    cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
+    assert events == ["up", "down"]
+
+
+def test_down_clears_pin(roots, monkeypatch):
+    setup_running_box(roots, monkeypatch, {})
+    b = boxmod.load("demo")
+    boxmod.pin(b)
+    monkeypatch.setattr(boxmod, "dc", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+    boxmod.down(b)
+    assert not boxmod.is_pinned(b)
+
+
+def test_up_pins(roots, monkeypatch):
+    setup_running_box(roots, monkeypatch, {})
+    monkeypatch.setattr(cli, "ensure_up", lambda b, *a, **k: None)
+    assert cli.main(["up", "demo"]) == 0
+    assert boxmod.is_pinned(boxmod.load("demo"))
+
+
+def test_run_timeout_kills(roots, monkeypatch):
+    def expire(timeout):
+        raise subprocess.TimeoutExpired("x", timeout)
+
+    events, seen = run_box(roots, monkeypatch, wait=expire)
+    killed = []
+    monkeypatch.setattr(cli, "kill_run", lambda b, rid, p: killed.append(rid))
+    pf = roots / "p.txt"
+    pf.write_text("hi")
+    rc = cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf), "--timeout", "1m"])
+    assert rc == 124 and seen["waited"] == 60
+    rd = sorted((paths.state_dir("demo") / "runs").iterdir())[-1]
+    assert killed == [rd.name] and (rd / "exit_code").read_text() == "124\n"
+    assert "run killed: timeout after 60 s" in (rd / "transcript.log").read_text()
+    assert f"AGENTBOX_RUN={rd.name}" in seen["cmd"]
+    assert events == ["up", "down"]
+
+
+def test_run_terminated_cleans_up(roots, monkeypatch):
+    def term(timeout):
+        raise cli.Terminated(15)
+
+    events, _ = run_box(roots, monkeypatch, wait=term)
+    killed = []
+    monkeypatch.setattr(cli, "kill_run", lambda b, rid, p: killed.append(rid))
+    pf = roots / "p.txt"
+    pf.write_text("hi")
+    b = boxmod.load("demo")
+    with pytest.raises(cli.Terminated):
+        cli.run_headless(b, "claude", pf, None, "/")
+    rd = sorted((paths.state_dir("demo") / "runs").iterdir())[-1]
+    assert killed == [rd.name] and (rd / "exit_code").read_text() == "143\n"
+    assert events == ["up", "down"]
+
+
+def test_run_prunes_old_runs(roots, monkeypatch):
+    events, _ = run_box(roots, monkeypatch)
+    import dataclasses
+
+    real_load = boxmod.load
+    monkeypatch.setattr(boxmod, "load", lambda n: dataclasses.replace(
+        real_load(n), cfg=paths.Config(runs_keep=3)))  # fmt: skip
+    runs = paths.state_dir("demo") / "runs"
+    for i in range(5):
+        (runs / f"20200101T00000{i}Z-claude").mkdir(parents=True)
+    pf = roots / "p.txt"
+    pf.write_text("hi")
+    cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
+    names = sorted(p.name for p in runs.iterdir())
+    assert len(names) == 3 and names[0] == "20200101T000003Z-claude"

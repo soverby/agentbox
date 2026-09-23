@@ -126,7 +126,7 @@ def test_parse_profile_host_checks(home, monkeypatch):
     monkeypatch.setattr(
         prof,
         "check_mount_host",
-        lambda h, dot=False: real_check(h, dot, home=home, system_deny=((), ())),
+        lambda h, dot=False, **kw: real_check(h, dot, home=home, system_deny=((), ()), **kw),
     )
     doc = {"mount": [{"host": "~/Projects/foo"}]}
     p = parse_profile(doc, "p1", host_checks=True)
@@ -135,3 +135,77 @@ def test_parse_profile_host_checks(home, monkeypatch):
     with pytest.raises(ProfileError) as e:
         parse_profile({"mount": [{"host": "~/.ssh"}]}, "p1", host_checks=True)
     assert e.value.problems[0][0] == "mount[0].host"
+
+
+def test_agentbox_repo_refused(home):
+    """PLAN §2.3: the repo the CLI runs from: equal, ancestor, descendant."""
+    repo = f"{home}/Projects/foo"
+    deny = (("/", os.path.dirname(home)), ())
+    for p, ok in ((repo, False), (f"{repo}/src", False), (f"{home}/Projects", False),
+                  (f"{home}/.config/x", None)):  # fmt: skip
+        if ok is None:
+            continue
+        with pytest.raises(MountError, match="agentbox repo .*runs from that code on the host"):
+            check_mount_host(p, home=home, case_insensitive=False, system_deny=deny,
+                             repo_roots=(os.path.realpath(repo),))  # fmt: skip
+    os.makedirs(f"{home}/Other")
+    assert check_mount_host(f"{home}/Other", home=home, case_insensitive=False,
+                            system_deny=deny, repo_roots=(os.path.realpath(repo),))  # fmt: skip
+
+
+def test_real_repo_is_in_default_denylist():
+    from agentbox import profile
+
+    here = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    assert here in profile.agentbox_repos()
+    with pytest.raises(MountError, match="agentbox repo"):
+        check_mount_host(os.path.join(here, "cli"))
+
+
+def test_agentbox_repo_read_only_allowed(home):
+    """A read-only mount of the repo or a parent of it is allowed: the agent
+    can read the code, not change what runs on the host."""
+    repo = f"{home}/Projects/foo"
+    deny = (("/", os.path.dirname(home)), ())
+    for p in (repo, f"{repo}/src", f"{home}/Projects"):
+        assert check_mount_host(p, home=home, case_insensitive=False, system_deny=deny,
+                                repo_roots=(os.path.realpath(repo),), writable=False)  # fmt: skip
+
+
+def test_profile_ro_parent_of_repo_ok_rw_refused():
+    here = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    parent = os.path.dirname(here)
+    ro = parse_profile({"mount": [{"host": parent, "mode": "ro", "path": "/w/p"}]}, "p1",
+                       host_checks=True)  # fmt: skip
+    assert ro.mounts[0].mode == "ro"
+    with pytest.raises(ProfileError, match="agentbox repo"):
+        parse_profile({"mount": [{"host": parent, "mode": "rw", "path": "/w/p"}]}, "p1",
+                      host_checks=True)  # fmt: skip
+
+
+def test_host_code_paths_refused_rw_only(home):
+    """Interpreter/venv/PYTHONPATH (equal, ancestor, descendant): rw refused, ro allowed."""
+    deny = (("/", os.path.dirname(home)), ())
+    venv = f"{home}/Projects/foo"
+    kw = dict(home=home, case_insensitive=False, system_deny=deny, repo_roots=(),
+              code_paths=(os.path.realpath(venv),))  # fmt: skip
+    for p in (venv, f"{venv}/src", f"{home}/Projects"):
+        with pytest.raises(MountError, match="change what runs on the host"):
+            check_mount_host(p, **kw)
+        assert check_mount_host(p, writable=False, **kw)
+    os.makedirs(f"{home}/Other")
+    assert check_mount_host(f"{home}/Other", **kw)
+
+
+def test_default_code_paths_include_interpreter(monkeypatch, tmp_path):
+    import sys
+
+    from agentbox import profile
+
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    code = profile.host_code_paths(("/nonexistent/x",))
+    assert os.path.realpath(sys.prefix) in code
+    assert os.path.realpath(sys.executable) in code
+    assert os.path.realpath(tmp_path) in code
+    assert "/nonexistent/x" not in code
+    assert profile.code_path_conflict(os.path.dirname(os.path.realpath(sys.prefix)), code, False)

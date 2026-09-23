@@ -175,13 +175,86 @@ def _variants(path: str) -> set[str]:
     return {path, os.path.realpath(path)}
 
 
+def agentbox_repos() -> tuple[str, ...]:
+    """Realpaths of the agentbox repo: the one this package runs from and
+    AGENTBOX_REPO when set (whichever exist)."""
+    cands = [Path(__file__).resolve().parents[2]]
+    if os.environ.get("AGENTBOX_REPO"):
+        cands.append(Path(os.environ["AGENTBOX_REPO"]))
+    out = []
+    for c in cands:
+        if (c / "images" / "agent").is_dir() or (c / "cli" / "agentbox").is_dir():
+            out.append(os.path.realpath(c))
+    return tuple(dict.fromkeys(out))
+
+
+def host_code_paths(extra: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Host paths whose code the CLI (or a scheduled job) executes: the Python
+    prefix and base prefix, the interpreter (as called and resolved), the
+    installed `agentbox` command, PYTHONPATH entries, plus `extra` (a job's
+    recorded program, interpreter, PYTHONPATH). Realpaths of those that exist."""
+    import shutil
+
+    cands = [sys.prefix, sys.base_prefix, os.path.abspath(sys.executable), sys.executable]
+    ab = shutil.which("agentbox")
+    if ab:
+        cands.append(os.path.abspath(ab))
+    cands += [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+    cands += list(extra)
+    out = []
+    for c in cands:
+        if c and os.path.isabs(c) and os.path.exists(c):
+            out += [os.path.abspath(c), os.path.realpath(c)]
+    return tuple(dict.fromkeys(out))
+
+
+def code_path_conflict(real: str, code: tuple[str, ...], ci: bool) -> str | None:
+    """The code path that `real` equals, contains, or is inside, or None."""
+
+    def norm(p: str) -> str:
+        p = p.rstrip("/") or "/"
+        return p.casefold() if ci else p
+
+    r = norm(real)
+    for c in code:
+        e = norm(c)
+        if r == e or r.startswith(e + "/") or e.startswith(r + "/"):
+            return c
+    return None
+
+
+CODE_WHY = (
+    "The host runs this code (Python interpreter, venv, agentbox command, or PYTHONPATH), "
+    "so a writable mount would let the agent change what runs on the host; "
+    'mount it `mode = "ro"` or mount a different directory'
+)
+
+
+def code_mount_problem(profile: Profile, extra: tuple[str, ...]) -> str | None:
+    """A writable mount of `profile` that overlaps host code (for `schedule add`
+    and `_fire`, with the job's recorded program paths as `extra`)."""
+    ci = sys.platform == "darwin"
+    code = host_code_paths(extra)
+    for m in profile.mounts:
+        if m.mode != "rw":
+            continue
+        real = os.path.realpath(_expand_home(m.host, os.path.expanduser("~")))
+        hit = code_path_conflict(real, code, ci)
+        if hit:
+            return f"mount {m.host} (rw) resolves to {real}, which overlaps {hit}. {CODE_WHY}"
+    return None
+
+
 def check_mount_host(
     host: str,
     allow_dotpath: bool = False,
     *,
+    writable: bool = True,
     home: str | None = None,
     case_insensitive: bool | None = None,
     system_deny: tuple[tuple[str, ...], tuple[str, ...]] | None = None,
+    repo_roots: tuple[str, ...] | None = None,
+    code_paths: tuple[str, ...] | None = None,
 ) -> str:
     """Validate a mount host path; return its realpath. Raises MountError.
 
@@ -189,7 +262,12 @@ def check_mount_host(
     $HOME; equal to, an ancestor of, or a descendant of a denylist entry; a
     dot-path under $HOME without `allow_dotpath`. On macOS (APFS is
     case-insensitive) every comparison is case-insensitive. `home`,
-    `case_insensitive`, `system_deny` (eq, tree) are for tests.
+    `case_insensitive`, `system_deny` (eq, tree), `repo_roots` are for tests.
+
+    The agentbox repo the CLI runs from is denied for writable mounts (equal,
+    ancestor, descendant): the CLI is an editable install, so a writable
+    mount of it would let the agent change code that runs on the host. A
+    read-only mount (e.g. `~/Projects` holding the repo) is allowed.
     """
     deny_eq, deny_tree = (DENY_EQ_ABS, DENY_TREE_ABS) if system_deny is None else system_deny
     home = os.path.expanduser("~") if home is None else home
@@ -220,6 +298,20 @@ def check_mount_host(
                 f"{host!r}: resolves to {real}, which is, contains, or is inside "
                 f"the denied path {e}"
             )
+    for repo in (agentbox_repos() if repo_roots is None else repo_roots) if writable else ():
+        e = norm(repo)
+        if r == e or r.startswith(e + "/") or e.startswith(r + "/"):
+            raise MountError(
+                f"{host!r}: resolves to {real}, which is, contains, or is inside the agentbox "
+                f"repo {repo}. The CLI runs from that code on the host, so the agent must "
+                'never be able to write it; mount it `mode = "ro"` or mount a different '
+                "directory"
+            )
+    if writable:
+        code = host_code_paths() if code_paths is None else code_paths
+        hit = code_path_conflict(real, code, ci)
+        if hit:
+            raise MountError(f"{host!r}: resolves to {real}, which overlaps {hit}. {CODE_WHY}")
     for h in {norm(v) for v in _variants(home)}:
         if r.startswith(h + "/"):
             rel = r[len(h) + 1 :].split("/")
@@ -455,10 +547,11 @@ def _parse_mounts(v: _V, top: dict, host_checks: bool) -> list[Mount]:
                 v.err(f"{p}.host", "is required")
             continue
         allow_dotpath = v.typed(m, "allow_dotpath", p, (bool,), False, "a boolean")
+        mode = v.enum(m, "mode", p, MOUNT_MODES, "ro")
         real = ""
         if host_checks:
             try:
-                real = check_mount_host(host, allow_dotpath)
+                real = check_mount_host(host, allow_dotpath, writable=mode == "rw")
             except MountError as e:
                 v.err(f"{p}.host", str(e))
                 continue
@@ -479,7 +572,7 @@ def _parse_mounts(v: _V, top: dict, host_checks: bool) -> list[Mount]:
             Mount(
                 host=host,
                 path=path,
-                mode=v.enum(m, "mode", p, MOUNT_MODES, "ro"),
+                mode=mode,
                 allow_dotpath=allow_dotpath,
                 host_real=real,
             )

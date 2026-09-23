@@ -318,7 +318,10 @@ Mount validation (T1):
   `/Users` (itself), `$HOME` (itself), the Docker socket, `~/Library`,
   `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config`,
   `~/.cache`, `~/.local`, `~/.claude`, `~/.codex`, `~/.pi`, `~/.netrc`,
-  `~/.npmrc`, `~/.pypirc`, `~/.gitconfig`.
+  `~/.npmrc`, `~/.pypirc`, `~/.gitconfig`. Writable (`rw`) mounts also may
+  not equal, contain, or sit inside the agentbox repo the CLI runs from
+  (editable install: the agent could change code that runs on the host);
+  read-only mounts of it or its parents (e.g. `~/Projects`) are allowed.
 - Any other dot-path under `$HOME` needs `allow_dotpath = true` on that mount.
 - Unit tests include symlink, `..`, and trailing-slash cases.
 
@@ -547,6 +550,14 @@ third-party router.
 - `agentbox schedule ls` shows last run time, exit code, and transcript path.
 - Headless Claude runs use the shared `CLAUDE_CODE_OAUTH_TOKEN` through
   `with-secrets`.
+- A fire fails (rc 78, fix command recorded) only when the chosen agent's
+  own credential is missing; other missing secrets become warnings in
+  `last.json` and `schedule ls`. Every run ends with `stop_if_idle`, so
+  overlapping jobs of one profile never leave the box up. Each job has a
+  timeout (default 2 h, `--timeout`), after which the run is killed (rc
+  124). An overlapping fire is skipped (rc 75) and counted in `ls`.
+  SIGTERM (launchd bootout, logout) runs cleanup and records the result.
+  Transcripts are capped (50 MB, truncation marker); job logs rotate.
 - The box does not need to run between jobs.
 
 ## 3. Repository layout

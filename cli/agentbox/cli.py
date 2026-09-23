@@ -160,11 +160,11 @@ def cmd_ls(args) -> int:
     return 0
 
 
-def session(b: boxmod.Box, cmd: list[str]) -> int:
+def session(b: boxmod.Box, cmd: list[str], env: dict[str, str] | None = None) -> int:
     with boxmod.session_lock(b):
         ensure_up(b)
         wd = launch.container_workdir(b.profile, os.getcwd())
-        argv = launch.exec_argv(b.project, str(b.compose_file), wd, cmd, is_tty())
+        argv = launch.exec_argv(b.project, str(b.compose_file), wd, cmd, is_tty(), env)
         return subprocess.call(argv)
 
 
@@ -175,7 +175,9 @@ def cmd_shell(args) -> int:
 
 def cmd_agent(args) -> int:
     b = boxmod.load(resolve(args.profile))
-    return session(b, launch.agent_argv(b.profile, args.command, args.rest))
+    route = launch.parse_model(b.profile, args.model)
+    ln = launch.agent_launch(b.profile, args.command, args.rest, model=route)
+    return session(b, ln.argv, ln.env)
 
 
 def cmd_run(args) -> int:
@@ -185,12 +187,16 @@ def cmd_run(args) -> int:
         prompt = prompt_file.read_bytes()
     except OSError as e:
         raise CliError(f"cannot read prompt file: {e}") from None
-    argv = launch.agent_argv(b.profile, args.agent, [], headless=True)
+    route = launch.parse_model(b.profile, args.model)
+    ln = launch.agent_launch(b.profile, args.agent, [], headless=True, model=route)
+    argv = ln.argv
     rd = runsmod.new_run_dir(b.state / "runs", args.agent)
     meta = {
         "profile": b.name,
         "agent": args.agent,
+        "model": args.model,
         "argv": argv,
+        "env": ln.env,
         "prompt": "stdin",
         "prompt_file": str(prompt_file.resolve()),
         "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
@@ -210,7 +216,7 @@ def cmd_run(args) -> int:
                 raise
             wd = launch.container_workdir(b.profile, os.getcwd())
             meta["workdir"] = wd
-            cmd = launch.exec_argv(b.project, str(b.compose_file), wd, argv, tty=False)
+            cmd = launch.exec_argv(b.project, str(b.compose_file), wd, argv, tty=False, env=ln.env)
             with transcript.open("w") as t, prompt_file.open("rb") as stdin:
                 rc = subprocess.run(cmd, stdout=t, stderr=subprocess.STDOUT, stdin=stdin).returncode
             runsmod.finish(rd, rc, meta)
@@ -466,6 +472,8 @@ def secret_rows(prof, cfg) -> list[tuple[str, str, str, str, str]]:
         scope = s.scope or "ref"
         rows.append((s.name, scope, status, ",".join(s.to), ref))
     for n, targets in delivery.BOX_TOKENS.items():
+        if delivery.TOKEN_NEEDS.get(n) == "router" and not compose.has_router(prof):
+            continue
         rows.append((n, "box", "made at up", ",".join(targets), "(state, rotated at down)"))
     sa = secretstore.sa_token_ref(cfg, prof.name)
     if secretstore.exists(sa):
@@ -657,15 +665,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("shell", help="bash in the box [-- cmd ...]")
     p.add_argument("profile", nargs="?")
     p.set_defaults(func=cmd_shell)
+    model_help = (
+        "ollama/<model> (host Ollama), remote/<name> ([models.remote.<name>]), or a model name"
+    )
     for a in AGENTS:
         p = sub.add_parser(a, help=f"{a} in the box [-- args ...]")
         p.add_argument("profile", nargs="?")
+        p.add_argument("--model", help=model_help)
         p.set_defaults(func=cmd_agent)
 
     p = sub.add_parser("run", help="headless agent run")
     p.add_argument("profile")
     p.add_argument("--agent", required=True, choices=AGENTS)
     p.add_argument("--prompt-file", required=True)
+    p.add_argument("--model", help=model_help)
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("allow", help="allow a domain: allow [profile] <domain>")

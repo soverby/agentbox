@@ -8,7 +8,7 @@
   (name, value) set, keyed by a per-profile random key (state, 0600). Compose
   does not see secret content, so the label makes a changed set recreate
   exactly the affected container. A plain hash of a value is never stored.
-- Per-box random tokens (MCP_GATEWAY_TOKEN; the router master key in P5) live
+- Per-box random tokens (MCP_GATEWAY_TOKEN, AGENTBOX_ROUTER_MASTER_KEY) live
   in state (0600), are made at the first `up`, and are replaced at `down`.
 """
 
@@ -27,9 +27,14 @@ from .paths import Config
 from .profile import CLAUDE_TOKEN, Profile
 
 MCP_GATEWAY_TOKEN = "MCP_GATEWAY_TOKEN"
-ROUTER_MASTER_KEY = "AGENTBOX_ROUTER_MASTER_KEY"  # reserved name; generated from P5
+ROUTER_MASTER_KEY = "AGENTBOX_ROUTER_MASTER_KEY"  # reserved name (AGENTBOX_*)
 # name -> targets. Only services that are rendered receive them.
-BOX_TOKENS = {MCP_GATEWAY_TOKEN: ["agent", "mcp-gateway"]}
+BOX_TOKENS = {MCP_GATEWAY_TOKEN: ["agent", "mcp-gateway"], ROUTER_MASTER_KEY: ["agent", "router"]}
+# A box token goes to the agent only when this sidecar runs (no router key in
+# a box without a router).
+TOKEN_NEEDS = {ROUTER_MASTER_KEY: "router"}
+# LiteLLM refuses a master key that does not start with "sk-".
+TOKEN_PREFIX = {ROUTER_MASTER_KEY: "sk-"}
 TARGET_SERVICES = ("agent", "router", "mcp-gateway")
 LABEL = "agentbox.secrets"
 TOKENS_FILE = "box-tokens.json"
@@ -46,7 +51,8 @@ ENV_PREFIX = "AGENTBOX_SECRET_"
 # "other" read is what lets the non-root gateway user (uid 10002) read them.
 # Every process in the gateway container runs as that uid, so stdio MCP
 # servers it spawns could read these files too (they get no secret env).
-SECRET_MODE = {"agent": "0444", "mcp-gateway": "0444"}
+# router: root:root 0444 too; the router runs as uid 10003.
+SECRET_MODE = {"agent": "0444", "mcp-gateway": "0444", "router": "0444"}
 
 
 @dataclass
@@ -86,7 +92,7 @@ def hmac_key(state: Path) -> bytes:
 
 
 def _new_tokens() -> dict[str, str]:
-    return {n: pysecrets.token_urlsafe(32) for n in BOX_TOKENS}
+    return {n: TOKEN_PREFIX.get(n, "") + pysecrets.token_urlsafe(32) for n in BOX_TOKENS}
 
 
 def box_tokens(state: Path) -> dict[str, str]:
@@ -136,6 +142,9 @@ def collect(
         d.values[s.name] = v
     if state is not None:
         for n, v in box_tokens(state).items():
+            need = TOKEN_NEEDS.get(n)
+            if need is not None and (need not in services or not profile.models.remote):
+                continue
             d.targets[n] = list(BOX_TOKENS[n])
             if services & set(BOX_TOKENS[n]):
                 d.values[n] = v

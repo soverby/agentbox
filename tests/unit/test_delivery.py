@@ -69,13 +69,17 @@ def test_render_names_only_and_target_filter(tmp_path):
     delivery.apply(doc, d, b"k" * 32)
     agent = doc["services"]["agent"]
     names = [e["target"] for e in agent["secrets"]]
+    # P5: the profile has [models.remote.*], so the router runs and the agent
+    # gets the per-box router master key (never the remote key).
     assert names == sorted(["AGENT_ONLY", "BOTH", "CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN",
-                            "MCP_GATEWAY_TOKEN"])  # fmt: skip
+                            "MCP_GATEWAY_TOKEN", "AGENTBOX_ROUTER_MASTER_KEY"])  # fmt: skip
     # no uid/gid (they make Compose chown to the container user): root:root 0444
     assert all(e["mode"] == "0444" and "uid" not in e and "gid" not in e for e in agent["secrets"])
     gw = [e["target"] for e in doc["services"]["mcp-gateway"]["secrets"]]
     assert gw == ["BOTH", "GW_ONLY", "MCP_GATEWAY_TOKEN"]
-    assert "ROUTER_KEY" not in doc["secrets"]  # no router service rendered
+    rt = doc["services"]["router"]["secrets"]
+    assert [e["target"] for e in rt] == ["AGENTBOX_ROUTER_MASTER_KEY", "ROUTER_KEY"]
+    assert all(e["mode"] == "0444" and "uid" not in e for e in rt)
     assert "secrets" not in doc["services"]["egress"]
     assert "secrets" not in doc["services"]["ollama-gate"]
     for n, spec in doc["secrets"].items():
@@ -144,11 +148,15 @@ def test_box_tokens_made_once_and_rotated(tmp_path):
     t1 = delivery.box_tokens(tmp_path)
     f = tmp_path / delivery.TOKENS_FILE
     assert f.stat().st_mode & 0o777 == 0o600
-    assert set(t1) == {"MCP_GATEWAY_TOKEN"} and len(t1["MCP_GATEWAY_TOKEN"]) >= 40
+    assert set(t1) == {"MCP_GATEWAY_TOKEN", "AGENTBOX_ROUTER_MASTER_KEY"}
+    assert len(t1["MCP_GATEWAY_TOKEN"]) >= 40
+    rk = t1["AGENTBOX_ROUTER_MASTER_KEY"]
+    assert rk.startswith("sk-") and len(rk) >= 43  # LiteLLM wants an sk- master key
     assert delivery.box_tokens(tmp_path) == t1
     delivery.rotate_box_tokens(tmp_path)
     t2 = delivery.box_tokens(tmp_path)
     assert t2["MCP_GATEWAY_TOKEN"] != t1["MCP_GATEWAY_TOKEN"]
+    assert t2["AGENTBOX_ROUTER_MASTER_KEY"] != rk  # rotated at down
     f.write_text("garbage")
     assert delivery.box_tokens(tmp_path)["MCP_GATEWAY_TOKEN"] not in (
         t1["MCP_GATEWAY_TOKEN"], t2["MCP_GATEWAY_TOKEN"],

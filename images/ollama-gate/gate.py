@@ -2,7 +2,8 @@
 """agentbox ollama-gate: path- and model-filtering proxy to host Ollama.
 
 PLAN §2.5. Stdlib only. Rules:
-- Explicit method + path list; anything else -> 403.
+- Explicit method + path list; anything else -> 403. `HEAD /` is answered
+  locally (ollama client liveness probe), never forwarded.
 - POST: media type application/json; Transfer-Encoding / Content-Encoding
   rejected; Content-Length required and capped; body parsed with
   object_pairs_hook + parse_constant into a JSON object, else 400.
@@ -135,6 +136,28 @@ class Policy:
         )
 
 
+FILTERED_GET = frozenset({"/api/tags", "/v1/models"})
+MAX_LISTING = 8 * 1024 * 1024
+
+
+def filter_listing(path: str, raw: bytes, policy: Policy) -> bytes:
+    """GET /api/tags and /v1/models: only allowed models reach the box (local
+    mode: non-cloud local; list mode: list ∩ local). Unparseable -> error."""
+    data = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+    if not isinstance(data, dict):
+        raise ValueError("listing is not an object")
+    key, name_of = (
+        ("models", lambda m: m.get("name") or m.get("model"))
+        if path == "/api/tags"
+        else ("data", lambda m: m.get("id"))
+    )
+    items = data.get(key)
+    if not isinstance(items, list):
+        raise ValueError(f"listing has no {key} list")
+    data[key] = [m for m in items if isinstance(m, dict) and policy.allowed(name_of(m))]
+    return json.dumps(data, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
 def local_models(tags: dict, show) -> list[str]:
     """Names from an /api/tags response with an empty remote_host, confirmed
     by /api/show (`show(name) -> dict`) also having an empty remote_host."""
@@ -188,6 +211,16 @@ def _to_plain(v):
 
 def _is_model_key(k: str, names: tuple[str, ...]) -> bool:
     return k.lower() in names or k.casefold() in names
+
+
+def drop_empty_show_keys(pairs: _Pairs, path: str) -> _Pairs:
+    """/api/show: the ollama client sends both `model` and `name`, one of them
+    exactly "" (0.34.3). A key spelled exactly `model`/`name` whose value is
+    exactly "" counts as absent and is dropped from the forwarded body."""
+    if path != "/api/show":
+        return pairs
+    out = _Pairs((k, v) for k, v in pairs if not (k in ("model", "name") and v == ""))
+    return out
 
 
 def check_model(pairs: _Pairs, path: str, policy: Policy) -> str:
@@ -250,7 +283,7 @@ def check_post_headers(headers, max_body: int) -> int:
 
 
 def check_post_body(body: bytes, path: str, policy: Policy) -> tuple[str, bytes]:
-    pairs = parse_json_object(body)
+    pairs = drop_empty_show_keys(parse_json_object(body), path)
     model = check_model(pairs, path, policy)
     try:
         # ensure_ascii: lone surrogates stay escaped instead of failing to encode.
@@ -409,6 +442,24 @@ def make_handler(gate: Gate):
                 reason=reason,
             )
 
+        def do_HEAD(self):
+            # The ollama client sends `HEAD /` as a liveness probe before
+            # every command. Answer it here; never forward it.
+            if self.path != "/":
+                return self._reject(403, "method or path not allowed", close=True)
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            gate.log(
+                client=self.client_address[0],
+                method="HEAD",
+                path="/",
+                model=None,
+                status=200,
+                bytes_in=0,
+                bytes_out=0,
+            )
+
         def _handle(self):
             try:
                 t = check_target(self.command, self.path, gate.policy)
@@ -431,6 +482,23 @@ def make_handler(gate: Gate):
                     return self._reject(r.status, r.reason, close=True)
             self._forward(t, model, body)
 
+        def _send_listing(self, t: Target, r):
+            raw = r.read(MAX_LISTING + 1)
+            try:
+                if r.status != 200 or len(raw) > MAX_LISTING:
+                    raise ValueError(f"upstream status {r.status}")
+                out = filter_listing(t.path, raw, gate.policy)
+            except (ValueError, UnicodeDecodeError, RecursionError) as e:
+                return self._reject(502, f"listing: {type(e).__name__}")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            gate.log(client=self.client_address[0], method="GET", path=t.path, model=None,
+                     status=200, bytes_in=0, bytes_out=len(out))  # fmt: skip
+            return None
+
         def _forward(self, t: Target, model, body):
             hdrs = {"User-Agent": "agentbox-ollama-gate"}
             for h in FORWARD_HEADERS:
@@ -448,6 +516,8 @@ def make_handler(gate: Gate):
                     r = c.getresponse()
                 except OSError as e:
                     return self._reject(502, f"upstream: {type(e).__name__}", model)
+                if t.method == "GET" and t.path in FILTERED_GET:
+                    return self._send_listing(t, r)
                 self.send_response(r.status)
                 for k, v in response_headers(r.getheaders()):
                     self.send_header(k, v)

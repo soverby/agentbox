@@ -271,7 +271,16 @@ def main() -> int:  # noqa: C901 (linear scenario)
         doctor_ok(
             e,
             MAIN,
-            {"13 (router)", "14 codex-apps-live", "15", "17 live", "18", "19", "20 allowed-call"},
+            {
+                "13 (router)",
+                "21 router",
+                "14 codex-apps-live",
+                "15",
+                "17 live",
+                "18",
+                "19",
+                "20 allowed-call",
+            },
             {
                 "1",
                 "2",
@@ -296,6 +305,7 @@ def main() -> int:  # noqa: C901 (linear scenario)
             {
                 "2",
                 "13 (router)",
+                "21 router",  # P5: no [models.remote.*] -> no router
                 "14 codex-config",
                 "15",
                 "17 live",

@@ -11,10 +11,14 @@
 PI_CLI=/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js
 ADAPTER=/usr/local/lib/agentbox/pi-mcp-adapter/node_modules/pi-mcp-adapter
 MCP_CONFIG=/etc/agentbox/pi-mcp.json
+# Model routes (agentbox pi --model ollama/<m> | remote/<name>): a root-owned
+# provider extension; it registers nothing unless the CLI set
+# AGENTBOX_MODEL_ROUTE and AGENTBOX_MODEL_ID. The CLI never writes models.json.
+MODELS_EXT=/usr/local/lib/agentbox/pi-models.ts
 case "${1-}" in
   install|remove|uninstall|update|list|config|auth)
     exec /usr/local/bin/node "$PI_CLI" "$@" ;;
 esac
 PI_MCP_CONFIG_MODE=exclusive
 export PI_MCP_CONFIG_MODE
-exec /usr/local/bin/node "$PI_CLI" --extension "$ADAPTER" --mcp-config "$MCP_CONFIG" "$@"
+exec /usr/local/bin/node "$PI_CLI" --extension "$ADAPTER" --mcp-config "$MCP_CONFIG" --extension "$MODELS_EXT" "$@"

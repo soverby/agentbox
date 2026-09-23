@@ -403,7 +403,7 @@ third-party router.
 | --- | --- | --- |
 | Claude Code | `CLAUDE_CODE_OAUTH_TOKEN`, direct to Anthropic via egress | Host ollama: `ANTHROPIC_BASE_URL=http://ollama-gate:11434`, `ANTHROPIC_AUTH_TOKEN=ollama` (Ollama serves `/v1/messages`). Remote: `ANTHROPIC_BASE_URL=http://router:4000` + router key. CLI shortcut: `agentbox claude --model ollama/<m>` or `--model remote/<m>`. |
 | Codex | ChatGPT login, direct to OpenAI via egress | `model_providers.<x>` with `wire_api = "responses"` (the only supported value): host ollama (`/v1/responses`, host Ollama ≥ 0.14.0) or router (LiteLLM Responses API bridged to chat completions for vLLM). Rendered by the CLI; same `--model` shortcut. |
-| Pi | `openai-codex` (ChatGPT login). Not the Claude plan: Anthropic does not permit subscription OAuth in third-party tools. | `models.json` custom provider → ollama-gate or router, rendered by the CLI. |
+| Pi | `openai-codex` (ChatGPT login). Not the Claude plan: Anthropic does not permit subscription OAuth in third-party tools. | Root-owned extension `/usr/local/lib/agentbox/pi-models.ts` (loaded by the wrapper) registers the ollama-gate / router provider; only the route and model id come from exec env. |
 | ollama CLI | — | `OLLAMA_HOST=http://ollama-gate:11434`, in `NO_PROXY`. Read and inference commands (`list`, `show`, `ps`, `run`). `pull`/`rm`/`cp`/`create`/`push` are denied: run them on the host. |
 
 - Host Ollama ≥ 0.14.0 (`/v1/messages`; `/v1/responses` non-stateful only).
@@ -425,18 +425,30 @@ third-party router.
     `/api/show`, `/v1/chat/completions`, `/v1/completions`,
     `/v1/embeddings`, `/v1/responses`, `/v1/messages`.
     No `/v1/*` wildcard (Ollama routes multipart `/v1/audio/transcriptions`
-    to the chat handler with `model` as a form field).
+    to the chat handler with `model` as a form field). `HEAD /` (the ollama
+    client's liveness probe) is answered 200 by the gate itself, never
+    forwarded.
   - Every POST: media type `application/json` (parameters allowed);
     `Transfer-Encoding` and `Content-Encoding` rejected; body size cap; body
     parsed with `object_pairs_hook` and `parse_constant` (rejects
     `NaN`/`Infinity`) into a JSON object, else 400.
   - Model check: exactly one top-level key that ASCII-case-insensitively
-    equals `model` (on `/api/show`: `model` or `name`, one in total),
-    spelled exactly, value allowed. Go's JSON decoder matches keys
+    equals `model` (on `/api/show`: `model` or `name`, one non-empty in
+    total; a key whose value is exactly `""` counts as absent and is dropped
+    from the forwarded body — the ollama client sends both), spelled
+    exactly, value allowed.
+  - `GET /api/tags` and `/v1/models` responses are filtered to the allowed
+    models, so `ollama list` shows only what the box can use. Go's JSON decoder matches keys
     case-insensitively, so `{"MODEL": …}` would otherwise reach Ollama
     unchecked.
   - Forwards its own re-serialized body with a fresh `Content-Length`.
   - Log: method, path, model, status, byte counts. Never bodies.
+- `[models.remote.<name>]` keys: `api_base` (https, port 443), `key`
+  (secret name), optional `model` (upstream model id, default `<name>`),
+  optional `provider = "openai" | "vllm"` (default `openai`).
+- With `--model ollama/…` or `remote/…`, the Claude session unsets
+  `CLAUDE_CODE_OAUTH_TOKEN` so the subscription token never reaches the gate
+  or the router.
 - Router (only when the profile has `[models.remote.*]`): LiteLLM container
   image pinned by digest, no database, `DISABLE_ADMIN_UI=True`,
   `store_model_in_db` off. The agent gets the per-box random master key
@@ -445,6 +457,20 @@ third-party router.
   `localhost,127.0.0.1` (for its healthcheck), so an SSRF to any internal
   name still goes to squid and is denied. Router egress allowlist: the
   remote model domains only.
+- Router request hardening: a root-owned LiteLLM pre-call hook baked into
+  the image (`/opt/agentbox-router/agentbox_guard.py`) rejects body keys that steer the upstream call
+  (`extra_headers`, `headers`, `api_key`, `extra_body`, any key matching
+  `*api_base*|*base_url*|*_headers`) with 400, and drops body keys outside
+  the OpenAI chat / Anthropic messages / Responses parameter sets (new
+  optional client parameters degrade instead of failing). Client request
+  headers are never forwarded upstream (`forward_client_headers_to_llm_api:
+  false`); `mcp`-type tools are rejected. The router runs as uid 10003,
+  which owns nothing under `/app`, so it cannot modify LiteLLM. Residual: without a DB, some non-admin LiteLLM
+  routes (`/ui` static bundle, `/openapi.json`, `/health/readiness`,
+  SSO/login stubs) answer outside `allowed_routes`; none reach an admin
+  action (doctor 21 samples them).
+  `/v1/messages/count_tokens` does not pass through the pre-call hook; it
+  cannot carry headers or the key elsewhere and only counts tokens.
 - Modal: `modal/serve_vllm.py` template deploys vLLM with an OpenAI-compatible
   endpoint and a bearer token.
 - Note: a custom `ANTHROPIC_BASE_URL` turns off Claude Code MCP tool search.
@@ -587,6 +613,9 @@ runs once the repo has a GitHub remote — until then Linux is untested). Every 
     `managed-mcp.json` is root-owned and not writable.
 17. Headless `agentbox run` with only env-delivered tokens
     (`CLAUDE_CODE_OAUTH_TOKEN`, `MCP_GATEWAY_TOKEN`) succeeds.
+21. Router (when present): healthy; with the master key, admin routes
+    (`/model/info`, `/config/yaml`, `/key/generate`, `/config/update`) →
+    403/404; a request with `api_base: http://agent:9` does not connect.
 20. Gateway: missing/wrong token → 401; only allowlisted namespaced tools
     listed; non-allowlisted `tools/call` rejected; agent cannot reach
     upstreams; gateway user writes only `/tmp` and its log dir, no setuid;

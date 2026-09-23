@@ -6,7 +6,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here"
 
-inputs=(Dockerfile versions.env managed-mcp.json pi-mcp.json pi-wrapper with-secrets
+inputs=(Dockerfile versions.env managed-mcp.json pi-mcp.json pi-wrapper pi-models.ts with-secrets
         pi-mcp-adapter/package.json pi-mcp-adapter/package-lock.json pi-mcp-adapter/.npmrc)
 for f in "${inputs[@]}"; do [ -f "$f" ] || { echo "missing input: $f" >&2; exit 1; }; done
 hash=$(for f in "${inputs[@]}"; do printf '%s\0' "$f"; cat "$f"; printf '\0'; done \

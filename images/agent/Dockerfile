@@ -170,6 +170,8 @@ RUN UV_PYTHON_INSTALL_DIR=/opt/python UV_PYTHON_BIN_DIR=/opt/python/bin \
 COPY managed-mcp.json /etc/claude-code/managed-mcp.json
 # Pi MCP config (pi-wrapper passes it with --mcp-config): only the gateway.
 COPY pi-mcp.json /etc/agentbox/pi-mcp.json
+# Pi model-route provider (pi-wrapper loads it with --extension; PLAN §2.5).
+COPY pi-models.ts /usr/local/lib/agentbox/pi-models.ts
 COPY with-secrets /usr/local/bin/with-secrets
 # COPY and RUN create root-owned files; only set modes (a recursive chown
 # of /usr/local would duplicate ~1 GB into a new layer). test.sh doctor 16
@@ -178,6 +180,7 @@ COPY with-secrets /usr/local/bin/with-secrets
 RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + \
  && chmod 0755 /etc/claude-code /etc/agentbox /usr/local/bin/with-secrets \
  && chmod 0644 /etc/claude-code/managed-mcp.json /etc/agentbox/pi-mcp.json \
+      /usr/local/lib/agentbox/pi-models.ts \
  && find /usr/local /opt/python /etc/claude-code /etc/agentbox -xdev \( ! -user root -o -perm -o+w \) \
       ! -type l -printf "%u %m %p\n" > /tmp/bad \
  && { [ ! -s /tmp/bad ] || { echo "FATAL: non-root or world-writable:"; head -20 /tmp/bad; exit 1; } >&2; } \

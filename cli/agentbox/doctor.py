@@ -21,6 +21,7 @@ from . import (
     delivery,
     docker,
     doctor_mcp,
+    doctor_router,
     egress,
     launch,
     mcpgw,
@@ -592,6 +593,7 @@ def _full(b: boxmod.Box) -> list[Result]:
     elif not model:
         res.append(Result("SKIP", "15", "no allowed local model on host Ollama"))
     res += mcp_checks(b, allowlist)
+    res += doctor_router.check_21(b)
     return sorted(res, key=lambda x: (_num(x.check), x.check))
 
 

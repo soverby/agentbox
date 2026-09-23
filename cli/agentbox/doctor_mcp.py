@@ -21,7 +21,7 @@ import re
 import shlex
 
 from . import box as boxmod
-from . import launch, mcpgw, paths
+from . import compose, launch, mcpgw, paths
 from .denied import allow_matches
 
 GW_PROBE = r"""
@@ -161,7 +161,12 @@ def check_13(b: boxmod.Box, ua: str) -> list:
         res[0].detail = "; ".join(
             x for x in (res[0].detail, "gateway allowlist is empty: allowed case not tested") if x
         )
-    res.append(_result("SKIP", "13 (router)", "no router in this profile (P5)"))
+    if compose.has_router(p):
+        from . import doctor_router
+
+        res += doctor_router.check_13(b, ua)
+    else:
+        res.append(_result("SKIP", "13 (router)", "no [models.remote.*] in this profile"))
     return res
 
 

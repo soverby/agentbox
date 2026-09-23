@@ -23,6 +23,7 @@ from . import (
     network,
     paths,
     presets,
+    router,
     secretstore,
     term,
 )
@@ -85,7 +86,10 @@ def is_running(box: Box) -> bool:
         return False
     r = dc(box, "ps", "--status", "running", "--services", check=False)
     running = set(r.stdout.split()) if r.returncode == 0 else set()
-    return {"agent", "egress", "ollama-gate", mcpgw.SERVICE} <= running
+    want = {"agent", "egress", "ollama-gate", mcpgw.SERVICE}
+    if compose.has_router(box.profile):
+        want.add(router.SERVICE)
+    return want <= running
 
 
 def agent_domains(profile: Profile) -> list[str]:
@@ -95,7 +99,13 @@ def agent_domains(profile: Profile) -> list[str]:
 
 
 def ctx_for(
-    box: Box, n: int, agent_image="", egress_image="", gate_image="", gateway_image=""
+    box: Box,
+    n: int,
+    agent_image="",
+    egress_image="",
+    gate_image="",
+    gateway_image="",
+    router_image="",
 ) -> compose.Ctx:
     return compose.Ctx(
         profile=box.profile,
@@ -106,6 +116,7 @@ def ctx_for(
         egress_image=egress_image,
         gate_image=gate_image,
         gateway_image=gateway_image,
+        router_image=router_image,
     )
 
 
@@ -172,6 +183,31 @@ def wait_ready(box: Box) -> None:
             box, "logs", "--tail", "40", "egress", "ollama-gate", mcpgw.SERVICE, check=False
         ).stdout
         raise BoxError(f"egress / ollama-gate / mcp-gateway not ready:\n{tail}")
+    if compose.has_router(box.profile):
+        wait_router(box)
+
+
+ROUTER_WAIT = 180.0
+
+
+def router_health(box: Box) -> str:
+    cid = dc(box, "ps", "-q", router.SERVICE, check=False).stdout.strip()
+    if not cid:
+        return "missing"
+    r = docker.run(["docker", "inspect", "--format", "{{.State.Health.Status}}", cid], check=False)
+    return r.stdout.strip() or "unknown"
+
+
+def wait_router(box: Box, timeout: float = ROUTER_WAIT) -> None:
+    """The router healthcheck (`/health/liveliness` on 127.0.0.1) turns healthy."""
+    deadline = time.monotonic() + timeout
+    st = router_health(box)
+    while st != "healthy" and time.monotonic() < deadline:
+        time.sleep(1)
+        st = router_health(box)
+    if st != "healthy":
+        tail = dc(box, "logs", "--tail", "40", router.SERVICE, check=False).stdout
+        raise BoxError(f"router not healthy ({st}):\n{tail}")
 
 
 def host_git(key: str) -> str | None:
@@ -338,18 +374,21 @@ def _up(box: Box, accept_mount_change: bool, explicit: bool = False) -> None:
     gate_image = images.ensure_sidecar(repo, "ollama-gate")
     try:
         mcpgw.check(p)
-    except mcpgw.McpError as e:
+        router.check(p)
+    except (mcpgw.McpError, router.RouterError) as e:
         raise BoxError(str(e)) from None
     gateway_image = images.ensure_sidecar(repo, mcpgw.SERVICE)
+    router_image = images.ensure_sidecar(repo, router.SERVICE) if compose.has_router(p) else ""
 
     base = box.cfg.subnet_base
     in_use = docker.subnets()
     n = network.allocate(paths.state_home(), box.name, in_use, base)
     network.verify(n, in_use, base, exclude_project=box.project)
 
-    ctx = ctx_for(box, n, agent_image, egress_image, gate_image, gateway_image)
+    ctx = ctx_for(box, n, agent_image, egress_image, gate_image, gateway_image, router_image)
     _prepare_log_dirs(box, ctx, gate_image)
     write_gateway_config(ctx)
+    write_router_config(ctx)
     files = render_egress(box, ctx)
     old = read_conf(ctx.conf_dir)
     egress.write(ctx.conf_dir, files)
@@ -450,7 +489,16 @@ def write_gateway_config(ctx: compose.Ctx) -> None:
     egress.write(d, {"config.json": mcpgw.config_text(ctx.profile)})
 
 
-# Read a file in the box (empty when missing); write one from stdin atomically.
+def write_router_config(ctx: compose.Ctx) -> None:
+    """Router config (names and `os.environ/<NAME>` refs only), bind-mounted ro."""
+    if not compose.has_router(ctx.profile):
+        return
+    d = router.conf_dir(ctx)
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o755)
+    egress.write(d, {router.CONFIG_NAME: router.config_text(ctx.profile)})
+
+
 def down(box: Box, volumes: bool = False) -> None:
     """Stop the box; replace the per-box tokens for the next `up`."""
     with up_lock(box):

@@ -27,6 +27,7 @@ AGENT_INPUTS = (
     "managed-mcp.json",
     "pi-mcp.json",
     "pi-wrapper",
+    "pi-models.ts",
     "with-secrets",
     "pi-mcp-adapter/package.json",
     "pi-mcp-adapter/package-lock.json",
@@ -36,6 +37,7 @@ SIDECARS = {
     "egress": "images/egress",
     "ollama-gate": "images/ollama-gate",
     "mcp-gateway": "images/mcp-gateway",
+    "router": "images/router",
 }
 PROXY_VARS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy")
 

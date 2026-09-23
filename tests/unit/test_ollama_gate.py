@@ -191,9 +191,26 @@ def test_show_name_key():
     assert post("/api/show", {"model": "qwen3:8b"})[0] == "qwen3:8b"
 
 
+def test_show_empty_key_dropped():
+    """ollama 0.34.3 client: both keys, one exactly "" (counts as absent)."""
+    m, out = post("/api/show", {"model": "", "name": "qwen3:8b"})
+    assert m == "qwen3:8b" and json.loads(out) == {"name": "qwen3:8b"}
+    m, out = post("/api/show", {"model": "qwen3:8b", "name": ""})
+    assert m == "qwen3:8b" and json.loads(out) == {"model": "qwen3:8b"}
+    # only /api/show; elsewhere "" is just a disallowed model
+    with pytest.raises(gate.Reject) as r:
+        post("/api/chat", {"model": ""})
+    assert r.value.status == 403
+
+
 @pytest.mark.parametrize(
     "path,body,status",
     [
+        ("/api/show", {"model": "", "name": ""}, 400),
+        ("/api/show", {"model": "", "name": "evil"}, 403),
+        ("/api/show", {"NAME": "", "model": "qwen3:8b"}, 400),
+        ("/api/show", {"name": " ", "model": "qwen3:8b"}, 400),
+        ("/api/show", {"name": None, "model": "qwen3:8b"}, 400),
         ("/api/chat", {"MODEL": "evil"}, 400),
         ("/api/chat", {"MODEL": "qwen3:8b"}, 400),
         ("/api/chat", {"Model": "qwen3:8b", "model": "qwen3:8b"}, 400),
@@ -253,7 +270,21 @@ class _Up(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    LISTING = {
+        "/api/tags": {"models": [{"name": "qwen3:8b"}, {"name": "evil:latest"},
+                                 {"name": "gpt-oss:120b-cloud"}, "junk"]},
+        "/v1/models": {"object": "list", "data": [{"id": "qwen3:8b"}, {"id": "evil:latest"},
+                                                 {"id": "x:cloud"}]},
+    }  # fmt: skip
+
     def do_GET(self):
+        if self.path in self.LISTING:
+            d = json.dumps(self.LISTING[self.path]).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(d)))
+            self.end_headers()
+            self.wfile.write(d)
+            return
         self.send_response(200)
         self.send_header("Content-Length", "2")
         self.send_header("Connection", "X-Hop")
@@ -299,7 +330,7 @@ def _raw(port, data, timeout=5):
 
 def test_http10_not_chunked(live):
     port, _ = live
-    out = _raw(port, b"GET /api/tags HTTP/1.0\r\n\r\n")
+    out = _raw(port, b"GET /api/ps HTTP/1.0\r\n\r\n")
     head, _, body = out.partition(b"\r\n\r\n")
     assert head.startswith(b"HTTP/1.0 200") or head.startswith(b"HTTP/1.1 200")
     assert b"chunked" not in head.lower() and body == b"ok"
@@ -308,7 +339,7 @@ def test_http10_not_chunked(live):
 
 def test_http11_chunked(live):
     port, _ = live
-    out = _raw(port, b"GET /api/tags HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    out = _raw(port, b"GET /api/ps HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     head, _, body = out.partition(b"\r\n\r\n")
     assert b"transfer-encoding: chunked" in head.lower() and body == b"2\r\nok\r\n0\r\n\r\n"
 
@@ -324,9 +355,48 @@ def test_connection_cap_503(live):
     finally:
         hold.close()
     time.sleep(0.2)
-    out = _raw(port, b"GET /api/tags HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    out = _raw(port, b"GET /api/ps HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     assert b" 200 " in out.split(b"\r\n")[0] + b" "
 
 
 def test_client_timeout_is_set():
     assert gate.make_handler(None).timeout == 30
+
+
+def test_head_root_answered_locally(live):
+    port, log = live
+    out = _raw(port, b"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert out.startswith(b"HTTP/1.1 200")
+    assert '"method": "HEAD"' in log.read_text() or '"method":"HEAD"' in log.read_text()
+
+
+# `HEAD //` is not listed: Python collapses it to `/`, which is answered locally.
+@pytest.mark.parametrize("path", [b"/api/tags", b"/api/pull", b"/?x=1"])
+def test_head_other_paths_denied(live, path):
+    port, _ = live
+    out = _raw(port, b"HEAD " + path + b" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert out.startswith(b"HTTP/1.1 403")
+
+
+LISTED = [("/api/tags", "models", [{"name": "qwen3:8b"}]),
+          ("/v1/models", "data", [{"id": "qwen3:8b"}])]  # fmt: skip
+
+
+@pytest.mark.parametrize("path,key,want", LISTED)
+def test_listing_filtered_live(live, path, key, want):
+    port, _ = live
+    out = _raw(port, f"GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+    head, _, body = out.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 200") and b"chunked" not in head.lower()
+    assert json.loads(body)[key] == want
+
+
+def test_filter_listing_list_mode():
+    raw = json.dumps({"models": [{"name": "llama3.2:latest"}, {"model": "qwen3:8b"},
+                                 {"name": "extra:latest"}, {"name": "notlocal:1"},
+                                 {"name": "gpt-oss:20b-cloud"}]}).encode()  # fmt: skip
+    out = json.loads(gate.filter_listing("/api/tags", raw, POL))["models"]
+    assert out == [{"name": "llama3.2:latest"}, {"model": "qwen3:8b"}]
+    for bad in (b"[]", b'{"models": 1}', b"x", b'{"models":[],"t":NaN}'):
+        with pytest.raises(ValueError):
+            gate.filter_listing("/api/tags", bad, POL)

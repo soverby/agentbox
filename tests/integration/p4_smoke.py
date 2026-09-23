@@ -296,9 +296,18 @@ def main() -> int:  # noqa: C901 (linear scenario)
         r = e.box("ls -A /run/secrets")
         names = sorted(r.stdout.split())
         rec(
-            names == ["AGENT_TOK", "BOTH_TOK", "GH_TOKEN", "MCP_GATEWAY_TOKEN"],
+            # P5: the profile has [models.remote.m], so the router runs and
+            # the agent gets the per-box router master key (never ROUTER_TOK).
+            names == ["AGENTBOX_ROUTER_MASTER_KEY", "AGENT_TOK", "BOTH_TOK", "GH_TOKEN",
+                      "MCP_GATEWAY_TOKEN"],
             "agent /run/secrets = agent-targeted names only",
             " ".join(names),
+        )  # fmt: skip
+        r = e.compose("exec", "-T", "router", "ls", "-A", "/run/secrets")
+        rec(
+            sorted(r.stdout.split()) == ["AGENTBOX_ROUTER_MASTER_KEY", "ROUTER_TOK"],
+            "router /run/secrets = router-targeted names only (P5)",
+            " ".join(r.stdout.split()) + r.stderr.strip()[-200:],
         )
         r = e.box(
             "for n in GH_TOKEN AGENT_TOK BOTH_TOK MCP_GATEWAY_TOKEN; do "
@@ -403,7 +412,8 @@ def main() -> int:  # noqa: C901 (linear scenario)
             and lab1
             and lab2,
             "secret change recreates only the agent container (label changed)",
-            f"agent {ids1['agent']}->{ids2['agent']} egress {ids1['egress']}->{ids2['egress']}",
+            f"agent {ids1['agent']}->{ids2['agent']} egress {ids1['egress']}->{ids2['egress']} "
+            f"gate {ids1['ollama-gate']}->{ids2['ollama-gate']} label {lab1[:12]}->{lab2[:12]}",
         )
         r = e.box('printf %s "$AGENT_TOK" | sha256sum')
         rec(sha(vals["AGENT_TOK"]) in r.stdout, "new value delivered after the change")

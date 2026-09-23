@@ -26,6 +26,9 @@ MEMORY_RE = re.compile(r"([1-9][0-9]*)([kmg])", re.I)
 PACKAGE_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*")
 URL_RE = re.compile(r"https?://[^/\s?#@]+(/[^\s]*)?")  # no userinfo
 OLLAMA_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*(:[a-zA-Z0-9._-]+)?")
+# Upstream model id of a remote model (vLLM served name, HF id, OpenAI name).
+MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
+REMOTE_PROVIDERS = ("openai", "vllm")
 TOOL_RE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 REF_RES = (
@@ -111,6 +114,8 @@ class RemoteModel:
     name: str
     api_base: str
     key: str | None
+    model: str = ""  # upstream model id (default: the name)
+    provider: str = "openai"  # LiteLLM prefix: openai/<model> or hosted_vllm/<model>
 
 
 @dataclass(frozen=True)
@@ -509,11 +514,18 @@ def _parse_models(v: _V, top: dict) -> Models:
         p = f"models.remote.{rname}"
         if not full(ITEM_NAME_RE, rname):
             v.err(p, "invalid model name")
-        rm = v.table(rm, p, {"api_base", "key"})
+        rm = v.table(rm, p, {"api_base", "key", "model", "provider"})
         if "api_base" not in rm:
             v.err(f"{p}.api_base", "is required")
         api_base = v.url(rm, "api_base", p)
-        remote[rname] = RemoteModel(rname, api_base or "", v.secret_ref(rm, "key", p))
+        model = v.typed(rm, "model", p, (str,), None, "a string")
+        if model is not None and not full(MODEL_ID_RE, model):
+            v.err(f"{p}.model", "invalid model id")
+            model = None
+        provider = v.enum(rm, "provider", p, REMOTE_PROVIDERS, "openai")
+        remote[rname] = RemoteModel(
+            rname, api_base or "", v.secret_ref(rm, "key", p), model or rname, provider
+        )
     return Models(ollama=ollama, remote=remote)
 
 

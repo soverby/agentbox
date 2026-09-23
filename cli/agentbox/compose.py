@@ -1,7 +1,7 @@
 """Render the per-profile Compose project (PLAN §2, §2.1, §2.2, §2.5).
 
-P3 renders agent, egress, ollama-gate. Router (P5) and mcp-gateway (P6) plug
-in through `EXTRA_SERVICES` / egress clients when they exist. The output holds
+P3 renders agent, egress, ollama-gate; P6 adds mcp-gateway (always); P5 adds
+the router when the profile has `[models.remote.*]`. The output holds
 no secrets: P4 adds Compose `secrets:` with an `environment:` source, so values
 stay in the `docker compose up` process env only.
 """
@@ -65,6 +65,7 @@ class Ctx:
     egress_image: str
     gate_image: str
     gateway_image: str = ""
+    router_image: str = ""
     linux: bool = field(default_factory=lambda: sys.platform.startswith("linux"))
     gate_upstream: str = f"http://host.docker.internal:{GATE_PORT}"
     egress_config_hash: str = ""
@@ -189,8 +190,12 @@ def _gateway_service(ctx: Ctx) -> dict:
 
 
 # Extension point (name -> fn(ctx)). P6: the MCP gateway always runs (§2.6).
-# P5 adds "router".
 EXTRA_SERVICES: dict = {"mcp-gateway": _gateway_service}
+
+
+def has_router(profile: Profile) -> bool:
+    """P5: the router runs only when the profile has [models.remote.*]."""
+    return bool(profile.models.remote)
 
 
 def escape_dollars(v):
@@ -220,6 +225,10 @@ def _render(ctx: Ctx) -> dict:
     }
     for name, fn in EXTRA_SERVICES.items():
         services[name] = fn(ctx)
+    if has_router(p):
+        from . import router
+
+        services[router.SERVICE] = router.service(ctx)
     return {
         "name": project_name(p.name),
         "services": services,
@@ -238,8 +247,10 @@ def egress_clients(ctx: Ctx, agent_domains: list[str]) -> list[egress.Client]:
     """Egress ACL clients: the agent, plus each sidecar that runs (P5/P6)."""
     ips = network.fixed_ips(ctx.n, ctx.base)
     clients = [egress.Client("agent", ips["agent"], agent_domains)]
-    if "router" in EXTRA_SERVICES:
-        raise NotImplementedError("router egress allowlist is P5")
+    if has_router(ctx.profile):
+        from . import router
+
+        clients.append(egress.Client("router", ips["router"], router.egress_domains(ctx.profile)))
     if "mcp-gateway" in EXTRA_SERVICES:
         from . import mcpgw
 

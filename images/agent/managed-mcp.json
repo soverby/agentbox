@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "agentbox": {
+      "type": "http",
+      "url": "http://mcp-gateway:8080/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_GATEWAY_TOKEN}"
+      }
+    }
+  }
+}

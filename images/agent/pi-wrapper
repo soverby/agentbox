@@ -1,0 +1,12 @@
+#!/bin/sh
+# agentbox: run Pi with the root-owned pi-mcp-adapter extension loaded.
+# Pi has no system-wide extension location; `--extension` is its documented
+# per-invocation flag. Package-management and auth subcommands get no extra
+# flag.
+PI_CLI=/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js
+ADAPTER=/usr/local/lib/agentbox/pi-mcp-adapter/node_modules/pi-mcp-adapter
+case "${1-}" in
+  install|remove|uninstall|update|list|config|auth)
+    exec /usr/local/bin/node "$PI_CLI" "$@" ;;
+esac
+exec /usr/local/bin/node "$PI_CLI" --extension "$ADAPTER" "$@"

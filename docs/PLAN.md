@@ -114,10 +114,15 @@ Per profile, one Compose project `agentbox-<profile>` with two networks:
     Claude Code exits at startup).
   - Codex CLI — `@openai/codex` (npm), pinned.
   - Pi — `@earendil-works/pi-coding-agent` (npm, `--ignore-scripts`), pinned;
-    plus `pi-mcp-adapter` (pinned) for MCP.
+    plus `pi-mcp-adapter` (pinned) for MCP. Pi has no system-wide extension
+    directory, so `/usr/local/bin/pi` is a wrapper that adds
+    `--extension /usr/local/lib/agentbox/pi-mcp-adapter/node_modules/pi-mcp-adapter`
+    (adapter installed by `npm ci` from a committed lockfile; not for
+    `install|remove|uninstall|update|list|config|auth`).
   - Node.js 24 LTS (Pi needs Node ≥ 22.19).
   - Ollama — client binary only: a build stage downloads the release archive
-    and copies only `bin/ollama` (the full archive is ~1.3 GB of GPU libs).
+    (`ollama-linux-amd64.tar.zst`, ~1.4 GB of GPU libs; needs `zstd`) and
+    copies only `bin/ollama`.
     Docker Desktop on macOS has no GPU passthrough; models run on the host or
     on Modal.
   - GitHub CLI `gh` — official apt repository.
@@ -130,7 +135,9 @@ Per profile, one Compose project `agentbox-<profile>` with two networks:
 - Per-profile extra packages: `[box] packages = ["ffmpeg", …]`. The CLI
   builds a derived image (`FROM agentbox/agent`, `apt-get install`) at `up`,
   cached by package-list hash. The runtime stays non-root.
-- User-space installs work at runtime through the proxy: `uv`/`pip`,
+- User-space installs work at runtime through the proxy: `uv`/`pip`
+  (`pip install --user` works: the image removes the `EXTERNALLY-MANAGED`
+  marker),
   `npm -g` (`NPM_CONFIG_PREFIX=~/.npm-global` on `PATH`), `cargo`, `go`.
 - Runtime hardening (Compose): user `agent` (uid 1000, no sudo),
   `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`, `pids_limit`,
@@ -158,6 +165,7 @@ Per profile, one Compose project `agentbox-<profile>` with two networks:
   - Always denied, all modes: IP-literal hosts (`dstdom_regex -n` for IPv4
     and bracketed IPv6); `dst` ACL for `0/8`, `10/8`, `100.64/10`, `127/8`,
     `169.254/16`, `172.16/12`, `192.168/16`, `::1`, `fc00::/7`, `fe80::/10`
+    (never `::` or `::ffff:0:0/96`: squid parses them as `0.0.0.0/0`)
     (checked on squid's resolved address, which is also the address it
     connects to); `CONNECT` to any port other than 443 (80 only with
     `allow_http`); `manager`.
@@ -172,8 +180,14 @@ Per profile, one Compose project `agentbox-<profile>` with two networks:
   - No cache. Access log to `<state>/logs/egress.log`.
 - Allowlist files are bind-mounted read-only from the host state dir. Changes
   apply with `squid -k reconfigure` in the egress container — no box restart.
+- Squid rejects `a.com` together with `.a.com` (FATAL), so allowlists are
+  merged with `merge_domains`. A bad config fails `squid -k reconfigure` and
+  the old config stays active; the CLI runs `squid -k parse` first.
+- Doctor checks call curl with `--noproxy ''` wherever traffic must go
+  through the proxy (curl honours `NO_PROXY` even with `-x`).
 - Agent env: `HTTPS_PROXY`/`HTTP_PROXY=http://egress:3128`,
-  `NO_PROXY=router,mcp-gateway,ollama-gate`. Tools that ignore proxy env fail
+  `NO_PROXY=router,mcp-gateway,ollama-gate,localhost,127.0.0.1` (upper and
+  lower case forms). Tools that ignore proxy env fail
   closed (no route).
 - Presets in `presets/*.toml` (builder confirms each list against real
   traffic):
@@ -231,6 +245,8 @@ Agent launch flags set by the CLI (the box is the external sandbox):
   `web_tools = false` adds `-c web_search=disabled`.
 - Pi: default mode.
 - Working directory: current host dir if inside a mount, else first mount.
+- Sessions never start through a login shell (`bash -l`): Ubuntu's
+  `~/.profile` would put `~/.local/bin` before system `PATH` entries.
 
 Profile file — what `agentbox init foo --mount ~/Projects/foo` writes:
 
@@ -311,7 +327,13 @@ Mount validation (T1):
   `LD_*`, `*_PROXY` and `NPM_CONFIG_*` (any case), `NODE_OPTIONS`,
   `PYTHON*`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `OLLAMA_HOST`,
   `DISABLE_AUTOUPDATER`, `DISABLE_UPDATES`, `ENABLE_CLAUDEAI_MCP_SERVERS`,
-  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` (the CLI sets these). Also
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` (the CLI sets these),
+  `BASH_ENV`, `ENV`, `IFS`, `PS4`, `NODE_*`, `SSL_CERT_*`,
+  `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `GIT_*` (code execution or TLS
+  weakening). `with-secrets` enforces the same list, except the names the
+  CLI itself delivers as secrets (`MCP_GATEWAY_TOKEN`, `AGENTBOX_*`,
+  `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`); the profile validator is
+  the policy point for those. Also
   `CLAUDE_CODE_OAUTH_TOKEN` as a `key` or `bearer`.
 - Ref formats: `keychain:<service>`, `op://<vault>/<item>/<field>`,
   `env:<VAR>`.
@@ -351,6 +373,9 @@ third-party router.
 - Host Ollama ≥ 0.14.0 (`/v1/messages`; `/v1/responses` non-stateful only).
 - `models.ollama = "local"` (default): the gate reads host `/api/tags` at
   start and every 60 s and allows every model with an empty `remote_host`.
+  Ollama routes any model reference ending `:cloud` or `:<tag>-cloud` (any
+  case) to ollama.com even without a local model (`server/cloud_proxy.go`);
+  the gate always denies such names, in `local` and list modes.
   Cloud models (`*-cloud`, non-empty `remote_host`) are never allowed: they
   send the prompt from the host to ollama.com outside squid. A list instead
   of `"local"` pins the allowed models.
@@ -490,8 +515,10 @@ Each check is pass/fail. The full suite runs on `agentbox doctor`, after
     `{"name":ok,"model":other}` on `/api/show`, chunked body,
     `Content-Encoding`, non-JSON content type → 4xx; allowed chat → 200 and
     streams.
-16. No path under `/usr`, `/etc`, `/opt`, or on `PATH` is writable by the
-    agent user; `managed-mcp.json` is root-owned and not writable.
+16. No path under `/usr`, `/etc`, `/opt`, or on the system part of `PATH`
+    is writable by the agent user; home `PATH` entries (`~/.npm-global/bin`,
+    `~/.local/bin`) come after every system entry; no setuid/setgid files;
+    `managed-mcp.json` is root-owned and not writable.
 17. Headless `agentbox run` with only env-delivered tokens
     (`CLAUDE_CODE_OAUTH_TOKEN`, `MCP_GATEWAY_TOKEN`) succeeds.
 18. Host Ollama ≥ 0.14.0; no allowed model has a non-empty `remote_host`.
@@ -507,9 +534,9 @@ rounds, then escalate. Coordinator signs off.
 | Phase | Deliverable | Acceptance gate |
 | --- | --- | --- |
 | P0 | Layout, CLAUDE.md, profile schema + example, lint config | `pytest tests/unit` runs; schema validates `example.toml` and the `init` output |
-| P1 | Agent image | Build succeeds on amd64; doctor 16 passes; `claude --version` ≥ 2.1.246; `codex`, `pi`, `ollama`, `gh`, `jq` `--version` pass; `python --version` equals `versions.env` pin; no GPU libs; derived image with `packages` builds and is cached |
+| P1 | Agent image | Build succeeds on amd64; doctor 16 passes; `claude --version` ≥ 2.1.246; `codex`, `pi`, `ollama`, `gh`, `jq` `--version` pass; `python --version` equals `versions.env` pin; no GPU libs; Pi loads `pi-mcp-adapter` with an empty home volume |
 | P2 | Egress proxy (both modes, live reload), networks, subnet allocation, ollama-gate | Doctor 1–9, 13 (stub containers at the sidecar IPs), 15, 18, 19 pass on macOS host and Linux CI; `agentbox allow` takes effect without restart |
-| P3 | CLI: setup/init/sessions/run/login/allow/denied/ls/update, profile resolution from cwd, mount validation, git setup | Mount unit tests (symlink, `..`, descendant) pass; doctor 10, 12 pass; `login codex`, `login pi` (paste flow) complete; from `~/Projects/foo`, `agentbox claude` opens Claude in that dir; `git push` to a test repo works; `update` rolls back on doctor failure |
+| P3 | CLI: setup/init/sessions/run/login/allow/denied/ls/update, profile resolution from cwd, mount validation, git setup | Mount unit tests (symlink, `..`, descendant) pass; doctor 10, 12 pass; `login codex`, `login pi` (paste flow) complete; derived image with `packages` builds (root for `apt-get`, back to `agent`) and is cached; from `~/Projects/foo`, `agentbox claude` opens Claude in that dir; `git push` to a test repo works; `update` rolls back on doctor failure |
 | P4 | Secrets backends, scopes, target inference, delivery, `with-secrets` | Doctor 11 and 17 pass; unit tests per backend and scope; no secret in state dir, `docker inspect`, image layers, or logs |
 | P5 | Model routing: ollama-gate paths, optional router, Modal template, agent configs, `--model` shortcut | Claude (shared token) and Claude → host ollama answer (despite `count_tokens` 403); Codex (subscription) and Codex → host ollama via Responses API; Pi → host ollama; `codex exec` runs a shell command in a non-git mount and its output is in the transcript; `ollama list` shows host models; router with a stub server; `allowed_routes` lists exactly `/v1/messages`, `/v1/messages/count_tokens`, `/v1/responses`, `/v1/chat/completions`, `/chat/completions`, `/v1/models`, `/models`, `/health/liveliness`; router healthy; with the master key `/model/info`, `/config/yaml`, `/key/generate` → 403/404 and `api_base: http://agent:9` does not connect; `web_tools = false` removes web tools from Claude and Codex |
 | P6 | MCP gateway (static bearer, host servers) | Doctor 14 passes (Codex tested with a ChatGPT account that has a connector enabled; remote curated plugins absent, else add `features.plugins=false`); interactive and headless Claude start with `managed-mcp.json`; host MCP server via squid works for streamable HTTP and SSE; allowed tool call succeeds; disallowed tool absent from `tools/list` and `tools/call` rejected; unlisted server unreachable; bad token rejected; calls logged; works from Claude, Codex, Pi |

@@ -1,0 +1,8 @@
+{
+  "name": "agentbox-pi-mcp-adapter",
+  "private": true,
+  "description": "Pins pi-mcp-adapter and its full dependency tree (package-lock.json). Regenerate with images/agent/pi-mcp-adapter/lock.sh.",
+  "dependencies": {
+    "pi-mcp-adapter": "2.37.0"
+  }
+}

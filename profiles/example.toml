@@ -1,0 +1,48 @@
+# Example profile. Copy to ~/.config/agentbox/profiles/<name>.toml.
+
+[box]
+agents = ["claude", "codex", "pi"]
+resources = { cpus = 4, memory = "8g" }
+packages = ["ffmpeg", "sqlite3"]
+web_tools = true
+
+[[mount]]
+host = "~/Projects/example"
+mode = "rw"
+
+[[mount]]
+host = "~/Datasets/reference"
+path = "/data/reference"     # default: same absolute path as on the host
+# mode defaults to "ro"
+
+[network]
+mode = "strict"
+presets = ["anthropic", "openai", "github", "dev"]
+allow = ["huggingface.co", ".hf.co"]
+allow_http = false
+
+[secrets]
+GH_TOKEN = "shared"                           # keychain agentbox/_shared/GH_TOKEN
+HF_TOKEN = {}                                 # keychain agentbox/example/HF_TOKEN, to agent
+SENTRY_TOKEN = { ref = "op://agentbox-example/sentry/token", to = ["agent", "router"] }
+MODAL_API_KEY = { to = "router" }             # same as the inferred target
+
+[models]
+ollama = ["qwen3-coder:30b", "gpt-oss:20b"]
+
+[models.remote.qwen-modal]
+api_base = "https://example--vllm-serve.modal.run/v1"
+key = "MODAL_API_KEY"                         # goes to router
+
+[mcp.servers.docs]
+url = "https://mcp.example.com/mcp"
+bearer = "DOCS_MCP_TOKEN"                     # goes to mcp-gateway
+tools = ["search", "fetch"]
+
+[mcp.servers.tracker]
+url = "https://mcp.tracker.example.com/mcp"
+auth = "oauth"                                # agentbox mcp login example tracker
+
+[mcp.servers.files]
+command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/srv"]
+tools = ["read_file", "list_directory"]

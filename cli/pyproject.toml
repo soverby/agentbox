@@ -1,0 +1,22 @@
+[project]
+name = "agentbox"
+version = "0.0.1"
+description = "Docker sandboxes for AI agents"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+agentbox = "agentbox.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["agentbox"]
+
+[tool.pytest.ini_options]
+testpaths = ["../tests/unit"]

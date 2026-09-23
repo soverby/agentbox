@@ -217,7 +217,8 @@ in that directory.
 
 Agent launch flags set by the CLI (the box is the external sandbox):
 
-- Claude Code: `--dangerously-skip-permissions` (opt-out per profile).
+- Claude Code: `--dangerously-skip-permissions` (opt-out per profile:
+  `[box] skip_permissions = false`; default `true`).
   `web_tools = false` adds `--disallowedTools WebFetch WebSearch` (two
   arguments).
 - Codex, on every launch (interactive and `exec`), highest-precedence layer
@@ -251,8 +252,9 @@ presets = ["anthropic", "openai", "github", "dev"]
 allow = []
 
 [secrets]
-# Default: to = "agent", ref = keychain agentbox/<profile>/<NAME>.
-GH_TOKEN = "shared"          # keychain agentbox/_shared/GH_TOKEN
+# NAME = "shared": agent, keychain agentbox/_shared/NAME.
+# NAME = { to = "...", ref = "..." }: defaults agent + agentbox/<profile>/NAME.
+GH_TOKEN = "shared"
 # CLAUDE_CODE_OAUTH_TOKEN is implicit (shared) when "claude" is in agents.
 
 [models]
@@ -296,8 +298,23 @@ Mount validation (T1):
   credentials that are the same in every box anyway (the Claude token) or
   that the user chooses to share (a GitHub PAT). A profile-scoped secret is
   still the recommendation for sensitive work.
-- Target inference: secrets named by `[models.remote.*].key` go to `router`;
-  by `[mcp.servers.*].bearer` go to `mcp-gateway`; others go to `agent`.
+- Targets: a secret's targets are its explicit `to` (a name or a list) plus
+  the inferred ones: named by `[models.remote.*].key` → `router`; by
+  `[mcp.servers.*].bearer` → `mcp-gateway`; no explicit `to` and no
+  inference → `agent`. Inference adds targets, never removes them. The
+  shorthand `NAME = "shared"` means `{ shared = true, to = "agent" }`, so a
+  shared `GH_TOKEN` for the agent can also serve a GitHub MCP server. A
+  table without `to` that a sidecar uses goes only to that sidecar (T4).
+  `CLAUDE_CODE_OAUTH_TOKEN`, when declared, must target exactly `agent`.
+- Reserved names (rejected in `[secrets]`, `key`, `bearer`):
+  `MCP_GATEWAY_TOKEN`, `AGENTBOX_*`, `PATH`, `HOME`, `USER`, `SHELL`,
+  `LD_*`, `*_PROXY` and `NPM_CONFIG_*` (any case), `NODE_OPTIONS`,
+  `PYTHON*`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `OLLAMA_HOST`,
+  `DISABLE_AUTOUPDATER`, `DISABLE_UPDATES`, `ENABLE_CLAUDEAI_MCP_SERVERS`,
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` (the CLI sets these). Also
+  `CLAUDE_CODE_OAUTH_TOKEN` as a `key` or `bearer`.
+- Ref formats: `keychain:<service>`, `op://<vault>/<item>/<field>`,
+  `env:<VAR>`.
 - Delivery: Compose `secrets:` with `environment:` source; the CLI passes the
   values only in the environment of the `docker compose up` process. Compose
   copies each secret into the target container at `/run/secrets/<NAME>` at

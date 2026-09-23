@@ -40,6 +40,9 @@ the agent container, and it can send any request to any sidecar it can reach.
 - A shared secret (§2.4) is visible in every box that uses it.
 - Domain fronting: squid sees the `CONNECT` host, not the TLS SNI, so a
   CDN-hosted allowed domain (npm, PyPI) can front other tenants of that CDN.
+- Doctor results can be faked by a persistent agent process (same uid, no
+  Yama ptrace restriction). Isolation does not depend on doctor; only its
+  report does.
 - A container-escape kernel bug in the Docker Desktop VM.
 - A sidecar compromise gives that sidecar's own secrets (each sidecar holds
   only its own).
@@ -501,8 +504,12 @@ runs once the repo has a GitHub remote — until then Linux is untested). Every 
 3. Via proxy to an allowlisted domain → 200.
 4. Direct TCP to `1.1.1.1:443`, `169.254.169.254:80`, Docker Desktop VM IPs →
    fails.
-5. Via proxy, `CONNECT <literal IP>:443` (including an IP whose PTR is an
-   allowlisted domain) and `GET http://<literal IP>/` → 403.
+5. Via proxy, `CONNECT <literal IP>:443` and `GET http://<literal IP>/` →
+   403; the squid.conf loaded in the running egress is byte-identical to the
+   CLI render (whose `-n` and `deny ip_literal` semantics the harness
+   negative controls prove). The PTR case runs live only when an allowlisted
+   entry covers the PTR of a resolved IP; else it reports that it relies on
+   the config check.
 6. `getent hosts example.com` and `host.docker.internal` → no answer.
 7. Via proxy from agent, `CONNECT host.docker.internal:<port>` and
    `GET http://host.docker.internal:<port>/` (MCP ports included) → 403.

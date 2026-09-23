@@ -19,6 +19,8 @@ CONF_DIR = "/etc/squid/agentbox"
 LOG_DIR = "/var/log/agentbox"
 ACCESS_LOG = f"{LOG_DIR}/egress.log"
 PORT = 3128
+# Native "squid" logformat, then '"<url-encoded User-Agent>"' ("-" when absent).
+LOGFORMAT = '%ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %[un %Sh/%<a %mt "%#{User-Agent}>h"'
 CLIENTS = ("agent", "router", "mcp-gateway")
 HOST_NAMES = ("host.docker.internal", "gateway.docker.internal")
 
@@ -90,18 +92,31 @@ def render(
     clients: list[Client],
     allow_http: bool = False,
     host_mcp_ports: list[int] | None = None,
+    partial: bool = False,
 ) -> dict[str, str]:
     """Return {file name: content} for squid.conf and the allowlist files.
 
     `clients` must hold exactly agent, router, mcp-gateway (each with its fixed
-    IP; domains may be empty). In `open` mode the agent list is ignored.
+    IP; domains may be empty). With `partial=True` (P3: only the sidecars that
+    run get an ACL) it must hold agent plus any subset of the others. In
+    `open` mode the agent list is ignored.
     """
     if mode not in NETWORK_MODES:
         raise EgressError(f"unknown network mode {mode!r}")
     by_name = {c.name: c for c in clients}
-    if sorted(by_name) != sorted(CLIENTS) or len(clients) != len(CLIENTS):
-        raise EgressError(f"clients must be exactly {CLIENTS}, got {[c.name for c in clients]}")
+    names = [c.name for c in clients]
+    if partial:
+        if (
+            len(by_name) != len(clients)
+            or "agent" not in by_name
+            or not set(by_name) <= set(CLIENTS)
+        ):
+            raise EgressError(f"clients must be agent plus a subset of {CLIENTS}, got {names}")
+    elif sorted(by_name) != sorted(CLIENTS) or len(clients) != len(CLIENTS):
+        raise EgressError(f"clients must be exactly {CLIENTS}, got {names}")
     ports = sorted(set(host_mcp_ports or ()))
+    if ports and "mcp-gateway" not in by_name:
+        raise EgressError("host MCP ports need the mcp-gateway client")
     for p in ports:
         if not isinstance(p, int) or isinstance(p, bool) or not 1 <= p <= 65535:
             raise EgressError(f"invalid host MCP port {p!r}")
@@ -129,7 +144,10 @@ def render(
         "pid_filename /run/squid/squid.pid",
         "cache deny all",
         "cache_mem 0 MB",
-        f"access_log stdio:{ACCESS_LOG} squid",
+        # squid native format + the request User-Agent, URL-encoded (%#) inside
+        # quotes: no client-sent byte can add a field or a line.
+        f"logformat agentbox {LOGFORMAT}",
+        f"access_log stdio:{ACCESS_LOG} agentbox",
         f"cache_log stdio:{LOG_DIR}/cache.log",
         "cache_store_log none",
         "logfile_rotate 0",

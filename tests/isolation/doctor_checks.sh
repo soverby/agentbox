@@ -23,6 +23,9 @@
 #   DOCTOR_GATE_MODEL   an allowed model (15) []
 #   DOCTOR_GATE_DENIED_MODEL  a model that must be denied (15) [agentbox-not-a-model:1]
 #   DOCTOR_GATE_CLOUD_MODEL   a cloud model name (15) [gpt-oss:120b-cloud]
+#   DOCTOR_UA           User-Agent of every probe [agentbox-doctor]; the CLI sets
+#                       agentbox-doctor/<nonce> so `agentbox denied` can drop
+#                       exactly these requests
 #
 # Check 5 note: DOCTOR_PTR_NAME must be allowlisted (strict) and be the PTR of
 # DOCTOR_PTR_IP; the check first proves the name itself gets 200, so a
@@ -40,6 +43,7 @@ GATE=${DOCTOR_GATE:-http://ollama-gate:11434}
 GMODEL=${DOCTOR_GATE_MODEL:-}
 GDENIED=${DOCTOR_GATE_DENIED_MODEL:-agentbox-not-a-model:1}
 GCLOUD=${DOCTOR_GATE_CLOUD_MODEL:-gpt-oss:120b-cloud}
+UA=${DOCTOR_UA:-agentbox-doctor}
 RC=0
 
 # Per-check failure list; a check passes when it collects no reason.
@@ -53,11 +57,11 @@ report() {
 
 # CONNECT status code from the proxy for host:port ("000" = no answer).
 connect_code() {
-  curl -s -o /dev/null -x "$P" --noproxy '' --connect-timeout 5 -m 15 -w '%{http_connect}' "https://$1/" 2>/dev/null
+  curl -A "$UA" -s -o /dev/null -x "$P" --noproxy '' --connect-timeout 5 -m 15 -w '%{http_connect}' "https://$1/" 2>/dev/null
 }
 # Status of a plain-HTTP forward request through the proxy.
 plain_code() {
-  curl -s -o /dev/null -x "$P" --noproxy '' --connect-timeout 5 -m 15 -w '%{http_code}' "http://$1" 2>/dev/null
+  curl -A "$UA" -s -o /dev/null -x "$P" --noproxy '' --connect-timeout 5 -m 15 -w '%{http_code}' "http://$1" 2>/dev/null
 }
 expect_connect() {  # host:port expected-code
   local c; c=$(connect_code "$1"); [ "$c" = "$2" ] || bad "CONNECT $1 -> $c (want $2)"
@@ -70,7 +74,7 @@ tcp_fails() {  # host port
 }
 
 check_1() {
-  if curl -s -o /dev/null --noproxy '*' --connect-timeout 5 -m 10 https://example.com; then
+  if curl -A "$UA" -s -o /dev/null --noproxy '*' --connect-timeout 5 -m 10 https://example.com; then
     bad "direct https://example.com succeeded"
   fi
   if awk 'NR>1 && $2=="00000000" {f=1} END {exit !f}' /proc/net/route; then
@@ -87,7 +91,7 @@ check_2() {
 
 check_3() {
   expect_connect "$ALLOWED:443" 200
-  local c; c=$(curl -s -o /dev/null -x "$P" -m 20 -w '%{http_code}' "https://$ALLOWED/")
+  local c; c=$(curl -A "$UA" -s -o /dev/null -x "$P" -m 20 -w '%{http_code}' "https://$ALLOWED/")
   case "$c" in 2??|3??) ;; *) bad "GET https://$ALLOWED/ -> $c" ;; esac
   report 3
 }
@@ -145,9 +149,9 @@ check_8() {
   expect_connect "$ALLOWED:8443" 403
   local proxy_hp=${P#http://}
   local c
-  c=$(curl -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' "http://$proxy_hp/squid-internal-mgr/menu")
+  c=$(curl -A "$UA" -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' "http://$proxy_hp/squid-internal-mgr/menu")
   [ "$c" = 403 ] || bad "direct cache manager -> $c (want 403)"
-  c=$(curl -s -o /dev/null -x "$P" -m 10 -w '%{http_code}' "http://$proxy_hp/squid-internal-mgr/menu")
+  c=$(curl -A "$UA" -s -o /dev/null -x "$P" -m 10 -w '%{http_code}' "http://$proxy_hp/squid-internal-mgr/menu")
   [ "$c" = 403 ] || bad "proxied cache manager -> $c (want 403)"
   report 8
 }
@@ -175,7 +179,7 @@ check_12() {
 }
 
 check_13() {
-  if curl -s -o /dev/null --noproxy '*' --connect-timeout 5 -m 10 "https://$ALLOWED/"; then
+  if curl -A "$UA" -s -o /dev/null --noproxy '*' --connect-timeout 5 -m 10 "https://$ALLOWED/"; then
     bad "$ROLE: direct egress succeeded"
   fi
   expect_connect "$ALLOWED:443" 200
@@ -197,7 +201,7 @@ check_13() {
 # ---- ollama-gate
 gate_post() {  # path body [extra curl args...] -> status
   local path=$1 body=$2; shift 2
-  curl -s -o /dev/null --noproxy '*' -m 20 -w '%{http_code}' -X POST \
+  curl -A "$UA" -s -o /dev/null --noproxy '*' -m 20 -w '%{http_code}' -X POST \
     -H 'Content-Type: application/json' "$@" --data-binary "$body" "$GATE$path"
 }
 is_4xx() { case "$1" in 4??) return 0 ;; *) return 1 ;; esac; }
@@ -217,18 +221,18 @@ check_15() {
            /v1/responses/compact /api/me /api/experimental/web_fetch /api/chat/ /API/chat; do
     c=$(gate_post "$p" "$ok"); [ "$c" = 403 ] || bad "POST $p -> $c (want 403)"
   done
-  c=$(curl -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' -X DELETE \
+  c=$(curl -A "$UA" -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' -X DELETE \
       -H 'Content-Type: application/json' --data "{\"model\":\"$GMODEL\"}" "$GATE/api/delete")
   [ "$c" = 403 ] || bad "DELETE /api/delete -> $c"
-  c=$(curl -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' -I "$GATE/api/blobs/sha256:00")
+  c=$(curl -A "$UA" -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' -I "$GATE/api/blobs/sha256:00")
   [ "$c" = 403 ] || bad "HEAD /api/blobs -> $c"
-  c=$(curl -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' \
+  c=$(curl -A "$UA" -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' \
       -F "model=$GMODEL" -F "file=@/etc/hostname" "$GATE/v1/audio/transcriptions")
   [ "$c" = 403 ] || bad "multipart /v1/audio/transcriptions -> $c"
   c=$(gate_post /api/chat "{\"model\":\"$GDENIED\",\"messages\":[]}"); [ "$c" = 403 ] || bad "denied model -> $c"
   c=$(gate_post /api/chat "{\"model\":\"$GCLOUD\",\"messages\":[]}"); [ "$c" = 403 ] || bad "cloud model -> $c"
   c=$(gate_post /api/chat "{\"model\":\"$GMODEL:cloud\",\"messages\":[]}"); [ "$c" = 403 ] || bad ":cloud suffix -> $c"
-  c=$(curl -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' "$GATE/v1/models/$GDENIED")
+  c=$(curl -A "$UA" -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' "$GATE/v1/models/$GDENIED")
   [ "$c" = 403 ] || bad "GET /v1/models/<denied> -> $c"
   c=$(gate_post /api/chat "{\"MODEL\":\"$GDENIED\"}"); is_4xx "$c" || bad "MODEL key -> $c"
   c=$(gate_post /api/chat "{\"Model\":\"$GMODEL\"}"); is_4xx "$c" || bad "Model key -> $c"
@@ -237,19 +241,19 @@ check_15() {
   c=$(gate_post /api/show "{\"name\":\"$GMODEL\",\"model\":\"$GDENIED\"}"); is_4xx "$c" || bad "show name+model -> $c"
   c=$(gate_post /api/chat "{\"model\":\"$GMODEL\",\"x\":NaN}"); is_4xx "$c" || bad "NaN -> $c"
   c=$(gate_post /api/chat "[\"$GMODEL\"]"); is_4xx "$c" || bad "non-object -> $c"
-  c=$(printf '%s' "$ok" | curl -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' \
+  c=$(printf '%s' "$ok" | curl -A "$UA" -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' \
       -H 'Content-Type: application/json' -H 'Transfer-Encoding: chunked' --data-binary @- "$GATE/api/chat")
   is_4xx "$c" || bad "chunked body -> $c"
   c=$(gate_post /api/chat "$ok" -H 'Content-Encoding: gzip'); is_4xx "$c" || bad "Content-Encoding -> $c"
   c=$(gate_post /api/chat "$ok" -H 'Content-Type: text/plain'); is_4xx "$c" || bad "text/plain -> $c"
   c=$(gate_post /api/chat "$ok" -H 'Content-Type: application/x-www-form-urlencoded'); is_4xx "$c" || bad "form -> $c"
   c=$(gate_post /api/show "{\"model\":\"$GMODEL\"}"); [ "$c" = 200 ] || bad "show allowed -> $c"
-  c=$(curl -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' "$GATE/api/tags"); [ "$c" = 200 ] || bad "tags -> $c"
+  c=$(curl -A "$UA" -s -o /dev/null --noproxy '*' -m 10 -w '%{http_code}' "$GATE/api/tags"); [ "$c" = 200 ] || bad "tags -> $c"
   # allowed chat: 200, chunked, several NDJSON lines, first byte before the end
   local out hdr
   out=$(mktemp); hdr=$(mktemp)
   local w
-  w=$(curl -sN --noproxy '*' -m 300 -D "$hdr" -o "$out" -w '%{http_code} %{time_starttransfer} %{time_total}' \
+  w=$(curl -A "$UA" -sN --noproxy '*' -m 300 -D "$hdr" -o "$out" -w '%{http_code} %{time_starttransfer} %{time_total}' \
       -H 'Content-Type: application/json' --data-binary "$ok" "$GATE/api/chat")
   set -- $w
   [ "$1" = 200 ] || bad "allowed chat -> $1"
@@ -262,17 +266,17 @@ check_15() {
 
 check_18() {
   local v tags n rh c
-  v=$(curl -s --noproxy '*' -m 10 "$GATE/api/version" | jq -r .version)
+  v=$(curl -A "$UA" -s --noproxy '*' -m 10 "$GATE/api/version" | jq -r .version)
   if [ -z "$v" ] || [ "$v" = null ]; then bad "no version"
   elif [ "$(printf '%s\n0.14.0\n' "$v" | sort -V | head -1)" != 0.14.0 ]; then bad "Ollama $v < 0.14.0"; fi
-  tags=$(curl -s --noproxy '*' -m 10 "$GATE/api/tags")
+  tags=$(curl -A "$UA" -s --noproxy '*' -m 10 "$GATE/api/tags")
   while IFS=$'\t' read -r n rh; do
     [ -n "$n" ] || continue
     c=$(gate_post /api/show "{\"model\":\"$n\"}")
     if [ -n "$rh" ]; then
       [ "$c" = 403 ] || bad "cloud model $n (remote_host $rh) allowed: /api/show -> $c"
     elif [ "$c" = 200 ]; then
-      rh=$(curl -s --noproxy '*' -m 10 -H 'Content-Type: application/json' \
+      rh=$(curl -A "$UA" -s --noproxy '*' -m 10 -H 'Content-Type: application/json' \
            --data "{\"model\":\"$n\"}" "$GATE/api/show" | jq -r '.remote_host // ""')
       [ -z "$rh" ] || bad "allowed model $n has remote_host $rh"
     fi
@@ -307,7 +311,7 @@ ff02--1.sslip.io 2002-a01-203--1.sslip.io 100--1.sslip.io 2001--1.sslip.io \
 check_19_v6() {
   local names=${DOCTOR_V6_NAMES:-$V6_DEFAULT} canary out code err t
   canary=${names%% *}
-  out=$(curl -sv -o /dev/null -x "$P" --noproxy '' --connect-timeout 5 -m 15 \
+  out=$(curl -A "$UA" -sv -o /dev/null -x "$P" --noproxy '' --connect-timeout 5 -m 15 \
         -w 'CODE=%{http_connect}\n' "https://$canary/" 2>&1)
   code=$(printf '%s\n' "$out" | sed -n 's/^CODE=//p')
   err=$(printf '%s\n' "$out" | tr -d '\r' | sed -n 's/^< [Xx]-[Ss]quid-[Ee]rror: \([A-Z_]*\).*/\1/p' | head -1)

@@ -39,7 +39,9 @@ def test_strict_files_and_order():
     assert "http_access deny !CONNECT" in acc
     assert acc[-1] == "http_access deny all"
     assert "cache deny all" in c
-    assert f"access_log stdio:{e.ACCESS_LOG} squid" in c
+    assert f"access_log stdio:{e.ACCESS_LOG} agentbox" in c
+    assert f"logformat agentbox {e.LOGFORMAT}" in c
+    assert e.LOGFORMAT.endswith('"%#{User-Agent}>h"')
 
 
 def test_private_ranges_present():

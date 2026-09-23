@@ -16,7 +16,7 @@ resources = {{ cpus = 4, memory = "8g" }}
 [[mount]]
 host = {mount}
 mode = "rw"                  # init writes rw for the project; schema default is ro
-# path defaults to the same absolute path as on the host
+{dotpath}# path defaults to the same absolute path as on the host
 
 [network]
 mode = {mode}              # or "{other}"
@@ -49,7 +49,11 @@ def _toml_str(s: str) -> str:
 
 
 def render_default_profile(
-    name: str, mount: str, agents: list[str] | None = None, open_mode: bool = False
+    name: str,
+    mount: str,
+    agents: list[str] | None = None,
+    open_mode: bool = False,
+    allow_dotpath: bool = False,
 ) -> str:
     """Return the profile TOML for `agentbox init`.
 
@@ -63,4 +67,7 @@ def render_default_profile(
         mount=_toml_str(mount),
         mode='"open"  ' if open_mode else '"strict"',
         other="strict" if open_mode else "open",
+        dotpath="allow_dotpath = true         # mount is a dot-path under $HOME\n"
+        if allow_dotpath
+        else "",
     )

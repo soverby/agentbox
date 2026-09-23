@@ -70,10 +70,16 @@ def test_mount_path_override_and_mode():
 
 
 def test_mount_hook_called(monkeypatch):
+    # P3: the host check runs only with host_checks=True (the CLI always sets it).
     seen = []
-    monkeypatch.setattr("agentbox.profile.check_mount_host", seen.append)
+    monkeypatch.setattr(
+        "agentbox.profile.check_mount_host", lambda h, dot=False: seen.append((h, dot)) or h
+    )
     parse({"mount": [{"host": "/srv/a"}, {"host": "/srv/b"}]})
-    assert seen == ["/srv/a", "/srv/b"]
+    assert seen == []
+    parse_profile({"mount": [{"host": "/srv/a"}, {"host": "/srv/b", "allow_dotpath": True}]},
+                  "p1", host_checks=True)  # fmt: skip
+    assert seen == [("/srv/a", False), ("/srv/b", True)]
 
 
 # --- structural errors ------------------------------------------------------

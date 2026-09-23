@@ -1,6 +1,7 @@
 """Profile schema: load, validate, resolve defaults (PLAN §2.3–§2.6).
 
-Host-side mount checks (realpath, existence, denylist) are P3; see `check_mount_host`.
+Host-side mount checks (realpath, existence, denylist; P3) run in `check_mount_host`
+when `parse_profile(..., host_checks=True)`: the CLI always passes it.
 Every pattern check uses `re.fullmatch`, so a trailing newline never passes.
 """
 
@@ -11,6 +12,7 @@ import math
 import os
 import posixpath
 import re
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,6 +83,7 @@ class Mount:
     path: str  # container path, normalised
     mode: str
     allow_dotpath: bool
+    host_real: str = ""  # host realpath; set only when host checks ran
 
 
 @dataclass(frozen=True)
@@ -132,11 +135,91 @@ class Profile:
     mcp_servers: dict[str, McpServer] = field(default_factory=dict)
 
 
-def check_mount_host(host: str) -> None:
-    """P3 hook: realpath, existence, and denylist checks (PLAN §2.3 T1).
+# Mount denylist (PLAN §2.3, T1). "eq": only the path itself. "tree": the
+# path, any ancestor, and any descendant.
+DENY_EQ_ABS = ("/", "/Users")
+DENY_TREE_ABS = (
+    "/etc", "/private", "/var", "/System", "/Library",
+    "/var/run/docker.sock", "/run/docker.sock",
+)  # fmt: skip
+DENY_TREE_HOME = (
+    "Library", ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".config", ".cache", ".local",
+    ".claude", ".codex", ".pi", ".netrc", ".npmrc", ".pypirc", ".gitconfig",
+)  # fmt: skip
 
-    Not implemented in P0. P0 only expands `~`.
+
+class MountError(ValueError):
+    pass
+
+
+def _expand_home(host: str, home: str) -> str:
+    if host == "~" or host.startswith("~/"):
+        return home + host[1:]
+    if host.startswith("~"):
+        raise MountError(f"{host!r}: only ~ and ~/ are expanded (no ~user)")
+    return host
+
+
+def _variants(path: str) -> set[str]:
+    """The path as written plus its realpath (e.g. /etc and /private/etc)."""
+    return {path, os.path.realpath(path)}
+
+
+def check_mount_host(
+    host: str,
+    allow_dotpath: bool = False,
+    *,
+    home: str | None = None,
+    case_insensitive: bool | None = None,
+    system_deny: tuple[tuple[str, ...], tuple[str, ...]] | None = None,
+) -> str:
+    """Validate a mount host path; return its realpath. Raises MountError.
+
+    Refuses: relative or missing paths; a realpath equal to `/`, `/Users`, or
+    $HOME; equal to, an ancestor of, or a descendant of a denylist entry; a
+    dot-path under $HOME without `allow_dotpath`. On macOS (APFS is
+    case-insensitive) every comparison is case-insensitive. `home`,
+    `case_insensitive`, `system_deny` (eq, tree) are for tests.
     """
+    deny_eq, deny_tree = (DENY_EQ_ABS, DENY_TREE_ABS) if system_deny is None else system_deny
+    home = os.path.expanduser("~") if home is None else home
+    ci = sys.platform == "darwin" if case_insensitive is None else case_insensitive
+    path = _expand_home(host, home)
+    if not os.path.isabs(path):
+        raise MountError(f"{host!r}: host path must be absolute or start with ~/")
+    try:
+        real = os.path.realpath(path, strict=True)
+    except OSError:
+        raise MountError(
+            f"{host!r}: host path does not exist (Docker would create it as root)"
+        ) from None
+
+    def norm(p: str) -> str:
+        p = p.rstrip("/") or "/"
+        return p.casefold() if ci else p
+
+    r = norm(real)
+    eq = {norm(v) for p in (*deny_eq, home) for v in _variants(p)}
+    tree = {norm(v) for p in deny_tree for v in _variants(p)}
+    tree |= {norm(v) for x in DENY_TREE_HOME for v in _variants(os.path.join(home, x))}
+    if r in eq:
+        raise MountError(f"{host!r}: resolves to {real}, which is never mountable")
+    for e in sorted(tree):
+        if r == e or r.startswith(e + "/") or e.startswith(r + "/"):
+            raise MountError(
+                f"{host!r}: resolves to {real}, which is, contains, or is inside "
+                f"the denied path {e}"
+            )
+    for h in {norm(v) for v in _variants(home)}:
+        if r.startswith(h + "/"):
+            rel = r[len(h) + 1 :].split("/")
+            dot = [c for c in rel if c.startswith(".")]
+            if dot and not allow_dotpath:
+                raise MountError(
+                    f"{host!r}: resolves to {real}, a dot-path under $HOME; "
+                    "set allow_dotpath = true on this mount to allow it"
+                )
+    return real
 
 
 def full(pattern: re.Pattern, s: str) -> bool:
@@ -344,7 +427,7 @@ def _parse_box(v: _V, top: dict) -> Box:
     )
 
 
-def _parse_mounts(v: _V, top: dict) -> list[Mount]:
+def _parse_mounts(v: _V, top: dict, host_checks: bool) -> list[Mount]:
     mounts: list[Mount] = []
     raw = top.get("mount", [])
     if not isinstance(raw, list):
@@ -361,12 +444,19 @@ def _parse_mounts(v: _V, top: dict) -> list[Mount]:
             if "host" not in m:
                 v.err(f"{p}.host", "is required")
             continue
-        check_mount_host(host)
+        allow_dotpath = v.typed(m, "allow_dotpath", p, (bool,), False, "a boolean")
+        real = ""
+        if host_checks:
+            try:
+                real = check_mount_host(host, allow_dotpath)
+            except MountError as e:
+                v.err(f"{p}.host", str(e))
+                continue
         explicit = v.typed(m, "path", p, (str,), None, "a string")
         path, where = (
             (explicit, f"{p}.path")
             if explicit is not None
-            else (os.path.expanduser(host), f"{p}.host")
+            else (real or os.path.expanduser(host), f"{p}.host")
         )
         if msg := container_path_problem(path):
             v.err(where, msg)
@@ -380,7 +470,8 @@ def _parse_mounts(v: _V, top: dict) -> list[Mount]:
                 host=host,
                 path=path,
                 mode=v.enum(m, "mode", p, MOUNT_MODES, "ro"),
-                allow_dotpath=v.typed(m, "allow_dotpath", p, (bool,), False, "a boolean"),
+                allow_dotpath=allow_dotpath,
+                host_real=real,
             )
         )
     return mounts
@@ -511,14 +602,18 @@ def _parse_secrets(
     return secrets
 
 
-def parse_profile(data: dict, name: str) -> Profile:
-    """Validate a parsed TOML document and resolve defaults. Raises ProfileError."""
+def parse_profile(data: dict, name: str, host_checks: bool = False) -> Profile:
+    """Validate a parsed TOML document and resolve defaults. Raises ProfileError.
+
+    `host_checks`: also validate each mount on this host (`check_mount_host`);
+    the container path then defaults to the host realpath.
+    """
     v = _V()
     if not full(PROFILE_NAME_RE, name):
         v.err("<name>", f"profile name {name!r} must match {PROFILE_NAME_RE.pattern}")
     top = v.table(data, "", {"box", "mount", "network", "secrets", "models", "mcp"})
     box = _parse_box(v, top)
-    mounts = _parse_mounts(v, top)
+    mounts = _parse_mounts(v, top, host_checks)
     network = _parse_network(v, top)
     models = _parse_models(v, top)
     servers = _parse_mcp(v, top)
@@ -528,7 +623,7 @@ def parse_profile(data: dict, name: str) -> Profile:
     return Profile(name, box, mounts, network, secrets, models, servers)
 
 
-def load_profile(path: str | Path, name: str | None = None) -> Profile:
+def load_profile(path: str | Path, name: str | None = None, host_checks: bool = False) -> Profile:
     """Load a profile file. The profile name defaults to the file stem."""
     path = Path(path)
     name = name if name is not None else path.stem
@@ -540,4 +635,4 @@ def load_profile(path: str | Path, name: str | None = None) -> Profile:
         raise ProfileError([(str(path), f"not valid UTF-8 (byte {e.start})")]) from e
     except OSError as e:
         raise ProfileError([(str(path), f"cannot read: {e.strerror}")]) from e
-    return parse_profile(data, name)
+    return parse_profile(data, name, host_checks)

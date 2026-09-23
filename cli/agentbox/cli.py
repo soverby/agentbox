@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import getpass
 import hashlib
 import json
 import os
@@ -21,6 +22,7 @@ from . import (
     __version__,
     allowedit,
     compose,
+    delivery,
     denied,
     docker,
     egress,
@@ -30,12 +32,21 @@ from . import (
     network,
     paths,
     presets,
+    secretstore,
 )
 from . import box as boxmod
 from . import doctor as doc
 from . import runs as runsmod
 from . import update as upd
-from .profile import AGENTS, PROFILE_NAME_RE, ProfileError, load_profile, parse_profile
+from .profile import (
+    AGENTS,
+    CLAUDE_TOKEN,
+    PROFILE_NAME_RE,
+    ProfileError,
+    load_profile,
+    parse_profile,
+    secret_name_problem,
+)
 from .template import render_default_profile
 
 
@@ -63,9 +74,9 @@ def print_results(results: list[doc.Result]) -> bool:
     return not any(r.status == "FAIL" for r in results)
 
 
-def ensure_up(b: boxmod.Box, accept_mount_change: bool = False) -> None:
+def ensure_up(b: boxmod.Box, accept_mount_change: bool = False, explicit: bool = False) -> None:
     """`up` + fast doctor subset (1, 2, 6, 9). Refuses sessions on failure."""
-    boxmod.up(b, accept_mount_change)
+    boxmod.up(b, accept_mount_change, explicit)
     res = doc.fast(b)
     bad = [r for r in res if r.status == "FAIL"]
     if bad:
@@ -120,7 +131,7 @@ def cmd_init(args) -> int:
 def cmd_up(args) -> int:
     b = boxmod.load(resolve(args.profile))
     with boxmod.session_lock(b):
-        ensure_up(b, args.accept_mount_change)
+        ensure_up(b, args.accept_mount_change, explicit=True)
     print(f"{b.name}: up ({b.project})")
     return 0
 
@@ -187,7 +198,7 @@ def cmd_run(args) -> int:
     transcript = runsmod.transcript_path(rd)
     rc = 125  # the box could not start / the run did not happen
     done = False
-    with boxmod.session_lock(b) as lock:
+    with boxmod.session_lock(b):
         was_running = boxmod.is_running(b)
         meta["box_was_running"] = was_running
         try:
@@ -207,26 +218,19 @@ def cmd_run(args) -> int:
             if not done:
                 runsmod.finish(rd, rc, meta)
             if not was_running:
-                stop_if_idle(b, lock)
+                stop_if_idle(b)
     print(f"run: {rd} (exit {rc})")
     return rc
 
 
-def stop_if_idle(b: boxmod.Box, lock) -> None:
+def stop_if_idle(b: boxmod.Box) -> None:
     """Stop a box `run` started, unless another session joined it."""
-    if not boxmod.try_exclusive(lock):
-        err(f"{b.name}: another agentbox session uses the box; leaving it up")
-        return
     try:
-        others = boxmod.other_processes(b)
+        why = boxmod.stop_if_idle(b)
     except Exception as e:  # noqa: BLE001
-        err(f"{b.name}: cannot list box processes ({e}); leaving it up")
-        return
-    if others:
-        err(f"{b.name}: other processes run in the box ({others[0]!r}); leaving it up")
-        return
-    with contextlib.suppress(Exception):
-        boxmod.down(b)
+        why = f"stop failed ({e})"
+    if why:
+        err(f"{b.name}: {why}; leaving it up")
 
 
 def cmd_allow(args) -> int:
@@ -352,7 +356,7 @@ def scratch_doctor() -> bool:
                                     allow_dotpath=True))  # fmt: skip
         b = boxmod.load(name)
         ensure_up(b)
-        return print_results(doc.full(b))
+        return print_results(doc.full(b, scratch=True))
     except Exception as e:
         err(f"scratch doctor: {e}")
         return False
@@ -367,6 +371,240 @@ def scratch_doctor() -> bool:
                 os.environ[k] = v
         shutil.rmtree(work, ignore_errors=True)
         shutil.rmtree(roots, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- secrets
+@dataclasses.dataclass
+class SecretTarget:
+    name: str
+    ref: str
+    where: str  # "shared" or the profile name
+
+
+def secret_target(shared: bool, first: str, second: str | None) -> SecretTarget:
+    """`[--shared | <profile>] NAME` -> where the value lives."""
+    cfg = paths.load_config()
+    if shared:
+        if second is not None:
+            raise CliError("give either --shared or a profile, not both")
+        name = first
+    else:
+        prof_name, name = (first, second) if second is not None else (resolve(None), first)
+    if name == secretstore.OP_SA_NAME:
+        # Host-only: the per-profile 1Password service-account token (PLAN §2.4).
+        if shared:
+            raise CliError(f"{name} is per profile only; give the profile, not --shared")
+        return SecretTarget(name, secretstore.sa_token_ref(cfg, prof_name), prof_name)
+    if msg := secret_name_problem(name):
+        raise CliError(msg)
+    if shared:
+        return SecretTarget(name, secretstore.default_ref(cfg, "_shared", name), "shared")
+    f = paths.profile_file(prof_name)
+    if not f.is_file():
+        raise CliError(f"no profile {prof_name!r} ({f})")
+    try:
+        prof = load_profile(f, prof_name)
+    except ProfileError as e:
+        raise CliError(f"profile {prof_name} is invalid:\n{e}") from None
+    s = prof.secrets.get(name)
+    if s is None:
+        err(f"{name} is not in [secrets] of {prof_name}; it is not delivered until you add it")
+        return SecretTarget(name, secretstore.default_ref(cfg, prof_name, name), prof_name)
+    if s.scope == "shared":
+        raise CliError(f"{name} is shared in profile {prof_name}: use `--shared {name}`")
+    return SecretTarget(name, secretstore.ref_for(s, prof_name, cfg), prof_name)
+
+
+def read_value(prompt: str, from_stdin: bool) -> str:
+    """One value: hidden prompt, or one line from stdin (one trailing newline removed)."""
+    if from_stdin:
+        v = sys.stdin.read()
+        v = v[:-1] if v.endswith("\n") else v
+        v = v[:-1] if v.endswith("\r") else v
+    else:
+        if not sys.stdin.isatty():
+            raise CliError("stdin is not a terminal: use --stdin to pipe the value")
+        v = getpass.getpass(prompt)
+    if msg := secretstore.value_problem(v):
+        raise CliError(msg)
+    return v
+
+
+def cmd_secret_set(args) -> int:
+    t = secret_target(args.shared, args.first, args.second)
+    value = read_value(f"{t.name} (input hidden): ", args.stdin)
+    secretstore.set(t.ref, value)
+    print(f"{t.name}: stored ({t.where}, {t.ref})")
+    return 0
+
+
+def cmd_secret_rm(args) -> int:
+    t = secret_target(args.shared, args.first, args.second)
+    if not secretstore.delete(t.ref):
+        raise CliError(f"{t.name}: not found at {t.ref}")
+    print(f"{t.name}: removed ({t.where}, {t.ref})")
+    return 0
+
+
+def present(ref: str, fetch) -> bool:
+    """op refs need the profile's service-account token; others use exists()."""
+    return fetch(ref) is not None if ref.startswith("op://") else secretstore.exists(ref)
+
+
+def secret_rows(prof, cfg) -> list[tuple[str, str, str, str, str]]:
+    """(name, scope, status, targets, ref) for a profile. Never values."""
+    rows = []
+    fetch = secretstore.fetcher(cfg, prof.name)
+    for s in sorted(prof.secrets.values(), key=lambda x: x.name):
+        ref = secretstore.ref_for(s, prof.name, cfg)
+        status = "present" if present(ref, fetch) else "missing"
+        scope = s.scope or "ref"
+        rows.append((s.name, scope, status, ",".join(s.to), ref))
+    for n, targets in delivery.BOX_TOKENS.items():
+        rows.append((n, "box", "made at up", ",".join(targets), "(state, rotated at down)"))
+    sa = secretstore.sa_token_ref(cfg, prof.name)
+    if secretstore.exists(sa):
+        rows.append((secretstore.OP_SA_NAME, "host", "present", "-", sa))
+    return rows
+
+
+def cmd_secret_ls(args) -> int:
+    cfg = paths.load_config()
+    if args.shared:
+        if args.profile:
+            raise CliError("give either --shared or a profile, not both")
+        users: dict[str, list[str]] = {CLAUDE_TOKEN: []}
+        for n in launch.list_profiles(paths.profiles_dir()):
+            try:
+                prof = load_profile(paths.profile_file(n), n)
+            except ProfileError:
+                continue
+            for s in prof.secrets.values():
+                if s.scope == "shared":
+                    users.setdefault(s.name, []).append(n)
+        print(f"{'NAME':<32} {'STATUS':<8} USED BY")
+        for name in sorted(users):
+            ref = secretstore.default_ref(cfg, "_shared", name)
+            status = "present" if secretstore.exists(ref) else "missing"
+            print(f"{name:<32} {status:<8} {', '.join(users[name]) or '-'}")
+        return 0
+    name = resolve(args.profile)
+    try:
+        prof = load_profile(paths.profile_file(name), name)
+    except (ProfileError, OSError) as e:
+        raise CliError(f"profile {name}: {e}") from None
+    print(f"{'NAME':<32} {'SCOPE':<8} {'STATUS':<10} {'TARGETS':<24} REF")
+    for r in secret_rows(prof, cfg):
+        print(f"{r[0]:<32} {r[1]:<8} {r[2]:<10} {r[3]:<24} {r[4]}")
+    return 0
+
+
+# ---------------------------------------------------------------- setup, login
+CLAUDE_TOKEN_PREFIX = "sk-ant-oat01-"
+MIN_OLLAMA = (0, 14, 0)
+
+
+def ollama_note(url: str = "http://127.0.0.1:11434/api/version") -> str:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:  # noqa: S310 - fixed local URL
+            v = json.loads(r.read()).get("version", "")
+    except (OSError, ValueError):
+        return "host Ollama: not running (optional; start it for local models)"
+    try:
+        parts = tuple(int(x) for x in v.split("-")[0].split(".")[:3])
+    except ValueError:
+        return f"host Ollama {v}: cannot parse the version"
+    if parts < MIN_OLLAMA:
+        return f"host Ollama {v}: older than 0.14.0; update it (the gate needs >= 0.14.0)"
+    return f"host Ollama {v}: ok"
+
+
+def claude_token_problem(v: str) -> str | None:
+    if not v.startswith(CLAUDE_TOKEN_PREFIX):
+        return f"the token must start with {CLAUDE_TOKEN_PREFIX} (output of `claude setup-token`)"
+    return secretstore.value_problem(v)
+
+
+def setup_token(from_stdin: bool) -> None:
+    cfg = paths.load_config()
+    ref = secretstore.default_ref(cfg, "_shared", CLAUDE_TOKEN)
+    if secretstore.exists(ref):
+        if from_stdin or not is_tty():
+            print(f"{CLAUDE_TOKEN}: already stored ({ref}); keeping it")
+            return
+        if input(f"{CLAUDE_TOKEN} is already stored. Replace it? [y/N] ").strip().lower() not in (
+            "y",
+            "yes",
+        ):
+            print(f"{CLAUDE_TOKEN}: kept")
+            return
+    if not from_stdin:
+        print(
+            "Run `claude setup-token` on the host (it opens a browser and prints a one-year "
+            "token),\nthen paste the token here. The input is hidden."
+        )
+    v = read_value("Claude token: ", from_stdin)
+    if msg := claude_token_problem(v):
+        raise CliError(msg)
+    secretstore.set(ref, v)
+    print(f"{CLAUDE_TOKEN}: stored ({ref})")
+
+
+def cmd_setup(args) -> int:
+    r = docker.run(["docker", "info", "--format", "{{.ServerVersion}}"], check=False)
+    if r.returncode != 0:
+        raise CliError("Docker is not running (start Docker Desktop, then run setup again)")
+    print(f"docker: engine {r.stdout.strip()}")
+    repo = paths.repo_root()
+    print("images: building or reusing agentbox/agent, egress, ollama-gate ...", flush=True)
+    print(f"images: {images.ensure_agent(repo)}")
+    for side in ("egress", "ollama-gate"):
+        print(f"images: {images.ensure_sidecar(repo, side)}")
+    vals = paths.read_config_values()
+    if "secret_backend" not in vals:
+        vals["secret_backend"] = "keychain"
+        print(f"config: wrote {paths.write_config(vals)} (secret_backend = keychain)")
+    else:
+        print(f"config: {paths.config_file()} (secret_backend = {vals['secret_backend']})")
+    if not args.skip_token:
+        setup_token(args.token_stdin)
+    print(ollama_note())
+    if args.skip_doctor:
+        return 0
+    print("doctor: full isolation self-test on a scratch profile ...", flush=True)
+    return 0 if scratch_doctor() else 1
+
+
+LOGIN_HINTS = {
+    "codex": (
+        "Codex device-code login. First, in ChatGPT (web) open Settings > Security and turn "
+        'on "Allow device code login". Then open the URL that Codex prints in your host '
+        "browser and enter the code. The login stays in this profile's home volume."
+    ),
+    "pi": (
+        "Pi login. In Pi, type /login and choose the provider (for ChatGPT: openai-codex). "
+        "Open the printed URL in your host browser and sign in. The browser then goes to a "
+        "localhost URL that does not load (Pi runs in the box): copy that full URL from the "
+        "address bar and paste it into Pi. Quit Pi with /quit or Ctrl+C twice. The login "
+        "stays in this profile's home volume."
+    ),
+}
+
+
+def cmd_login(args) -> int:
+    b = boxmod.load(args.profile)
+    if args.agent not in b.profile.box.agents:
+        raise CliError(f"{args.agent} is not in [box] agents of {b.name}")
+    if not is_tty():
+        raise CliError("login is interactive: run it in a terminal")
+    print(LOGIN_HINTS[args.agent], flush=True)
+    if args.agent == "codex":
+        cmd = ["codex", "login", "--device-auth"]
+    else:
+        cmd = launch.agent_argv(b.profile, "pi", [])
+    return session(b, cmd)
 
 
 # ---------------------------------------------------------------- parser
@@ -433,6 +671,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_denied)
 
+    p = sub.add_parser("secret", help="manage secrets: set / ls / rm")
+    ssub = p.add_subparsers(dest="secret_command", metavar="<set|ls|rm>")
+    ssub.required = True
+    for cmd, fn, hlp in (
+        ("set", cmd_secret_set, "store a secret: set [--shared | <profile>] NAME [--stdin]"),
+        ("rm", cmd_secret_rm, "delete a secret: rm [--shared | <profile>] NAME"),
+    ):
+        q = ssub.add_parser(cmd, help=hlp)
+        q.add_argument("--shared", action="store_true", help="shared scope (agentbox/_shared)")
+        q.add_argument("first", metavar="profile|NAME")
+        q.add_argument("second", nargs="?", metavar="NAME")
+        if cmd == "set":
+            q.add_argument("--stdin", action="store_true", help="read one value from stdin")
+        else:
+            q.set_defaults(stdin=False)
+        q.set_defaults(func=fn)
+    q = ssub.add_parser("ls", help="names, scope, present/missing, targets (never values)")
+    q.add_argument("--shared", action="store_true")
+    q.add_argument("profile", nargs="?")
+    q.set_defaults(func=cmd_secret_ls)
+
+    p = sub.add_parser("setup", help="first run: Docker, images, config, Claude token, doctor")
+    p.add_argument("--skip-token", action="store_true", help="do not ask for the Claude token")
+    p.add_argument("--token-stdin", action="store_true", help="read the Claude token from stdin")
+    p.add_argument("--skip-doctor", action="store_true", help="do not run the scratch doctor")
+    p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser("login", help="subscription login in the box: login <profile> codex|pi")
+    p.add_argument("profile")
+    p.add_argument("agent", choices=("codex", "pi"))
+    p.set_defaults(func=cmd_login)
+
     p = sub.add_parser("update", help="bump versions.env, rebuild, doctor")
     p.add_argument("--check", action="store_true", help="only list current vs latest")
     p.set_defaults(func=cmd_update)
@@ -465,6 +735,7 @@ def main(argv: list[str] | None = None) -> int:
         network.NetworkError,
         presets.PresetError,
         mountstate.MountChangeError,
+        secretstore.SecretError,
     ) as e:
         err(str(e))
         return 1

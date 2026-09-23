@@ -3,14 +3,27 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import compose, docker, egress, images, mountstate, network, paths, presets
+from . import (
+    compose,
+    delivery,
+    docker,
+    egress,
+    images,
+    mountstate,
+    network,
+    paths,
+    presets,
+    secretstore,
+)
 from .launch import WITH_SECRETS
 from .profile import Profile, ProfileError, load_profile
 
@@ -25,6 +38,7 @@ class Box:
     profile: Profile
     state: Path
     cfg: paths.Config
+    lock_fd: object = None  # this process's session.lock file while it holds it
 
     @property
     def project(self) -> str:
@@ -153,9 +167,9 @@ def host_git(key: str) -> str | None:
     return v or None
 
 
-def git_setup(box: Box) -> None:
-    """Host identity + HTTPS rewrite into the box ~/.gitconfig (PLAN §2.1).
-    `gh auth setup-git` needs GH_TOKEN: P4 hook `gh_setup_git`."""
+def git_setup(box: Box, agent_secrets: list[str] | None = None) -> None:
+    """Host identity + HTTPS rewrite into the box ~/.gitconfig (PLAN §2.1), and
+    `gh auth setup-git` when GH_TOKEN is delivered to the agent."""
     cmds = [["git", "config", "--global", "url.https://github.com/.insteadOf", "git@github.com:"]]
     for key in ("user.name", "user.email"):
         v = host_git(key)
@@ -165,14 +179,37 @@ def git_setup(box: Box) -> None:
         r = exec_in(box, c, timeout=30)
         if r.returncode != 0:
             raise BoxError(f"git setup failed: {' '.join(c[:4])}: {r.stderr.strip()}")
-    gh_setup_git(box)
+    if "GH_TOKEN" in (agent_secrets or []):
+        gh_setup_git(box)
 
 
 def gh_setup_git(box: Box) -> None:
-    """P4: `gh auth setup-git` once GH_TOKEN is delivered."""
+    """`gh auth setup-git` through with-secrets: git uses gh (and so GH_TOKEN,
+    read at each git call) as credential helper for github.com."""
+    r = exec_in(box, ["gh", "auth", "setup-git", "--hostname", "github.com"], timeout=60)
+    if r.returncode != 0:
+        raise BoxError(f"`gh auth setup-git` failed in the box: {r.stderr.strip()[-300:]}")
 
 
-def up(box: Box, accept_mount_change: bool = False) -> None:
+def warn(msg: str) -> None:
+    print(f"agentbox: {msg}", file=sys.stderr, flush=True)
+
+
+def secret_problems(d: delivery.Delivery, profile: Profile) -> None:
+    """One line per missing secret (the Claude token gets the setup hint)."""
+    hint = delivery.claude_hint(d, profile)
+    if hint:
+        warn(hint)
+    for m in d.missing:
+        if m.name == "CLAUDE_CODE_OAUTH_TOKEN" and hint:
+            continue
+        scope = profile.secrets[m.name].scope
+        where = "--shared" if scope == "shared" else profile.name
+        how = f"`agentbox secret set {where} {m.name}`" if scope else f"store it at {m.ref}"
+        warn(f"secret {m.name} ({m.ref}) is missing, so it is not delivered: {how}")
+
+
+def up(box: Box, accept_mount_change: bool = False, explicit: bool = False) -> None:
     """Render and start the box. Idempotent for a running box.
 
     Every `up` ends with `squid -k parse` + `squid -k reconfigure`: the egress
@@ -180,12 +217,104 @@ def up(box: Box, accept_mount_change: bool = False) -> None:
     `[network]` must be applied explicitly (a label with the config hash also
     recreates egress when the render changes).
     """
-    with (box.state / "up.lock").open("a") as lk:  # one `up` per profile at a time
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        _up(box, accept_mount_change)
+    with up_lock(box):  # one `up` / `down` per profile at a time
+        _up(box, accept_mount_change, explicit)
 
 
-def _up(box: Box, accept_mount_change: bool) -> None:
+LOCK_TIMEOUT = 300.0
+
+
+@contextmanager
+def up_lock(box: Box, timeout: float = LOCK_TIMEOUT):
+    """Exclusive up.lock: `up`, `down`, and run's stop-if-idle never interleave."""
+    with (box.state / "up.lock").open("a") as lk:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise BoxError(
+                        f"{box.name}: another agentbox up/down holds {lk.name} "
+                        f"for more than {timeout:.0f}s"
+                    ) from None
+                time.sleep(0.2)
+        yield
+
+
+def sessions_active(box: Box) -> bool:
+    """True when another process holds session.lock (a session uses the box).
+
+    macOS flock does not upgrade in place (it releases first), so the probe
+    never converts a lock: under an exclusive probe.lock (one prober at a
+    time) it drops this process's own shared lock, tries a non-blocking
+    exclusive lock on a fresh descriptor, and takes the shared lock back.
+    Callers hold up.lock, so no other up/down/stop runs meanwhile. A session
+    that starts inside the window holds a shared lock and counts as active.
+    """
+    with (box.state / "probe.lock").open("a") as pl:
+        fcntl.flock(pl, fcntl.LOCK_EX)
+        own = box.lock_fd
+        if own is not None:
+            fcntl.flock(own, fcntl.LOCK_UN)
+        try:
+            with (box.state / "session.lock").open("a") as g:
+                try:
+                    fcntl.flock(g, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return False
+                except BlockingIOError:
+                    return True
+        finally:
+            if own is not None:
+                fcntl.flock(own, fcntl.LOCK_SH)
+
+
+def running_label(box: Box, service: str = "agent") -> str | None:
+    cid = dc(box, "ps", "-q", service, check=False).stdout.strip()
+    if not cid:
+        return None
+    r = docker.run(
+        ["docker", "inspect", "--format", f'{{{{index .Config.Labels "{delivery.LABEL}"}}}}', cid],
+        check=False,
+    )
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+DEFER_MSG = "secret change applies after sessions end or `agentbox down {name}`"
+
+
+def keep_running_secrets(box: Box, doc: dict, old_doc: dict | None, dl) -> bool:
+    """If the agent's secret set changed while other sessions use the box, put
+    the running label and secret list back into `doc` (no recreate)."""
+    agent = doc["services"]["agent"]
+    new = agent.get("labels", {}).get(delivery.LABEL)
+    old = running_label(box)
+    if not old or old == new or not old_doc:
+        return False
+    old_agent = old_doc.get("services", {}).get("agent", {})
+    # A name the running container has but the backend no longer gives cannot
+    # be restored (its env var would be unset): recreate instead.
+    if any(e["source"] not in dl.values for e in old_agent.get("secrets", [])):
+        return False
+    if not sessions_active(box):
+        return False
+    agent["labels"][delivery.LABEL] = old
+    if old_agent.get("secrets"):
+        agent["secrets"] = old_agent["secrets"]
+    else:
+        agent.pop("secrets", None)
+    used = sorted({e["source"] for svc in doc["services"].values() for e in svc.get("secrets", [])})
+    if used:
+        doc["secrets"] = {n: {"environment": delivery.env_var(n)} for n in used}
+    else:
+        doc.pop("secrets", None)
+    return True
+
+
+def _up(box: Box, accept_mount_change: bool, explicit: bool = False) -> None:
     mountstate.check_and_record(box.state, box.profile, accept_mount_change)
     repo = paths.repo_root()
     p = box.profile
@@ -208,23 +337,57 @@ def _up(box: Box, accept_mount_change: bool) -> None:
     # Label = hash of squid.conf (mode, ACL layout): a change recreates egress.
     # Allowlist-only changes (`allow`) apply by reconfigure, without a restart.
     ctx.egress_config_hash = compose.config_hash({"squid.conf": files["squid.conf"]})
-    compose.write_json(box.compose_file, compose.render(ctx))
-    dc(box, "up", "-d", "--remove-orphans", "--quiet-pull", timeout=900)
+    doc = compose.render(ctx)
+    try:
+        dl = delivery.collect(p, box.cfg, box.state, set(doc["services"]))
+    except secretstore.SecretError as e:
+        raise BoxError(f"secrets: {e}") from None
+    running = is_running(box)
+    if explicit or not running:  # not on every session attach to a running box
+        secret_problems(dl, p)
+    delivery.apply(doc, dl, delivery.hmac_key(box.state))
+    old_doc = None
+    if running and box.compose_file.is_file():
+        try:
+            old_doc = json.loads(box.compose_file.read_text())
+        except ValueError:
+            old_doc = None
+    if running and keep_running_secrets(box, doc, old_doc, dl):
+        warn(DEFER_MSG.format(name=box.name))
+    compose.write_json(box.compose_file, doc)  # names only, never values
+    # Values reach only this process's environment (Compose `environment:` source).
+    # Only the backend fills AGENTBOX_SECRET_*: drop any inherited from the shell.
+    base = {k: v for k, v in os.environ.items() if not k.startswith(delivery.ENV_PREFIX)}
+    env = {**base, **delivery.compose_env(dl, doc)}
+    try:
+        dc(box, "up", "-d", "--remove-orphans", "--quiet-pull", timeout=900, env=env)
+    except docker.DockerError as e:
+        msg = str(e)
+        for v in dl.values.values():
+            msg = secretstore.scrub(msg, v)
+        raise BoxError(msg) from None
     wait_ready(box)
     # Unchanged files are what the running squid already loaded (the CLI is the
     # only writer); skip the reload so session starts do not disturb traffic.
     if files != old:
         apply_egress(box, ctx.conf_dir, old)
-    git_setup(box)
+    git_setup(box, dl.names_for("agent"))
 
 
 def down(box: Box, volumes: bool = False) -> None:
-    if not box.compose_file.is_file():
-        return
-    args = ["down", "--remove-orphans", "--timeout", "3"]
-    if volumes:
-        args.append("-v")
-    dc(box, *args, timeout=300)
+    """Stop the box; replace the per-box tokens for the next `up`."""
+    with up_lock(box):
+        down_locked(box, volumes)
+
+
+def down_locked(box: Box, volumes: bool = False) -> None:
+    """`down` for a caller that already holds up.lock."""
+    if box.compose_file.is_file():
+        args = ["down", "--remove-orphans", "--timeout", "3"]
+        if volumes:
+            args.append("-v")
+        dc(box, *args, timeout=300)
+    delivery.rotate_box_tokens(box.state)
 
 
 SQUID_CONF = f"{egress.CONF_DIR}/squid.conf"
@@ -277,17 +440,28 @@ def session_lock(box: Box):
     f = (box.state / "session.lock").open("a")
     try:
         fcntl.flock(f, fcntl.LOCK_SH)
+        box.lock_fd = f
         yield f
     finally:
+        box.lock_fd = None
         f.close()
 
 
-def try_exclusive(f) -> bool:
-    try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except BlockingIOError:
-        return False
+def stop_if_idle(box: Box) -> str | None:
+    """Stop a box that `run` started unless someone else uses it. Holds up.lock
+    for the whole decision, so no `up` can start a session in between.
+    Returns why the box stays up, or None when it was stopped."""
+    with up_lock(box):
+        if sessions_active(box):
+            return "another agentbox session uses the box"
+        try:
+            others = other_processes(box)
+        except Exception as e:  # noqa: BLE001
+            return f"cannot list box processes ({e})"
+        if others:
+            return f"other processes run in the box ({others[0]!r})"
+        down_locked(box)
+        return None
 
 
 IDLE_PROCS = ("sleep infinity", "/sbin/docker-init", "docker-init")

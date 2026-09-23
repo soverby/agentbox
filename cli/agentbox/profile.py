@@ -37,6 +37,7 @@ RESERVED_SECRET_RE = re.compile(
     r"MCP_GATEWAY_TOKEN|AGENTBOX_.*|PATH|HOME|USER|SHELL|LD_.*|NODE_OPTIONS|PYTHON.*"
     r"|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|OLLAMA_HOST|DISABLE_AUTOUPDATER|DISABLE_UPDATES"
     r"|ENABLE_CLAUDEAI_MCP_SERVERS|CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+    r"|_OP_SERVICE_ACCOUNT_TOKEN"  # host-only (op backend); never delivered to a box
 )
 PROXY_SECRET_RE = re.compile(r".*_PROXY|NPM_CONFIG_.*", re.I)
 LOCAL_SUFFIXES = ("localhost", "localdomain", "local", "internal", "home.arpa")
@@ -99,6 +100,10 @@ class Secret:
     name: str
     ref: str
     to: list[str]  # sorted target containers
+    # "shared" / "profile" when the ref is the default location (the backend and
+    # service prefix then come from config.toml, see secrets.ref_for); None when
+    # the profile gives an explicit ref.
+    scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -561,6 +566,7 @@ def _parse_secrets(
         explicit: set[str] = set()
         if sv == "shared":  # same as { shared = true, to = "agent" }
             ref = _default_ref(name, sname, shared=True)
+            scope = "shared"
             explicit = {"agent"}
         elif isinstance(sv, dict):
             t = v.table(sv, p, {"ref", "to", "shared"})
@@ -571,8 +577,10 @@ def _parse_secrets(
             if ref is not None and not ref_ok(ref):
                 v.err(f"{p}.ref", "must be keychain:<service>, op://<vault>/<item>/<field>, "
                       "or env:<VAR>")  # fmt: skip
+            scope = None
             if ref is None:
                 ref = _default_ref(name, sname, shared)
+                scope = "shared" if shared else "profile"
             to = t.get("to")
             to_list = [to] if isinstance(to, str) else to
             if to is not None:
@@ -590,14 +598,16 @@ def _parse_secrets(
         targets = explicit | inferred.get(sname, set()) or {"agent"}
         if sname == CLAUDE_TOKEN and targets != {"agent"}:
             v.err(p, f"{CLAUDE_TOKEN} must target exactly agent")
-        secrets[sname] = Secret(sname, ref, sorted(targets))
+        secrets[sname] = Secret(sname, ref, sorted(targets), scope)
 
     for sname, targets in inferred.items():
         if sname not in secrets:
-            secrets[sname] = Secret(sname, _default_ref(name, sname, False), sorted(targets))
+            secrets[sname] = Secret(
+                sname, _default_ref(name, sname, False), sorted(targets), "profile"
+            )
     if "claude" in box.agents and CLAUDE_TOKEN not in secrets:
         secrets[CLAUDE_TOKEN] = Secret(
-            CLAUDE_TOKEN, _default_ref(name, CLAUDE_TOKEN, True), ["agent"]
+            CLAUDE_TOKEN, _default_ref(name, CLAUDE_TOKEN, True), ["agent"], "shared"
         )
     return secrets
 

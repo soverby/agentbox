@@ -57,6 +57,13 @@ class Env:
             PYTHONPATH=str(ROOT / "cli"),
         )
         self.env.pop("AGENTBOX_REPO", None)
+        # P4: never read the user's keychain. Test-only env backend + test prefix;
+        # no values are set, so declared secrets are reported missing.
+        (self.roots / "config").mkdir()
+        (self.roots / "config" / "config.toml").write_text(
+            f'secret_backend = "env"\nsecret_prefix = "agentbox-test-{TAG}"\n'
+        )
+        self.env["AGENTBOX_TEST_SECRET_STORE"] = str(self.roots / "secret-store.json")
 
     def ab(self, *args, cwd=None, timeout=1800) -> subprocess.CompletedProcess:
         return sh(
@@ -107,13 +114,14 @@ def proxy_code(e: Env, name: str, host: str) -> str:
 
 
 def ck(c: str) -> tuple:
-    return (int(c.split("-")[0]), c)
+    return (int(c.split("-")[0].split()[0]), c)
 
 
 def doctor_ok(e: Env, name: str, want_skip: set[str], want_pass: set[str]) -> None:
     r = e.ab("doctor", name, timeout=900)
     lines = [x for x in r.stdout.splitlines() if x.split(" ")[0] in ("PASS", "FAIL", "SKIP")]
-    status = {x.split()[1].rstrip(":"): x.split()[0] for x in lines}
+    # check id = text between the status word and ": " ("17 env", "19-v6", ...)
+    status = {x.split(" ", 1)[1].partition(": ")[0].strip(): x.split()[0] for x in lines}
     fails = [x for x in lines if x.startswith("FAIL")]
     skips = {c for c, s in status.items() if s == "SKIP"}
     passes = {c for c, s in status.items() if s == "PASS"}
@@ -123,7 +131,7 @@ def doctor_ok(e: Env, name: str, want_skip: set[str], want_pass: set[str]) -> No
         and not fails
         and want_pass <= passes
         and skips <= want_skip
-        and {"11", "13", "14", "17"} <= skips
+        and {"13", "14"} <= skips
         and skip_reasons
     )
     rec(
@@ -178,8 +186,11 @@ def main() -> int:  # noqa: C901 (linear scenario)
             and a["user"] == "1000:1000"
             and a["init"] is True
             and list(a["networks"]) == ["internal"]
-            and "secrets" not in cj,
-            "rendered compose: hardening, internal-only agent, no secrets",
+            # P4: no values are stored in this smoke, so only the per-box token is
+            # delivered; the file holds names and env var names only.
+            and cj.get("secrets")
+            == {"MCP_GATEWAY_TOKEN": {"environment": "AGENTBOX_SECRET_MCP_GATEWAY_TOKEN"}},
+            "rendered compose: hardening, internal-only agent, secrets = box token (names only)",
         )
 
         # -- packages profile (open mode) second, so doctor 12 has a target
@@ -255,14 +266,14 @@ def main() -> int:  # noqa: C901 (linear scenario)
         doctor_ok(
             e,
             MAIN,
-            {"11", "13", "14", "15", "17", "18", "19"},
-            {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "12", "16"},
+            {"13", "14", "15", "17 live", "18", "19"},
+            {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "16", "17 env"},
         )
         doctor_ok(
             e,
             PKG,
-            {"2", "11", "13", "14", "15", "17", "18", "19-v6"},
-            {"1", "3", "4", "5", "6", "7", "8", "9", "10", "12", "16", "19"},
+            {"2", "13", "14", "15", "17 live", "18", "19-v6"},
+            {"1", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "16", "17 env", "19"},
         )
 
         # -- sessions from inside the mounted dir

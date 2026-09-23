@@ -9,6 +9,7 @@ touch the real config or state dirs.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,28 +62,84 @@ def state_dir(name: str, create: bool = True) -> Path:
     return d
 
 
+BACKENDS = ("keychain", "op", "env")
+PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+OP_VAULT_RE = re.compile(r"[^/\s\"\\]+")
+CONFIG_KEYS = ("subnet_base", "secret_backend", "secret_prefix", "op_vault")
+
+
 @dataclass(frozen=True)
 class Config:
     subnet_base: str = DEFAULT_BASE
+    # Backend for default secret locations (PLAN §2.4, §7: keychain). Refs with
+    # an explicit scheme in a profile always use that scheme's backend.
+    secret_backend: str = "keychain"
+    # First part of the default service name: <prefix>/<profile|_shared>/<NAME>.
+    # Tests set it to agentbox-test-<rand> so they never touch real items.
+    secret_prefix: str = "agentbox"
+    op_vault: str | None = None  # needed when secret_backend = "op"
+
+
+def config_file() -> Path:
+    return config_home() / "config.toml"
 
 
 def load_config() -> Config:
     """~/.config/agentbox/config.toml. Missing file: defaults. Unknown key: error."""
-    f = config_home() / "config.toml"
+    f = config_file()
     if not f.is_file():
         return Config()
     try:
         data = tomllib.loads(f.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
         raise ConfigError(f"{f}: {e}") from None
-    unknown = set(data) - {"subnet_base"}
+    unknown = set(data) - set(CONFIG_KEYS)
     if unknown:
         raise ConfigError(f"{f}: unknown key(s) {', '.join(sorted(unknown))}")
+    for k in CONFIG_KEYS:
+        if k in data and not isinstance(data[k], str):
+            raise ConfigError(f"{f}: {k} must be a string")
     base = data.get("subnet_base", DEFAULT_BASE)
-    if not isinstance(base, str):
-        raise ConfigError(f"{f}: subnet_base must be a string")
     try:
         parse_base(base)
     except NetworkError as e:
         raise ConfigError(f"{f}: {e}") from None
-    return Config(subnet_base=base)
+    backend = data.get("secret_backend", "keychain")
+    if backend not in BACKENDS:
+        raise ConfigError(f"{f}: secret_backend must be one of {', '.join(BACKENDS)}")
+    prefix = data.get("secret_prefix", "agentbox")
+    if not PREFIX_RE.fullmatch(prefix):
+        raise ConfigError(f"{f}: secret_prefix must match {PREFIX_RE.pattern}")
+    vault = data.get("op_vault")
+    if vault is not None and not OP_VAULT_RE.fullmatch(vault):
+        raise ConfigError(f"{f}: op_vault is not a valid 1Password vault name")
+    if backend == "op" and vault is None:
+        raise ConfigError(f'{f}: secret_backend = "op" needs op_vault')
+    return Config(subnet_base=base, secret_backend=backend, secret_prefix=prefix, op_vault=vault)
+
+
+def write_config(values: dict[str, str]) -> Path:
+    """Write config.toml (flat string keys, 0600) after validating it."""
+    f = config_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{k} = {_toml_str(values[k])}" for k in CONFIG_KEYS if k in values]
+    tmp = f.with_name(f".{f.name}.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(f)
+    load_config()
+    return f
+
+
+def read_config_values() -> dict[str, str]:
+    f = config_file()
+    if not f.is_file():
+        return {}
+    load_config()  # validates
+    return dict(tomllib.loads(f.read_text(encoding="utf-8")))
+
+
+def _toml_str(v: str) -> str:
+    if any(ord(c) < 0x20 or c in '"\\' or ord(c) == 0x7F for c in v):
+        raise ConfigError(f"config value {v!r} has characters this writer does not quote")
+    return f'"{v}"'

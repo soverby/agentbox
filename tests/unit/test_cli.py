@@ -117,6 +117,7 @@ def run_box(roots, monkeypatch, up_fails=False, others=()):
     monkeypatch.setattr(cli.subprocess, "run", run)
     monkeypatch.setattr(boxmod, "other_processes", lambda b: list(others))
     monkeypatch.setattr(boxmod, "down", lambda b, volumes=False: events.append("down"))
+    monkeypatch.setattr(boxmod, "down_locked", lambda b, volumes=False: events.append("down"))
     return events, seen
 
 
@@ -172,7 +173,7 @@ def test_fast_failure_message(roots, monkeypatch):
     from agentbox import doctor as doc
 
     setup_running_box(roots, monkeypatch, {})
-    monkeypatch.setattr(boxmod, "up", lambda b, accept=False: None)
+    monkeypatch.setattr(boxmod, "up", lambda b, accept=False, explicit=False: None)
     monkeypatch.setattr(doc, "fast", lambda b: [doc.Result("FAIL", "1", "default route present")])
     b = boxmod.load("demo")
     with pytest.raises(cli.CliError) as e:

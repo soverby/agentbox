@@ -16,16 +16,14 @@ import time
 from dataclasses import dataclass
 
 from . import box as boxmod
-from . import compose, docker, egress, network, paths
+from . import compose, delivery, docker, egress, launch, network, paths, secretstore
 from .denied import allow_matches
 
 FAST = ["1", "2", "6", "9"]
 INBOX_FULL = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
 NOT_IN_P3 = {
-    "11": "secrets delivery is P4",
     "13": "no router / mcp-gateway in this profile (P5/P6)",
     "14": "MCP gateway is P6",
-    "17": "headless run with env-delivered tokens is P4",
 }
 ALLOWED_PREF = ("example.com", "github.com", "pypi.org", "www.wikipedia.org")
 DENIED_PREF = ("example.org", "example.net", "iana.org", "www.w3.org")
@@ -34,9 +32,10 @@ PTR_IP, PTR_NAME = "1.1.1.1", "one.one.one.one"
 
 @dataclass
 class Result:
-    status: str  # PASS FAIL SKIP
+    status: str  # PASS FAIL SKIP WARN
     check: str
     detail: str = ""
+    kind: str = ""  # machine-readable sub-result (17: ok / rejected / no-token / other)
 
     def line(self) -> str:
         return f"{self.status} {self.check}" + (f": {self.detail}" if self.detail else "")
@@ -46,7 +45,7 @@ def parse_lines(text: str) -> list[Result]:
     out = []
     for raw in text.splitlines():
         line = raw.strip()
-        for st in ("PASS", "FAIL", "SKIP"):
+        for st in ("PASS", "FAIL", "SKIP", "WARN"):
             if line.startswith(st + " "):
                 rest = line[len(st) + 1 :]
                 check, _, detail = rest.partition(": ")
@@ -343,7 +342,191 @@ def gate_probe(b: boxmod.Box) -> tuple[bool, str | None]:
     return True, None
 
 
-def full(b: boxmod.Box) -> list[Result]:
+# Check 11 reads names, owner/mode/writability of /run/secrets, and the
+# with-secrets env of a fresh exec. The env dump stays in the CLI process: it
+# is searched, never printed.
+CHECK_11_SCRIPT = r"""ls -A /run/secrets 2>/dev/null
+printf '\0AGENTBOX-PERM\0'
+for f in /run/secrets/*; do
+  [ -e "$f" ] || continue
+  w=r; test -w "$f" && w=w
+  printf '%s %s %s %s\n' "${f##*/}" "$(stat -c %u "$f")" "$(stat -c %a "$f")" "$w"
+done
+test -d /run/secrets && test -w /run/secrets && echo '. dir - w'
+printf '\0AGENTBOX-ENV\0'
+env -0"""
+AGENT_UID = "1000"
+
+
+def rendered_services(b: boxmod.Box) -> set[str]:
+    try:
+        return set(json.loads(b.compose_file.read_text())["services"])
+    except (OSError, ValueError, KeyError):
+        return {"agent"}
+
+
+def check_11(b: boxmod.Box, fetch=None) -> Result:
+    """/run/secrets names == agent-targeted present names; files not owned by
+    and not writable for the agent; no sidecar-only secret in the agent (by
+    name; by value only for sidecars that run, whose values `up` read anyway).
+    Names only in the result; values never leave this function."""
+    p = b.profile
+    services = rendered_services(b)
+    try:
+        d = delivery.collect(p, b.cfg, b.state, services, fetch=fetch)
+    except secretstore.SecretError as e:
+        return Result("FAIL", "11", f"secret backend: {e}")
+    want = set(d.names_for("agent"))
+    sidecar_only = {n for n, t in d.targets.items() if "agent" not in t}
+    r = boxmod.exec_in(b, ["sh", "-c", CHECK_11_SCRIPT], timeout=60)
+    head, sep1, rest = r.stdout.partition("\0AGENTBOX-PERM\0")
+    perms, sep2, envdump = rest.partition("\0AGENTBOX-ENV\0")
+    if r.returncode != 0 or not sep1 or not sep2:
+        return Result("FAIL", "11", f"cannot read the box env (exit {r.returncode})")
+    have = set(head.split())
+    env_names = {x.partition("=")[0] for x in envdump.split("\0") if x}
+    cfg_env = (
+        json.loads(
+            docker.run(
+                ["docker", "inspect", "--format", "{{json .Config.Env}}", agent_container(b)]
+            ).stdout
+        )
+        or []
+    )
+    reasons = []
+    # A secret change `up` deferred while sessions run: the running set is the
+    # old one. Skip the name-set comparison; everything else still applies.
+    deferred = False
+    rendered = delivery.label(delivery.hmac_key(b.state), {n: d.values[n] for n in want})
+    if boxmod.running_label(b) not in (None, rendered):
+        deferred = boxmod.sessions_active(b)
+    if deferred:
+        extra = sorted(have - want - set(d.targets))  # names of nothing declared
+        if extra:
+            reasons.append(f"/run/secrets has undeclared names: {', '.join(extra)}")
+    else:
+        if extra := sorted(have - want):
+            reasons.append(f"/run/secrets has names not targeted at agent: {', '.join(extra)}")
+        if lack := sorted(want - have):
+            reasons.append(
+                f"agent-targeted secrets missing from /run/secrets: {', '.join(lack)} "
+                "(run `agentbox up` after a secret change)"
+            )
+    for line in perms.splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        name, uid, _mode, w = parts
+        if name == ".":
+            reasons.append("/run/secrets is writable by the agent")
+            continue
+        if uid == AGENT_UID:
+            reasons.append(f"/run/secrets/{name} is owned by the agent")
+        if w == "w":
+            reasons.append(f"/run/secrets/{name} is writable by the agent")
+    if bad := sorted(sidecar_only & (have | env_names)):
+        reasons.append(f"sidecar-only secret names in the agent: {', '.join(bad)}")
+    for n in sorted(sidecar_only):
+        v = d.values.get(n)  # only secrets of sidecars that run were read
+        if v and (v in envdump or v in head or any(v in e for e in cfg_env)):
+            reasons.append(f"value of sidecar-only secret {n} is in the agent env")
+    if not_exported := sorted(have - env_names):
+        reasons.append(f"with-secrets did not export: {', '.join(not_exported)}")
+    if deferred and not reasons:
+        return Result("PASS", "11", "secret change deferred: sessions active; files root-owned, "
+                      f"read-only; sidecar-only absent: {len(sidecar_only)}")  # fmt: skip
+    detail = "; ".join(reasons) or (
+        f"agent: {len(want)} secret(s) ({', '.join(sorted(want))}), root-owned, read-only; "
+        f"sidecar-only absent: {len(sidecar_only)}"
+    )
+    return Result("FAIL" if reasons else "PASS", "11", detail)
+
+
+FAKE_CLAUDE_TOKEN = "sk-ant-oat01-agentbox-doctor-invalid-" + "0" * 40
+CLAUDE_PROMPT = "Reply with the single word OK."
+NOT_LOGGED_IN = ("not logged in", "please run /login", "/login", "invalid api key")
+REJECTED = ("401", "invalid bearer", "authentication_error", "oauth token", "invalid token",
+            "token has expired", "unauthorized", "revoked")  # fmt: skip
+
+
+def classify_claude(rc: int, out: str) -> str:
+    """ok | rejected (the token reached the API) | no-token | other."""
+    low = out.lower()
+    if rc == 0:
+        return "ok"
+    if any(x in low for x in REJECTED):
+        return "rejected"
+    if any(x in low for x in NOT_LOGGED_IN):
+        return "no-token"
+    return "other"
+
+
+def _claude_run(b: boxmod.Box, pre: list[str]) -> tuple[int, str]:
+    argv = launch.agent_argv(b.profile, "claude", [], headless=True)
+    r = boxmod.exec_in(
+        b, [*pre, *argv], input=CLAUDE_PROMPT, timeout=180, workdir=b.profile.mounts[0].path
+    )
+    return r.returncode, r.stdout + r.stderr
+
+
+SET_TOKEN_HINT = "run `agentbox setup` or `agentbox secret set --shared CLAUDE_CODE_OAUTH_TOKEN`"
+
+
+def check_17(b: boxmod.Box, fetch=None, run=_claude_run) -> list[Result]:
+    """17 env: a headless `claude -p` with an invalid env token must be rejected
+    by the API (not "Not logged in"): the env token path works without a real
+    account. 17 live: with the token delivered from the backend, `claude -p`
+    succeeds (SKIP when the backend has no token)."""
+    if "claude" not in b.profile.box.agents:
+        why = "claude is not in [box] agents"
+        return [Result("SKIP", "17 env", why), Result("SKIP", "17 live", why)]
+    res = []
+    # `env NAME=...` after with-secrets: overrides a delivered token for this run.
+    rc, out = run(b, ["env", f"CLAUDE_CODE_OAUTH_TOKEN={FAKE_CLAUDE_TOKEN}"])
+    kind = classify_claude(rc, out)
+    tail = " ".join(out.split())[-200:]
+    if kind == "rejected":
+        res.append(Result("PASS", "17 env", "invalid env token rejected by the API", kind))
+    else:
+        res.append(Result("FAIL", "17 env", f"expected an invalid-token error, got {kind}: {tail}",
+                          kind))  # fmt: skip
+    fetch = fetch or secretstore.fetcher(b.cfg, b.profile.name)
+    try:
+        token = fetch(secretstore.ref_for(b.profile.secrets["CLAUDE_CODE_OAUTH_TOKEN"],
+                                          b.profile.name, b.cfg))  # fmt: skip
+    except secretstore.SecretError as e:
+        return [*res, Result("FAIL", "17 live", f"secret backend: {e}")]
+    if token is None:
+        return [*res, Result("SKIP", "17 live", "no CLAUDE_CODE_OAUTH_TOKEN in the backend")]
+    rc, out = run(b, [])
+    kind = classify_claude(rc, out)
+    tail = " ".join(out.replace(token, "<redacted>").split())[-200:]
+    if kind == "ok":
+        res.append(Result("PASS", "17 live", "headless claude -p with the delivered token"))
+    elif kind == "rejected":
+        res.append(Result("FAIL", "17 live", "the delivered token was rejected (invalid or "
+                          f"expired): {SET_TOKEN_HINT}: {tail}"))  # fmt: skip
+    else:
+        res.append(Result("FAIL", "17 live", f"{kind}: {tail}; {SET_TOKEN_HINT}"))
+    return res
+
+
+def full(b: boxmod.Box, scratch: bool = False) -> list[Result]:
+    """scratch (setup / update on a throwaway profile): "17 live" failures are
+    WARN (they depend on the user's token); "17 env" is WARN only when the API
+    was not reached cleanly (network error, 429, 5xx: kind "other"). A wrong
+    answer ("Not logged in", or success with a fake token) stays FAIL."""
+    res = _full(b)
+    if scratch:
+        for x in res:
+            if x.status != "FAIL":
+                continue
+            if x.check == "17 live" or (x.check == "17 env" and x.kind == "other"):
+                x.status = "WARN"
+    return res
+
+
+def _full(b: boxmod.Box) -> list[Result]:
     p = b.profile
     env = base_env(b)
     allowlist = [] if p.network.mode == "open" else boxmod.agent_domains(p)
@@ -385,7 +568,9 @@ def full(b: boxmod.Box) -> list[Result]:
             )
         x.detail = "; ".join(notes)
     res.append(check_10(b))
+    res.append(check_11(b))
     res.append(check_16(b))
+    res += check_17(b)
     if not others:
         res.append(Result("SKIP", "12", "no other agentbox profile is running"))
     if not reachable:

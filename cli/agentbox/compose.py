@@ -185,7 +185,25 @@ def gate_service(ctx: Ctx) -> dict:
 EXTRA_SERVICES: dict = {}
 
 
+def escape_dollars(v):
+    """Compose interpolates `$VAR` / `${VAR}` in every string, and the
+    `compose up` env holds AGENTBOX_SECRET_* values: escape `$` as `$$` in
+    every string value (recursively) so nothing from a profile can pull a
+    secret into container config (PLAN §2.4)."""
+    if isinstance(v, str):
+        return v.replace("$", "$$")
+    if isinstance(v, dict):
+        return {k: escape_dollars(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [escape_dollars(x) for x in v]
+    return v
+
+
 def render(ctx: Ctx) -> dict:
+    return escape_dollars(_render(ctx))
+
+
+def _render(ctx: Ctx) -> dict:
     p = ctx.profile
     services = {
         "agent": agent_service(ctx),

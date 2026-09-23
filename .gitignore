@@ -1,0 +1,26 @@
+# Secrets and per-profile runtime state never enter git
+.env
+*.env
+!*.env.example
+secrets/
+state/
+.run/
+*.age
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+dist/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code local settings
+.claude/settings.local.json

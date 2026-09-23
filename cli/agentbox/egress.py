@@ -22,7 +22,14 @@ PORT = 3128
 # Native "squid" logformat, then '"<url-encoded User-Agent>"' ("-" when absent).
 LOGFORMAT = '%ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %[un %Sh/%<a %mt "%#{User-Agent}>h"'
 CLIENTS = ("agent", "router", "mcp-gateway")
-HOST_NAMES = ("host.docker.internal", "gateway.docker.internal")
+# `host_dom` (the gateway-only host-MCP forward rule) matches only
+# host.docker.internal. Both Docker Desktop host names are always denied
+# otherwise (`internal_dom`), before any allow.
+HOST_NAMES = ("host.docker.internal",)
+INTERNAL_NAMES = ("host.docker.internal", "gateway.docker.internal")
+# Claude.ai connector backend: denied for every client in every mode (T5,
+# PLAN §1). Leading dot = the domain and its subdomains.
+ALWAYS_DENIED_DOMAINS = (".mcp-proxy.anthropic.com",)
 
 # Always denied destination ranges (checked on the resolved address).
 # PLAN §2.2 list first, then extra non-public ranges.
@@ -171,6 +178,8 @@ def render(
         "acl ip_literal dstdom_regex -n -i " + " ".join(IP_LITERAL_RES),
         "acl private_dst dst " + " ".join(PRIVATE_DST),
         "acl host_dom dstdomain -n " + " ".join(HOST_NAMES),
+        "acl internal_dom dstdomain -n " + " ".join(INTERNAL_NAMES),
+        "acl denied_dom dstdomain -n " + " ".join(ALWAYS_DENIED_DOMAINS),
         f"acl conn_ports port {connect_ports}",
         "acl CONNECT method CONNECT",
     ]
@@ -183,6 +192,7 @@ def render(
         "# always denied",
         "http_access deny manager",
         "http_access deny ip_literal",
+        "http_access deny denied_dom",
     ]
     if ports:
         L += [
@@ -190,7 +200,7 @@ def render(
             "http_access allow src_mcp-gateway !CONNECT host_dom host_mcp_ports",
         ]
     L += [
-        "http_access deny host_dom",
+        "http_access deny internal_dom",
         "http_access deny private_dst",
         "http_access deny CONNECT !conn_ports",
         "http_access deny !CONNECT !plain_ports" if allow_http else "http_access deny !CONNECT",

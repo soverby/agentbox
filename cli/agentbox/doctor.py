@@ -16,15 +16,22 @@ import time
 from dataclasses import dataclass
 
 from . import box as boxmod
-from . import compose, delivery, docker, egress, launch, network, paths, secretstore
+from . import (
+    compose,
+    delivery,
+    docker,
+    doctor_mcp,
+    egress,
+    launch,
+    mcpgw,
+    network,
+    paths,
+    secretstore,
+)
 from .denied import allow_matches
 
 FAST = ["1", "2", "6", "9"]
 INBOX_FULL = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
-NOT_IN_P3 = {
-    "13": "no router / mcp-gateway in this profile (P5/P6)",
-    "14": "MCP gateway is P6",
-}
 ALLOWED_PREF = ("example.com", "github.com", "pypi.org", "www.wikipedia.org")
 DENIED_PREF = ("example.org", "example.net", "iana.org", "www.w3.org")
 PTR_IP, PTR_NAME = "1.1.1.1", "one.one.one.one"
@@ -189,6 +196,7 @@ def base_env(b: boxmod.Box) -> dict[str, str]:
         "DOCTOR_ROLE": "agent",
         "DOCTOR_ALLOWED": pick_allowed(p.network.mode, allowlist),
         "DOCTOR_BLOCKED_TCP": f"{ips['egress']}:80 {network.gateway_ip(n, b.cfg.subnet_base)}:80",
+        "DOCTOR_MCP_PORTS": " ".join(str(x) for x in mcpgw.host_ports(p)),
     }
     if p.network.mode == "strict":
         env["DOCTOR_DENIED"] = pick_denied(allowlist)
@@ -304,7 +312,12 @@ def other_targets(b: boxmod.Box) -> list[str]:
     for proj, services in sorted(docker.running_projects().items()):
         if proj == b.project:
             continue
-        for svc, port in (("egress", 3128), ("ollama-gate", 11434), ("agent", 22)):
+        for svc, port in (
+            ("egress", 3128),
+            ("ollama-gate", 11434),
+            ("mcp-gateway", 8080),
+            ("agent", 22),
+        ):
             if svc not in services:
                 continue
             ids = docker.run(
@@ -578,8 +591,23 @@ def _full(b: boxmod.Box) -> list[Result]:
         res += [Result("SKIP", "15", why), Result("SKIP", "18", why)]
     elif not model:
         res.append(Result("SKIP", "15", "no allowed local model on host Ollama"))
-    res += [Result("SKIP", c, why) for c, why in NOT_IN_P3.items()]
+    res += mcp_checks(b, allowlist)
     return sorted(res, key=lambda x: (_num(x.check), x.check))
+
+
+def mcp_checks(b: boxmod.Box, allowlist: list[str]) -> list[Result]:
+    """13 (gateway), 14, 20 (PLAN §4; 20 is new in P6). Probes carry a nonce
+    User-Agent inside a recorded window, like the in-box script."""
+    ua = new_ua()
+    t0 = time.time()
+    try:
+        return [
+            *doctor_mcp.check_13(b, ua),
+            *doctor_mcp.check_14(b, ua),
+            *doctor_mcp.check_20(b, ua, allowlist),
+        ]
+    finally:
+        record_window(b.state, t0, time.time(), ua)
 
 
 def _num(check: str) -> int:

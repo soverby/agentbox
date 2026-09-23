@@ -33,7 +33,8 @@ the agent container, and it can send any request to any sidecar it can reach.
 **Accepted residual risks (documented, not solved):**
 
 - Exfiltration to an allowed domain (for example a gist on github.com). In
-  `open` mode, any public domain.
+  `open` mode, any public domain (`mcp-proxy.anthropic.com` stays denied
+  in every mode).
 - The agent can read the credentials its own CLIs need (subscription tokens,
   `GH_TOKEN`). With the ChatGPT token and chatgpt.com allowed, the agent can
   also call the connector backend by raw HTTP.
@@ -49,6 +50,14 @@ the agent container, and it can send any request to any sidecar it can reach.
 - Provider-side web tools (Claude `WebFetch`/`WebSearch`, Codex web search)
   read arbitrary URLs outside the egress allowlist and return the content
   into the box. Opt-out per profile: `[box] web_tools = false`.
+- T5 for remote MCP servers the agent adds to its own Codex/Pi config
+  relies on T2: strict mode limits them to allowlisted domains; open mode
+  allows any public domain, unlogged by the gateway (no worse than raw
+  HTTP).
+- stdio MCP servers run as the gateway user and can read the gateway's
+  secrets (upstream bearers); one with a shell or file tool hands them to
+  the agent, and it shares the gateway's network position. Declare only trusted stdio servers; `uvx`/
+  `npx` packages are pinned only as far as the profile pins them.
 - A mounted repo can declare stdio MCP servers for Codex or Pi. They are only
   in-box code. Claude Code loads only the root-owned `managed-mcp.json`.
 
@@ -450,6 +459,30 @@ third-party router.
   and serves one streamable-HTTP endpoint `http://mcp-gateway:8080/mcp`. It
   logs each call (server, tool, args hash, status). It always runs, with zero
   tools when the profile lists no servers.
+- Implementation notes (P6): FastMCP 4.0.5 `create_proxy` + `mount(namespace=)`
+  (tools exposed as `<server>_<tool>`; a server name may not prefix another
+  plus `_`), `enable(only=True)` plus a policy middleware (second layer);
+  tools only in v1 (resources/prompts hidden and rejected). Incoming headers
+  are never forwarded upstream (FastMCP forwards them by default; that
+  leaked the gateway token). Not `read_only` (same Compose secrets limit as
+  the agent): non-root uid, no caps, tmpfs `/tmp` (exec). stdio servers:
+  `uvx`/`python3` and `npx`/`node` (Node 24 in the image); PyPI or npm
+  registry domains join the gateway allowlist only when a stdio server
+  needs them. Remote servers: `https://` port 443; host servers:
+  `http://host.docker.internal:<port>`. An upstream that fails to connect
+  is reported by doctor (it would otherwise vanish from `tools/list`).
+- Files and text the agent controls are untrusted input to the CLI: agent
+  config merges never block a session (warn, leave the file), reads of
+  in-box files are size-capped regular files only, and every string from
+  the box, the gateway, or an upstream is stripped of control characters
+  before it reaches the terminal. No agent config file is parsed or written
+  by the CLI: Claude uses the image's `managed-mcp.json`, Codex gets the
+  gateway entry as `-c` launch overrides, and Pi gets
+  `--mcp-config /etc/agentbox/pi-mcp.json` (root-owned, in the image) from
+  its wrapper.
+- Host-side logs (egress, gate, gateway calls, status) are size-rotated
+  (the CLI at `up`; gate and gateway by size themselves); logged
+  agent-chosen strings are truncated.
 - Agent → gateway auth: `MCP_GATEWAY_TOKEN`, random per box (FastMCP
   `StaticTokenVerifier`; acceptable: random per box, private network).
 - Upstream auth:
@@ -466,7 +499,8 @@ third-party router.
 - Agent wiring: Claude Code via the image's `managed-mcp.json` (§2.1); Codex
   via CLI-rendered `[mcp_servers.agentbox]` (`url`,
   `bearer_token_env_var = "MCP_GATEWAY_TOKEN"`); Pi via `~/.pi/agent/mcp.json`
-  for `pi-mcp-adapter`.
+  for `pi-mcp-adapter` — superseded: `/etc/agentbox/pi-mcp.json` via the Pi
+  wrapper (see above).
 - Claude.ai connectors off (`managed-mcp.json`,
   `ENABLE_CLAUDEAI_MCP_SERVERS=false`, `mcp-proxy.anthropic.com` never
   allowed). Codex apps and remote plugins off by `-c` overrides on every
@@ -553,6 +587,10 @@ runs once the repo has a GitHub remote — until then Linux is untested). Every 
     `managed-mcp.json` is root-owned and not writable.
 17. Headless `agentbox run` with only env-delivered tokens
     (`CLAUDE_CODE_OAUTH_TOKEN`, `MCP_GATEWAY_TOKEN`) succeeds.
+20. Gateway: missing/wrong token → 401; only allowlisted namespaced tools
+    listed; non-allowlisted `tools/call` rejected; agent cannot reach
+    upstreams; gateway user writes only `/tmp` and its log dir, no setuid;
+    every declared upstream connected (else FAIL naming it).
 18. Host Ollama ≥ 0.14.0; no allowed model has a non-empty `remote_host`.
 19. `open` mode: public domain → 200; IP literal, RFC 1918, loopback,
     link-local, `host.docker.internal`, and a public name that resolves to a

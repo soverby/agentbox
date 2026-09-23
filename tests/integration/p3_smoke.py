@@ -117,6 +117,12 @@ def ck(c: str) -> tuple:
     return (int(c.split("-")[0].split()[0]), c)
 
 
+# P6: the MCP gateway always runs (checks 13, 14, 20).
+P6_PASS = ("13 (mcp-gateway)", "14 claude-mcp", "14 codex-config", "14 connectors-proxy",
+           "20 auth", "20 policy", "20 upstream-direct", "20 gateway-fs",
+           "20 upstreams")  # fmt: skip
+
+
 def doctor_ok(e: Env, name: str, want_skip: set[str], want_pass: set[str]) -> None:
     r = e.ab("doctor", name, timeout=900)
     lines = [x for x in r.stdout.splitlines() if x.split(" ")[0] in ("PASS", "FAIL", "SKIP")]
@@ -131,7 +137,6 @@ def doctor_ok(e: Env, name: str, want_skip: set[str], want_pass: set[str]) -> No
         and not fails
         and want_pass <= passes
         and skips <= want_skip
-        and {"13", "14"} <= skips
         and skip_reasons
     )
     rec(
@@ -266,14 +271,63 @@ def main() -> int:  # noqa: C901 (linear scenario)
         doctor_ok(
             e,
             MAIN,
-            {"13", "14", "15", "17 live", "18", "19"},
-            {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "16", "17 env"},
+            {"13 (router)", "14 codex-apps-live", "15", "17 live", "18", "19", "20 allowed-call"},
+            {
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+                "9",
+                "10",
+                "11",
+                "12",
+                "16",
+                "17 env",
+                *P6_PASS,
+            },
         )
         doctor_ok(
             e,
             PKG,
-            {"2", "13", "14", "15", "17 live", "18", "19-v6"},
-            {"1", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "16", "17 env", "19"},
+            {
+                "2",
+                "13 (router)",
+                "14 codex-config",
+                "15",
+                "17 live",
+                "18",
+                "19-v6",
+                "14 pi-mcp",
+                "20 allowed-call",
+            },
+            {
+                "1",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+                "9",
+                "10",
+                "11",
+                "12",
+                "16",
+                "17 env",
+                "19",
+                "13 (mcp-gateway)",
+                "14 claude-mcp",
+                "14 connectors-proxy",
+                "20 upstreams",
+                "20 auth",
+                "20 policy",
+                "20 upstream-direct",
+                "20 gateway-fs",
+            },
         )
 
         # -- sessions from inside the mounted dir

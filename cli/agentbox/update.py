@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import docker, images
+from . import docker, images, term
 
 UA = {"User-Agent": "agentbox-update"}
 LINE_RE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
@@ -281,7 +281,7 @@ def apply(
             raise UpdateError("doctor failed on the new image")
         return True
     except BaseException as e:  # also KeyboardInterrupt: never leave a half update
-        print(f"agentbox update: {e!r}; rolling back")
+        print(term.clean(f"agentbox update: {e!r}; rolling back"))
         env_file.write_text(old_env)
         lock.write_bytes(old_lock)
         pkg.write_bytes(old_pkg)

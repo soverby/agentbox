@@ -91,7 +91,7 @@ def test_sidecars(tmp_path):
     assert g["volumes"] == [f"{tmp_path}/logs/gate:/var/log/agentbox"]
     assert g["environment"]["GATE_MODELS"] == '["llama3.2:latest"]'
     assert g["environment"]["GATE_UPSTREAM"] == "http://host.docker.internal:11434"
-    assert set(doc["services"]) == {"agent", "egress", "ollama-gate"}  # no router/gateway in P3
+    assert set(doc["services"]) == {"agent", "egress", "ollama-gate", "mcp-gateway"}  # no router
 
 
 def test_linux_extra_hosts(tmp_path):
@@ -109,9 +109,10 @@ def test_no_secrets_in_render(tmp_path):
         assert w.lower() not in s.lower()
 
 
-def test_egress_clients_agent_only(tmp_path):
+def test_egress_clients_agent_and_gateway(tmp_path):
     c = compose.egress_clients(ctx(tmp_path), ["example.com"])
-    assert [(x.name, x.ip) for x in c] == [("agent", "10.213.7.10")]
+    assert [(x.name, x.ip) for x in c] == [("agent", "10.213.7.10"), ("mcp-gateway", "10.213.7.12")]
+    assert c[1].domains == []  # no MCP servers: empty gateway allowlist
 
 
 def test_write_json_mode(tmp_path):

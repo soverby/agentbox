@@ -33,7 +33,7 @@ def test_strict_files_and_order():
     assert acc[1] == "http_access deny ip_literal"
     gw = acc.index("http_access allow src_mcp-gateway !CONNECT host_dom host_mcp_ports")
     assert gw < acc.index("http_access deny private_dst")
-    assert gw < acc.index("http_access deny host_dom")
+    assert gw < acc.index("http_access deny internal_dom")
     allow_agent = acc.index("http_access allow src_agent allow_agent")
     assert acc.index("http_access deny private_dst") < allow_agent
     assert "http_access deny !CONNECT" in acc

@@ -3,10 +3,18 @@
 # Pi has no system-wide extension location; `--extension` is its documented
 # per-invocation flag. Package-management and auth subcommands get no extra
 # flag.
+# MCP: the adapter reads only the root-owned /etc/agentbox/pi-mcp.json (the
+# gateway, bearer from MCP_GATEWAY_TOKEN). `--mcp-config` takes the place of
+# ~/.pi/agent/mcp.json; PI_MCP_CONFIG_MODE=exclusive makes that file the only
+# source (no ~/.config/mcp, ~/.agents, project .mcp.json / .pi/mcp.json,
+# package or plugin configs). pi-mcp-adapter 2.37.0 config.ts getConfigSources.
 PI_CLI=/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js
 ADAPTER=/usr/local/lib/agentbox/pi-mcp-adapter/node_modules/pi-mcp-adapter
+MCP_CONFIG=/etc/agentbox/pi-mcp.json
 case "${1-}" in
   install|remove|uninstall|update|list|config|auth)
     exec /usr/local/bin/node "$PI_CLI" "$@" ;;
 esac
-exec /usr/local/bin/node "$PI_CLI" --extension "$ADAPTER" "$@"
+PI_MCP_CONFIG_MODE=exclusive
+export PI_MCP_CONFIG_MODE
+exec /usr/local/bin/node "$PI_CLI" --extension "$ADAPTER" --mcp-config "$MCP_CONFIG" "$@"

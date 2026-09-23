@@ -42,7 +42,11 @@ ENV_PREFIX = "AGENTBOX_SECRET_"
 # Agent: root:root 0444: readable, not writable, not chmod-able, not removable
 # (/run/secrets is root 0755). PLAN §2.4 says root:agent 0440; Compose cannot
 # set a group without the chown, see the P4 round-2 report.
-SECRET_MODE = {"agent": "0444"}
+# mcp-gateway: root:root 0444 for the same reason (no uid/gid, so no chown);
+# "other" read is what lets the non-root gateway user (uid 10002) read them.
+# Every process in the gateway container runs as that uid, so stdio MCP
+# servers it spawns could read these files too (they get no secret env).
+SECRET_MODE = {"agent": "0444", "mcp-gateway": "0444"}
 
 
 @dataclass

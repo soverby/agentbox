@@ -12,10 +12,19 @@ from pathlib import Path
 from .profile import Profile, ProfileError, load_profile
 
 WITH_SECRETS = "/usr/local/bin/with-secrets"
+# The gateway entry for Codex (PLAN §2.6): launch overrides, so T5 does not
+# depend on the agent-writable ~/.codex/config.toml (a hostile `command` there
+# makes Codex refuse to start: fails closed). Same values as mcpgw.CODEX_MCP.
+CODEX_MCP_OVERRIDES = (
+    "-c", 'mcp_servers.agentbox.url="http://mcp-gateway:8080/mcp"',
+    "-c", 'mcp_servers.agentbox.bearer_token_env_var="MCP_GATEWAY_TOKEN"',
+    "-c", "mcp_servers.agentbox.enabled=true",
+)  # fmt: skip
 CODEX_OVERRIDES = (
     "-c", "features.apps=false",
     "-c", "features.remote_plugin=false",
     "-c", "apps._default.enabled=false",
+    *CODEX_MCP_OVERRIDES,
 )  # fmt: skip
 
 

@@ -18,11 +18,13 @@ from . import (
     docker,
     egress,
     images,
+    mcpgw,
     mountstate,
     network,
     paths,
     presets,
     secretstore,
+    term,
 )
 from .launch import WITH_SECRETS
 from .profile import Profile, ProfileError, load_profile
@@ -83,7 +85,7 @@ def is_running(box: Box) -> bool:
         return False
     r = dc(box, "ps", "--status", "running", "--services", check=False)
     running = set(r.stdout.split()) if r.returncode == 0 else set()
-    return {"agent", "egress", "ollama-gate"} <= running
+    return {"agent", "egress", "ollama-gate", mcpgw.SERVICE} <= running
 
 
 def agent_domains(profile: Profile) -> list[str]:
@@ -92,7 +94,9 @@ def agent_domains(profile: Profile) -> list[str]:
     )
 
 
-def ctx_for(box: Box, n: int, agent_image="", egress_image="", gate_image="") -> compose.Ctx:
+def ctx_for(
+    box: Box, n: int, agent_image="", egress_image="", gate_image="", gateway_image=""
+) -> compose.Ctx:
     return compose.Ctx(
         profile=box.profile,
         n=n,
@@ -101,6 +105,7 @@ def ctx_for(box: Box, n: int, agent_image="", egress_image="", gate_image="") ->
         agent_image=agent_image,
         egress_image=egress_image,
         gate_image=gate_image,
+        gateway_image=gateway_image,
     )
 
 
@@ -111,12 +116,17 @@ def render_egress(box: Box, ctx: compose.Ctx) -> dict[str, str]:
         p.network.mode,
         compose.egress_clients(ctx, domains),
         allow_http=p.network.allow_http,
+        host_mcp_ports=mcpgw.host_ports(p),
         partial=True,
     )
 
 
 def _prepare_log_dirs(box: Box, ctx: compose.Ctx, gate_image: str) -> None:
-    for d, uid in ((ctx.egress_logs, compose.EGRESS_UID), (ctx.gate_logs, compose.GATE_UID)):
+    for d, uid in (
+        (ctx.egress_logs, compose.EGRESS_UID),
+        (ctx.gate_logs, compose.GATE_UID),
+        (mcpgw.log_dir(ctx), mcpgw.GW_UID),
+    ):
         d.mkdir(parents=True, exist_ok=True)
         os.chmod(d, 0o755)
         if sys.platform.startswith("linux"):
@@ -150,15 +160,18 @@ def exec_in(
 READY_SCRIPT = (
     "for i in $(seq 1 120); do "
     "(exec 3<>/dev/tcp/egress/3128) 2>/dev/null && "
-    "(exec 3<>/dev/tcp/ollama-gate/11434) 2>/dev/null && exit 0; sleep 0.5; done; exit 1"
+    "(exec 3<>/dev/tcp/ollama-gate/11434) 2>/dev/null && "
+    "(exec 3<>/dev/tcp/mcp-gateway/8080) 2>/dev/null && exit 0; sleep 0.5; done; exit 1"
 )
 
 
 def wait_ready(box: Box) -> None:
     r = exec_in(box, ["bash", "-c", READY_SCRIPT], timeout=120)
     if r.returncode != 0:
-        tail = dc(box, "logs", "--tail", "40", "egress", "ollama-gate", check=False).stdout
-        raise BoxError(f"egress / ollama-gate not ready:\n{tail}")
+        tail = dc(
+            box, "logs", "--tail", "40", "egress", "ollama-gate", mcpgw.SERVICE, check=False
+        ).stdout
+        raise BoxError(f"egress / ollama-gate / mcp-gateway not ready:\n{tail}")
 
 
 def host_git(key: str) -> str | None:
@@ -192,7 +205,7 @@ def gh_setup_git(box: Box) -> None:
 
 
 def warn(msg: str) -> None:
-    print(f"agentbox: {msg}", file=sys.stderr, flush=True)
+    print(f"agentbox: {term.clean(msg, multiline=True)}", file=sys.stderr, flush=True)
 
 
 def secret_problems(d: delivery.Delivery, profile: Profile) -> None:
@@ -323,14 +336,20 @@ def _up(box: Box, accept_mount_change: bool, explicit: bool = False) -> None:
         agent_image = images.ensure_pkgs(agent_image, p.box.packages)
     egress_image = images.ensure_sidecar(repo, "egress")
     gate_image = images.ensure_sidecar(repo, "ollama-gate")
+    try:
+        mcpgw.check(p)
+    except mcpgw.McpError as e:
+        raise BoxError(str(e)) from None
+    gateway_image = images.ensure_sidecar(repo, mcpgw.SERVICE)
 
     base = box.cfg.subnet_base
     in_use = docker.subnets()
     n = network.allocate(paths.state_home(), box.name, in_use, base)
     network.verify(n, in_use, base, exclude_project=box.project)
 
-    ctx = ctx_for(box, n, agent_image, egress_image, gate_image)
+    ctx = ctx_for(box, n, agent_image, egress_image, gate_image, gateway_image)
     _prepare_log_dirs(box, ctx, gate_image)
+    write_gateway_config(ctx)
     files = render_egress(box, ctx)
     old = read_conf(ctx.conf_dir)
     egress.write(ctx.conf_dir, files)
@@ -367,13 +386,71 @@ def _up(box: Box, accept_mount_change: bool, explicit: bool = False) -> None:
             msg = secretstore.scrub(msg, v)
         raise BoxError(msg) from None
     wait_ready(box)
+    rotate_egress_log(box, ctx)
     # Unchanged files are what the running squid already loaded (the CLI is the
     # only writer); skip the reload so session starts do not disturb traffic.
     if files != old:
         apply_egress(box, ctx.conf_dir, old)
     git_setup(box, dl.names_for("agent"))
+    if (explicit or not running) and p.mcp_servers:
+        warn_upstreams(box)
 
 
+EGRESS_LOG_MAX = 20 * 1024 * 1024
+
+
+def rotate_egress_log(box: Box, ctx: compose.Ctx, max_bytes: int = EGRESS_LOG_MAX) -> bool:
+    """At `up`: egress.log over max_bytes -> egress.log.1 (one old file kept),
+    then `squid -k rotate`, which (logfile_rotate 0) only reopens the logs, so
+    squid writes a fresh egress.log. `denied` reads both files."""
+    f = ctx.egress_logs / "egress.log"
+    try:
+        if f.stat().st_size <= max_bytes:
+            return False
+    except FileNotFoundError:
+        return False
+    os.replace(f, f.with_name("egress.log.1"))
+    r = dc(box, "exec", "-T", "egress", "squid", "-k", "rotate", "-f", SQUID_CONF, check=False)
+    if r.returncode != 0:
+        warn(f"egress log rotated, but `squid -k rotate` failed: {r.stderr.strip()[-200:]}")
+    return True
+
+
+def gateway_status(box: Box) -> dict:
+    """Refresh the gateway's upstream status (`gateway.py probe` in the
+    gateway container; it also writes logs/mcp/status.json). Names and short
+    reasons only: the probe scrubs bearer values from reasons."""
+    r = dc(box, "exec", "-T", mcpgw.SERVICE, *mcpgw.PROBE_ARGV, check=False, timeout=300)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise BoxError(
+            f"mcp-gateway status probe failed (exit {r.returncode}): {r.stderr.strip()[-300:]}"
+        ) from None
+
+
+def warn_upstreams(box: Box) -> None:
+    """One warning line per MCP upstream that does not connect."""
+    try:
+        st = gateway_status(box)
+    except BoxError as e:
+        warn(str(e))
+        return
+    for name, s in sorted(st.get("servers", {}).items()):
+        if s.get("state") != "connected":
+            warn(f"MCP server {name} is not reachable from mcp-gateway: {s.get('reason', '?')}; "
+                 "its tools are not available (see `agentbox doctor`)")  # fmt: skip
+
+
+def write_gateway_config(ctx: compose.Ctx) -> None:
+    """Gateway config (names only, no secret values), in a dir bind-mounted ro."""
+    d = mcpgw.conf_dir(ctx)
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o755)
+    egress.write(d, {"config.json": mcpgw.config_text(ctx.profile)})
+
+
+# Read a file in the box (empty when missing); write one from stdin atomically.
 def down(box: Box, volumes: bool = False) -> None:
     """Stop the box; replace the per-box tokens for the next `up`."""
     with up_lock(box):

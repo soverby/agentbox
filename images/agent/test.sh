@@ -102,6 +102,14 @@ check "managed-mcp.json root 0644, ro" bash -c "
   ! docker exec $run_id sh -c ': >> /etc/claude-code/managed-mcp.json' 2>/dev/null"
 check "managed-mcp.json content" bash -c "
   docker exec $run_id jq -e '(.mcpServers|keys)==[\"agentbox\"] and .mcpServers.agentbox.type==\"http\" and .mcpServers.agentbox.url==\"http://mcp-gateway:8080/mcp\" and .mcpServers.agentbox.headers.Authorization==\"Bearer \${MCP_GATEWAY_TOKEN}\"' /etc/claude-code/managed-mcp.json"
+check "pi-mcp.json root 0644, ro, gateway only" bash -c "
+  o=\$(docker exec $run_id stat -c '%U:%G %a' /etc/agentbox/pi-mcp.json /etc/agentbox) && echo \$o &&
+  [ \"\$o\" = \"\$(printf 'root:root 644\nroot:root 755')\" ] &&
+  ! docker exec $run_id sh -c 'test -w /etc/agentbox/pi-mcp.json || test -w /etc/agentbox' &&
+  docker exec $run_id jq -e '(.mcpServers|keys)==[\"agentbox\"] and .mcpServers.agentbox=={\"url\":\"http://mcp-gateway:8080/mcp\",\"auth\":\"bearer\",\"bearerTokenEnv\":\"MCP_GATEWAY_TOKEN\"}' /etc/agentbox/pi-mcp.json"
+check "pi-wrapper passes --mcp-config + exclusive mode" bash -c "
+  docker exec $run_id grep -q -- '--extension \"\$ADAPTER\" --mcp-config \"\$MCP_CONFIG\"' /usr/local/bin/pi &&
+  docker exec $run_id grep -q '^PI_MCP_CONFIG_MODE=exclusive' /usr/local/bin/pi && echo ok"
 check "with-secrets root 0755" bash -c "o=\$(docker exec $run_id stat -c '%U:%G %a' /usr/local/bin/with-secrets) && echo \$o && [ \"\$o\" = 'root:root 755' ]"
 
 # --- no GPU libs ------------------------------------------------------------

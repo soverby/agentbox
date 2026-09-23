@@ -225,7 +225,12 @@ def test_up_passes_values_only_in_compose_env(env, monkeypatch):
     envd = up_calls[0][1]["env"]
     assert envd["AGENTBOX_SECRET_AGENT_ONLY"] == "MARK-agent-only"
     assert envd["AGENTBOX_SECRET_GH_TOKEN"] == "MARK-gh"
-    assert "AGENTBOX_SECRET_GW_ONLY" not in envd  # no mcp-gateway service in P4
+    assert envd["AGENTBOX_SECRET_GW_ONLY"] == "MARK-gw-only"  # P6: the gateway runs
+    doc0 = json.loads(b.compose_file.read_text())
+    gw = {e["source"]: e for e in doc0["services"]["mcp-gateway"]["secrets"]}
+    assert set(gw) == {"GW_ONLY", "MCP_GATEWAY_TOKEN"}
+    assert all(e["mode"] == "0444" and "uid" not in e and "gid" not in e for e in gw.values())
+    assert "GW_ONLY" not in {e["source"] for e in doc0["services"]["agent"]["secrets"]}
     for a, k in calls:
         assert not any("MARK-" in x for x in a)
         if a[0] != "up":

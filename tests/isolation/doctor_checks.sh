@@ -91,8 +91,11 @@ check_2() {
 
 check_3() {
   expect_connect "$ALLOWED:443" 200
-  local c; c=$(curl -A "$UA" -s -o /dev/null -x "$P" -m 20 -w '%{http_code}' "https://$ALLOWED/")
-  case "$c" in 2??|3??) ;; *) bad "GET https://$ALLOWED/ -> $c" ;; esac
+  # Reachable = squid opened the tunnel (CONNECT 200) and the TLS server
+  # answered with any HTTP status: inside the tunnel squid cannot answer, so
+  # 4xx/5xx here come from the upstream (e.g. api.openai.com -> 421).
+  local c; c=$(curl -A "$UA" -s -o /dev/null -x "$P" -m 20 -w '%{http_connect} %{http_code}' "https://$ALLOWED/")
+  case "$c" in "200 "[1-5]??) ;; *) bad "GET https://$ALLOWED/ -> CONNECT/HTTP $c (want 200 + any status)" ;; esac
   report 3
 }
 

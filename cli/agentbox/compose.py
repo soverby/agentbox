@@ -64,6 +64,7 @@ class Ctx:
     agent_image: str
     egress_image: str
     gate_image: str
+    gateway_image: str = ""
     linux: bool = field(default_factory=lambda: sys.platform.startswith("linux"))
     gate_upstream: str = f"http://host.docker.internal:{GATE_PORT}"
     egress_config_hash: str = ""
@@ -181,8 +182,15 @@ def gate_service(ctx: Ctx) -> dict:
     return svc
 
 
-# Extension point: P5 adds "router", P6 adds "mcp-gateway" (name -> fn(ctx)).
-EXTRA_SERVICES: dict = {}
+def _gateway_service(ctx: Ctx) -> dict:
+    from . import mcpgw
+
+    return mcpgw.service(ctx)
+
+
+# Extension point (name -> fn(ctx)). P6: the MCP gateway always runs (§2.6).
+# P5 adds "router".
+EXTRA_SERVICES: dict = {"mcp-gateway": _gateway_service}
 
 
 def escape_dollars(v):
@@ -230,9 +238,14 @@ def egress_clients(ctx: Ctx, agent_domains: list[str]) -> list[egress.Client]:
     """Egress ACL clients: the agent, plus each sidecar that runs (P5/P6)."""
     ips = network.fixed_ips(ctx.n, ctx.base)
     clients = [egress.Client("agent", ips["agent"], agent_domains)]
-    for name in ("router", "mcp-gateway"):
-        if name in EXTRA_SERVICES:
-            raise NotImplementedError(f"{name} egress allowlist is P5/P6")
+    if "router" in EXTRA_SERVICES:
+        raise NotImplementedError("router egress allowlist is P5")
+    if "mcp-gateway" in EXTRA_SERVICES:
+        from . import mcpgw
+
+        clients.append(
+            egress.Client("mcp-gateway", ips["mcp-gateway"], mcpgw.egress_domains(ctx.profile))
+        )
     return clients
 
 

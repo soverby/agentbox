@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "agentbox": {
+      "url": "http://mcp-gateway:8080/mcp",
+      "auth": "bearer",
+      "bearerTokenEnv": "MCP_GATEWAY_TOKEN"
+    }
+  }
+}

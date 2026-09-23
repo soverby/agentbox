@@ -29,6 +29,9 @@ def test_codex_overrides_every_launch():
     over = [
         "-c", "features.apps=false", "-c", "features.remote_plugin=false",
         "-c", "apps._default.enabled=false",
+        "-c", 'mcp_servers.agentbox.url="http://mcp-gateway:8080/mcp"',
+        "-c", 'mcp_servers.agentbox.bearer_token_env_var="MCP_GATEWAY_TOKEN"',
+        "-c", "mcp_servers.agentbox.enabled=true",
     ]  # fmt: skip
     bypass = "--dangerously-bypass-approvals-and-sandbox"
     assert launch.agent_argv(prof(), "codex", ["x"]) == ["codex", *over, bypass, "x"]

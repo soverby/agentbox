@@ -324,8 +324,13 @@ def main() -> int:  # noqa: C901 (linear scenario)
         # -- doctor 11 (+ 17 env)
         res = doctor(e)
         rec(res.get("11", ("-",))[0] == "PASS", "doctor 11", res.get("11", ("-", "missing"))[1])
-        others = {k: v for k, v in res.items() if v[0] == "FAIL"}
-        rec(not others, "full doctor: no FAIL", json.dumps(others)[:400])
+        # P6: the profile's MCP server (mcp.example.com) does not exist, so
+        # doctor 20 upstreams must FAIL naming it; nothing else may FAIL.
+        up20 = res.get("20 upstreams", ("-", "missing"))
+        rec(up20[0] == "FAIL" and "docs (" in up20[1], "doctor 20 upstreams names the "
+            "unreachable MCP server", up20[1][:200])  # fmt: skip
+        others = {k: v for k, v in res.items() if v[0] == "FAIL" and k != "20 upstreams"}
+        rec(not others, "full doctor: no other FAIL", json.dumps(others)[:400])
         rec(res.get("17 live", ("-",))[0] == "SKIP", "doctor 17 live SKIP without a token")
 
         # -- leak audit 1 (tokens are in state by design: audit test markers only)

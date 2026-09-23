@@ -25,13 +25,18 @@ AGENT_INPUTS = (
     "Dockerfile",
     "versions.env",
     "managed-mcp.json",
+    "pi-mcp.json",
     "pi-wrapper",
     "with-secrets",
     "pi-mcp-adapter/package.json",
     "pi-mcp-adapter/package-lock.json",
     "pi-mcp-adapter/.npmrc",
 )
-SIDECARS = {"egress": "images/egress", "ollama-gate": "images/ollama-gate"}
+SIDECARS = {
+    "egress": "images/egress",
+    "ollama-gate": "images/ollama-gate",
+    "mcp-gateway": "images/mcp-gateway",
+}
 PROXY_VARS = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy")
 
 

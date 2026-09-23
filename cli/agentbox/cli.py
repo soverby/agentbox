@@ -33,6 +33,7 @@ from . import (
     paths,
     presets,
     secretstore,
+    term,
 )
 from . import box as boxmod
 from . import doctor as doc
@@ -55,7 +56,7 @@ class CliError(Exception):
 
 
 def err(msg: str) -> None:
-    print(f"agentbox: {msg}", file=sys.stderr, flush=True)
+    print(f"agentbox: {term.clean(msg, multiline=True)}", file=sys.stderr, flush=True)
 
 
 def is_tty() -> bool:
@@ -70,7 +71,7 @@ def resolve(name: str | None) -> str:
 
 def print_results(results: list[doc.Result]) -> bool:
     for r in results:
-        print(r.line(), flush=True)
+        print(term.clean(r.line()), flush=True)
     return not any(r.status == "FAIL" for r in results)
 
 
@@ -95,7 +96,7 @@ def cmd_validate(args) -> int:
         profile = load_profile(args.file, name=args.name)
     except ProfileError as e:
         for path, msg in e.problems:
-            print(f"error: {path}: {msg}", file=sys.stderr)
+            print(term.clean(f"error: {path}: {msg}", multiline=True), file=sys.stderr)
         return 1
     print(json.dumps(dataclasses.asdict(profile), indent=2))
     return 0
@@ -219,7 +220,7 @@ def cmd_run(args) -> int:
                 runsmod.finish(rd, rc, meta)
             if not was_running:
                 stop_if_idle(b)
-    print(f"run: {rd} (exit {rc})")
+    print(term.clean(f"run: {rd} (exit {rc})"))
     return rc
 
 
@@ -280,10 +281,13 @@ def _atomic_write(f: Path, text: str) -> None:
 def cmd_denied(args) -> int:
     name = resolve(args.profile)
     b = boxmod.load(name)
-    log = b.state / "logs" / "egress" / "egress.log"
+    logdir = b.state / "logs" / "egress"
     since = denied.parse_since(args.since) if args.since else 0.0
     allowlist = [] if b.profile.network.mode == "open" else boxmod.agent_domains(b.profile)
-    lines = log.read_text(errors="replace").splitlines() if log.is_file() else []
+    lines = []
+    for log in (logdir / "egress.log.1", logdir / "egress.log"):  # rotated file first
+        if log.is_file():
+            lines += log.read_text(errors="replace").splitlines()
     items = denied.parse(lines, b.ips()["agent"], allowlist, since, doc.load_windows(b.state))
     if args.json:
         print(json.dumps([d.as_json() for d in items], indent=1))
@@ -292,12 +296,13 @@ def cmd_denied(args) -> int:
         print("no denied requests")
         return 0
     for d in items:
-        print(f"{d.count:>5}  {d.host:<40}  ports {','.join(sorted(d.ports))}  {d.reason}")
+        line = f"{d.count:>5}  {d.host:<40}  ports {','.join(sorted(d.ports))}  {d.reason}"
+        print(term.clean(line))
     if is_tty():
         for d in items:
             if not d.allowable:
                 continue
-            ans = input(f"allow {d.host}? [y/N] ").strip().lower()
+            ans = input(term.clean(f"allow {d.host}? [y/N] ")).strip().lower()
             if ans in ("y", "yes"):
                 allow_domain(name, d.host)
     return 0
@@ -558,9 +563,12 @@ def cmd_setup(args) -> int:
         raise CliError("Docker is not running (start Docker Desktop, then run setup again)")
     print(f"docker: engine {r.stdout.strip()}")
     repo = paths.repo_root()
-    print("images: building or reusing agentbox/agent, egress, ollama-gate ...", flush=True)
+    print(
+        "images: building or reusing agentbox/agent, egress, ollama-gate, mcp-gateway ...",
+        flush=True,
+    )
     print(f"images: {images.ensure_agent(repo)}")
-    for side in ("egress", "ollama-gate"):
+    for side in ("egress", "ollama-gate", "mcp-gateway"):
         print(f"images: {images.ensure_sidecar(repo, side)}")
     vals = paths.read_config_values()
     if "secret_backend" not in vals:

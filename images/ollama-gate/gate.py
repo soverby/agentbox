@@ -283,14 +283,21 @@ class Gate:
         self.timeout = timeout
         self._refreshed = False
         self._log_lock = threading.Lock()
+        self._log_path = log_path
         self._log = open(log_path, "a", buffering=1) if log_path else sys.stderr  # noqa: SIM115
 
     def conn(self, timeout: float | None = None) -> http.client.HTTPConnection:
         return http.client.HTTPConnection(self.host, self.port, timeout=timeout or self.timeout)
 
+    LOG_MAX = 10 * 1024 * 1024  # rotate at 10 MB, keep one old file (<log>.1)
+
     def log(self, **rec) -> None:
         rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **rec}
         with self._log_lock:
+            if self._log_path and self._log.tell() >= self.LOG_MAX:
+                self._log.close()
+                os.replace(self._log_path, self._log_path + ".1")
+                self._log = open(self._log_path, "a", buffering=1)  # noqa: SIM115
             self._log.write(json.dumps(rec) + "\n")
 
     def _get_json(self, method: str, path: str, body: dict | None = None):

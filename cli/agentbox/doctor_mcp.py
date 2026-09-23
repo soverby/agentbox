@@ -21,7 +21,7 @@ import re
 import shlex
 
 from . import box as boxmod
-from . import compose, launch, mcpgw, paths
+from . import compose, docker, launch, mcpgw, paths
 from .denied import allow_matches
 
 GW_PROBE = r"""
@@ -98,7 +98,7 @@ else:
 # its user can write only /tmp (tmpfs) and the log dir, and runs as non-root.
 GW_FS = r"""
 import os, stat
-allowed = ("/tmp", "/var/log/mcp")
+allowed = ("/tmp", "/var/log/mcp", "/var/lib/mcp-oauth")
 skip = ("/proc", "/sys", "/dev")
 bad = []
 if os.getuid() == 0:
@@ -145,7 +145,7 @@ def check_13(b: boxmod.Box, ua: str) -> list:
     from .doctor import parse_lines, pick_denied
 
     p = b.profile
-    doms = mcpgw.egress_domains(p)
+    doms = mcpgw.egress_domains(p, b.state)
     ports = mcpgw.host_ports(p)
     deny_ports = [x for x in (11434, 3128, 22) if x not in ports]
     args = [ua, pick_gateway_allowed(doms), pick_denied(doms), " ".join(map(str, ports)),
@@ -379,9 +379,70 @@ def check_upstreams(b: boxmod.Box):
     return _result("PASS", "20 upstreams", detail)
 
 
+OAUTH_FS = r"""
+import os, stat, sys
+d = sys.argv[1]
+bad = []
+st = os.stat(d)
+if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700:
+    bad.append(f"{d} uid {st.st_uid} mode {stat.S_IMODE(st.st_mode):o} (want {os.getuid()} 700)")
+for n in os.listdir(d):
+    m = stat.S_IMODE(os.lstat(os.path.join(d, n)).st_mode)
+    if m & 0o077:
+        bad.append(f"{n} mode {m:o}")
+print("BAD " + "; ".join(bad) if bad else f"OK {len(os.listdir(d))} file(s)")
+"""
+
+
+def check_oauth_store(b: boxmod.Box):
+    """P6b: the OAuth token volume is on the gateway only (0700, gateway uid)."""
+    if not mcpgw.has_oauth(b.profile):
+        return _result("SKIP", "20 oauth-store", 'no auth = "oauth" MCP servers')
+    reasons = []
+    vol = mcpgw.oauth_volume(b.profile.name)
+    # Live mounts of every container that uses the volume (any project).
+    r = docker.run(["docker", "ps", "-a", "-q", "--filter", f"volume={vol}"], check=False)
+    ids = r.stdout.split()
+    users = []
+    if ids:
+        r = docker.run(["docker", "inspect", *ids], check=False)
+        try:
+            info = json.loads(r.stdout or "[]")
+        except ValueError:
+            info = []
+        for c in info:
+            mounts = [m for m in c.get("Mounts", []) if m.get("Name") == vol]
+            if not mounts:
+                continue
+            labels = c.get("Config", {}).get("Labels") or {}
+            svc = labels.get("com.docker.compose.service", "?")
+            proj = labels.get("com.docker.compose.project", "?")
+            users.append(f"{proj}/{svc}")
+            if svc != mcpgw.SERVICE or proj != b.project:
+                reasons.append(f"{proj}/{svc} ({c.get('Name', '?').lstrip('/')}) mounts {vol}")
+            elif any(m.get("Destination") != mcpgw.OAUTH_DIR for m in mounts):
+                reasons.append(f"gateway mounts {vol} outside {mcpgw.OAUTH_DIR}")
+    if f"{b.project}/{mcpgw.SERVICE}" not in users:
+        reasons.append(f"mcp-gateway does not mount {vol}")
+    r = boxmod.dc(b, "exec", "-T", mcpgw.SERVICE, "python3", "-", mcpgw.OAUTH_DIR,
+                  input=OAUTH_FS, check=False, timeout=60)  # fmt: skip
+    out = r.stdout.strip()
+    if not out.startswith("OK"):
+        reasons.append(f"gateway: {out or r.stderr.strip()[-200:]}")
+    r = boxmod.exec_in(b, ["sh", "-c", f"test -e {mcpgw.OAUTH_DIR} && echo SEEN || echo NONE"],
+                       timeout=60)  # fmt: skip
+    if "NONE" not in r.stdout:
+        reasons.append(f"agent sees {mcpgw.OAUTH_DIR}")
+    return _result("FAIL" if reasons else "PASS", "20 oauth-store",
+                   "; ".join(reasons) or f"gateway-only volume, 0700 uid {mcpgw.GW_UID}; "
+                   f"{out[3:]}; agent has no path to it")  # fmt: skip
+
+
 def check_20(b: boxmod.Box, ua: str, agent_allowlist: list[str]) -> list:
     p = b.profile
     res = [check_gateway_fs(b), check_upstreams(b)]
+    if mcpgw.has_oauth(p):  # P6b; no line for profiles without OAuth servers
+        res.append(check_oauth_store(b))
     codes = {m: mcp_client(b, "code", m).get("code") for m in ("none", "bad", "env")}
     ok = codes["none"] == 401 and codes["bad"] == 401 and codes["env"] == 200
     res.append(_result("PASS" if ok else "FAIL", "20 auth",
@@ -409,7 +470,7 @@ def check_20(b: boxmod.Box, ua: str, agent_allowlist: list[str]) -> list:
                        f"rejected: {', '.join(out.get('calls', {}))}"))  # fmt: skip
     # The agent reaches no upstream except through the gateway.
     reasons = []
-    targets = [f"{d}:443" for d in mcpgw.egress_domains(p)
+    targets = [f"{d}:443" for d in mcpgw.egress_domains(p, b.state)
                if p.network.mode == "strict" and not allow_matches(d, agent_allowlist)]  # fmt: skip
     ports = mcpgw.host_ports(p)
     curl = f"curl -A {shlex.quote(ua)} -s -o /dev/null --noproxy '' -x http://egress:3128 -m 15"
@@ -425,7 +486,7 @@ def check_20(b: boxmod.Box, ua: str, agent_allowlist: list[str]) -> list:
             parts = line.split()
             if len(parts) == 3 and parts[2] != "403":
                 reasons.append(f"agent {parts[0]} {parts[1]} -> {parts[2]} (want 403)")
-    shared = [d for d in mcpgw.egress_domains(p) if allow_matches(d, agent_allowlist)]
+    shared = [d for d in mcpgw.egress_domains(p, b.state) if allow_matches(d, agent_allowlist)]
     note = f"; also on the agent allowlist (reachable by design): {', '.join(shared)}" if (
         shared and p.network.mode == "strict") else ""  # fmt: skip
     res.append(_result("FAIL" if reasons else "PASS", "20 upstream-direct",

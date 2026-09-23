@@ -41,7 +41,19 @@ RESERVED_SECRET_RE = re.compile(
     r"|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|OLLAMA_HOST|DISABLE_AUTOUPDATER|DISABLE_UPDATES"
     r"|ENABLE_CLAUDEAI_MCP_SERVERS|CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
     r"|_OP_SERVICE_ACCOUNT_TOKEN"  # host-only (op backend); never delivered to a box
+    r"|_MCP_OAUTH_.*"  # OAuth token sets (`agentbox mcp login`), mcp-gateway only
 )
+OAUTH_PREFIX = "_MCP_OAUTH_"
+# RFC 6749 §3.3 scope-token: %x21 / %x23-5B / %x5D-7E
+SCOPE_RE = re.compile(r"[\x21\x23-\x5b\x5d-\x7e]{1,256}")
+CLIENT_ID_RE = re.compile(r"[\x21-\x7e]{1,512}")
+
+
+def oauth_secret_name(server: str) -> str:
+    """Backend item name of an OAuth MCP server's token set (PLAN §2.6)."""
+    return OAUTH_PREFIX + re.sub(r"[^A-Za-z0-9_]", "_", server).upper()
+
+
 PROXY_SECRET_RE = re.compile(r".*_PROXY|NPM_CONFIG_.*", re.I)
 LOCAL_SUFFIXES = ("localhost", "localdomain", "local", "internal", "home.arpa")
 RESERVED_ROOTS = (
@@ -132,6 +144,9 @@ class McpServer:
     bearer: str | None
     auth: str | None
     tools: list[str] | None
+    scopes: list[str] | None = None  # auth = "oauth": requested scopes (default: discovered)
+    client_id: str | None = None  # auth = "oauth": pre-registered client (no DCR)
+    client_secret: str | None = None  # secret NAME of that client's secret
 
 
 @dataclass(frozen=True)
@@ -629,7 +644,10 @@ def _parse_mcp(v: _V, top: dict) -> dict[str, McpServer]:
         p = f"mcp.servers.{sname}"
         if not full(ITEM_NAME_RE, sname):
             v.err(p, "invalid server name")
-        s = v.table(s, p, {"url", "command", "bearer", "auth", "tools"})
+        s = v.table(
+            s, p, {"url", "command", "bearer", "auth", "tools", "scopes", "client_id",
+                   "client_secret"}
+        )  # fmt: skip
         if ("url" in s) == ("command" in s):
             v.err(p, "needs exactly one of url or command")
         url = v.url(s, "url", p)
@@ -647,7 +665,28 @@ def _parse_mcp(v: _V, top: dict) -> dict[str, McpServer]:
             v.err(f"{p}.tools", "must not be empty; omit `tools` for all tools")
         if tools and len(set(tools)) != len(tools):
             v.err(f"{p}.tools", "duplicate tool")
-        servers[sname] = McpServer(sname, url, command, bearer, auth, tools)
+        scopes = v.str_list(s, "scopes", p, None, SCOPE_RE)
+        client_id = v.typed(s, "client_id", p, (str,), None, "a string")
+        if client_id is not None and not full(CLIENT_ID_RE, client_id):
+            v.err(f"{p}.client_id", "must be 1-512 visible ASCII characters")
+            client_id = None
+        client_secret = v.secret_ref(s, "client_secret", p)
+        if auth != "oauth" and any(k in s for k in ("scopes", "client_id", "client_secret")):
+            v.err(p, 'scopes, client_id, client_secret need auth = "oauth"')
+        if "client_secret" in s and "client_id" not in s:
+            v.err(f"{p}.client_secret", "needs client_id")
+        if scopes == [] and s.get("scopes") == []:
+            v.err(f"{p}.scopes", "must not be empty; omit `scopes` for the server's default")
+        servers[sname] = McpServer(
+            sname, url, command, bearer, auth, tools, scopes, client_id, client_secret
+        )
+    seen: dict[str, str] = {}
+    for sname, sv in servers.items():
+        if sv.auth == "oauth":
+            n = oauth_secret_name(sname)
+            if n in seen:
+                v.err(f"mcp.servers.{sname}", f"clashes with {seen[n]!r} (same item name {n})")
+            seen[n] = sname
     return servers
 
 
@@ -661,6 +700,8 @@ def _parse_secrets(
     for s in servers.values():
         if s.bearer:
             inferred.setdefault(s.bearer, set()).add("mcp-gateway")
+        if s.client_secret:
+            inferred.setdefault(s.client_secret, set()).add("mcp-gateway")
 
     secrets: dict[str, Secret] = {}
     for sname, sv in v.table(top.get("secrets", {}), "secrets", None).items():
@@ -710,6 +751,10 @@ def _parse_secrets(
             secrets[sname] = Secret(
                 sname, _default_ref(name, sname, False), sorted(targets), "profile"
             )
+    for s in servers.values():
+        if s.auth == "oauth":  # the token set from `agentbox mcp login`, gateway only
+            n = oauth_secret_name(s.name)
+            secrets[n] = Secret(n, _default_ref(name, n, False), ["mcp-gateway"], "profile")
     if "claude" in box.agents and CLAUDE_TOKEN not in secrets:
         secrets[CLAUDE_TOKEN] = Secret(
             CLAUDE_TOKEN, _default_ref(name, CLAUDE_TOKEN, True), ["agent"], "shared"

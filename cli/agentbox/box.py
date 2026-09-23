@@ -28,7 +28,7 @@ from . import (
     term,
 )
 from .launch import WITH_SECRETS
-from .profile import Profile, ProfileError, load_profile
+from .profile import OAUTH_PREFIX, Profile, ProfileError, load_profile, oauth_secret_name
 
 
 class BoxError(Exception):
@@ -251,6 +251,11 @@ def secret_problems(d: delivery.Delivery, profile: Profile) -> None:
         warn(hint)
     for m in d.missing:
         if m.name == "CLAUDE_CODE_OAUTH_TOKEN" and hint:
+            continue
+        if m.name.startswith(OAUTH_PREFIX):
+            srv = next((n for n in profile.mcp_servers if oauth_secret_name(n) == m.name), "?")
+            warn(f"MCP server {srv} is not logged in, so its tools are not available: "
+                 f"`agentbox mcp login {profile.name} {srv}`")  # fmt: skip
             continue
         scope = profile.secrets[m.name].scope
         where = "--shared" if scope == "shared" else profile.name

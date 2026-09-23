@@ -55,7 +55,9 @@ the agent container, and it can send any request to any sidecar it can reach.
   allows any public domain, unlogged by the gateway (no worse than raw
   HTTP).
 - stdio MCP servers run as the gateway user and can read the gateway's
-  secrets (upstream bearers); one with a shell or file tool hands them to
+  secrets (upstream bearers, OAuth token sets in `/run/secrets` and the
+  OAuth volume — a stdio server could rotate a refresh token and lock the
+  gateway out); one with a shell or file tool hands them to
   the agent, and it shares the gateway's network position. Declare only trusted stdio servers; `uvx`/
   `npx` packages are pinned only as far as the profile pins them.
 - A mounted repo can declare stdio MCP servers for Codex or Pi. They are only
@@ -522,6 +524,18 @@ third-party router.
     set in the backend (profile scope), and delivers it to the gateway only.
     The gateway refreshes tokens and keeps rotated refresh tokens in a
     gateway-only volume. The agent never sees upstream tokens.
+    Implementation (P6b, MCP authorization rev. 2026-07-28): RFC 9728
+    protected-resource discovery with a fallback to the server origin as
+    the authorization server when no metadata exists (older revision; the
+    issuer check still applies — needed by Atlassian); RFC 8414/OIDC
+    discovery with exact issuer match; DCR (RFC 7591) unless the profile
+    sets `client_id` (+ optional `client_secret` secret name); PKCE S256
+    only; RFC 9207 `iss` check; `resource` (RFC 8707) on every request;
+    https-only metadata and endpoints. Optional profile `scopes`. Token and
+    revocation hosts join the gateway allowlist only. `agentbox mcp
+    status|logout` (RFC 7009 revocation when advertised). Token sets above
+    the Keychain cap keep only refresh data; the `op` backend is read-only,
+    so larger sets are unsupported for now.
 - Host MCP servers: reached by the gateway through squid forward requests
   (§2.2). P6 tests streamable HTTP and SSE through squid; if squid buffers
   streams, fall back to a per-port relay reachable only from the gateway.
@@ -627,7 +641,8 @@ runs once the repo has a GitHub remote — until then Linux is untested). Every 
 21. Router (when present): healthy; with the master key, admin routes
     (`/model/info`, `/config/yaml`, `/key/generate`, `/config/update`) →
     403/404; a request with `api_base: http://agent:9` does not connect.
-20. Gateway: missing/wrong token → 401; only allowlisted namespaced tools
+20. Gateway (also `oauth-store`, when OAuth servers exist: the token
+    volume is 0700 gateway-owned, files 0600, mounted by no other service): missing/wrong token → 401; only allowlisted namespaced tools
     listed; non-allowlisted `tools/call` rejected; agent cannot reach
     upstreams; gateway user writes only `/tmp` and its log dir, no setuid;
     every declared upstream connected (else FAIL naming it).

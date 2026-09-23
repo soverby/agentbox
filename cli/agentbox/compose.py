@@ -239,8 +239,15 @@ def _render(ctx: Ctx) -> dict:
             },
             "external": {},
         },
-        "volumes": {"home": {"name": home_volume(p.name)}},
+        "volumes": {"home": {"name": home_volume(p.name)}, **_oauth_volume(p)},
     }
+
+
+def _oauth_volume(p: Profile) -> dict:
+    """P6b: gateway-only volume for rotated OAuth token sets (never on the agent)."""
+    from . import mcpgw
+
+    return {"mcpoauth": {"name": mcpgw.oauth_volume(p.name)}} if mcpgw.has_oauth(p) else {}
 
 
 def egress_clients(ctx: Ctx, agent_domains: list[str]) -> list[egress.Client]:
@@ -255,7 +262,9 @@ def egress_clients(ctx: Ctx, agent_domains: list[str]) -> list[egress.Client]:
         from . import mcpgw
 
         clients.append(
-            egress.Client("mcp-gateway", ips["mcp-gateway"], mcpgw.egress_domains(ctx.profile))
+            egress.Client(
+                "mcp-gateway", ips["mcp-gateway"], mcpgw.egress_domains(ctx.profile, ctx.state)
+            )
         )
     return clients
 

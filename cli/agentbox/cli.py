@@ -30,6 +30,8 @@ from . import (
     egress,
     images,
     launch,
+    mcpcmd,
+    mcpoauth,
     mountstate,
     network,
     paths,
@@ -45,10 +47,12 @@ from . import update as upd
 from .profile import (
     AGENTS,
     CLAUDE_TOKEN,
+    OAUTH_PREFIX,
     PROFILE_NAME_RE,
     ProfileError,
     code_mount_problem,
     load_profile,
+    oauth_secret_name,
     parse_profile,
     secret_name_problem,
 )
@@ -696,6 +700,20 @@ def cmd_login(args) -> int:
     return session(b, cmd)
 
 
+# ---------------------------------------------------------------- mcp (P6b)
+def cmd_mcp_login(args) -> int:
+    return mcpcmd.login(args.profile, args.server, no_browser=args.no_browser,
+                        timeout=args.timeout, redirect_port=args.redirect_port)  # fmt: skip
+
+
+def cmd_mcp_status(args) -> int:
+    return mcpcmd.status(resolve(args.profile))
+
+
+def cmd_mcp_logout(args) -> int:
+    return mcpcmd.logout(args.profile, args.server)
+
+
 # ---------------------------------------------------------------- schedule
 class RunFailed(Exception):
     def __init__(self, msg: str, run_dir: Path | None, rc: int | None = None) -> None:
@@ -717,6 +735,9 @@ def sched_runner(profile: str, agent: str, prompt: str, model: str | None, timeo
 
 
 def secret_fix(prof, m) -> str:
+    if m.name.startswith(OAUTH_PREFIX):
+        srv = next((n for n in prof.mcp_servers if oauth_secret_name(n) == m.name), "?")
+        return f"MCP server {srv} is not logged in: `agentbox mcp login {prof.name} {srv}`"
     if m.name == CLAUDE_TOKEN:
         return f"{m.name} is missing: run `agentbox setup` (it stores the shared token)"
     scope = prof.secrets[m.name].scope
@@ -1077,6 +1098,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("agent", choices=("codex", "pi"))
     p.set_defaults(func=cmd_login)
 
+    p = sub.add_parser("mcp", help="OAuth MCP servers: login / status / logout")
+    ssub = p.add_subparsers(dest="mcp_command", metavar="<login|status|logout>")
+    ssub.required = True
+    q = ssub.add_parser("login", help="OAuth login on the host: login <profile> <server>")
+    q.add_argument("profile")
+    q.add_argument("server")
+    q.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
+    q.add_argument("--timeout", type=float, help=argparse.SUPPRESS)
+    q.add_argument("--redirect-port", type=int, default=0,
+                   help="fixed loopback port (for a pre-registered client_id)")  # fmt: skip
+    q.set_defaults(func=cmd_mcp_login)
+    q = ssub.add_parser("status", help="per OAuth server: logged in, expiry, refresh, needs login")
+    q.add_argument("profile", nargs="?")
+    q.set_defaults(func=cmd_mcp_status)
+    q = ssub.add_parser("logout", help="delete the token set (backend + gateway volume), revoke")
+    q.add_argument("profile")
+    q.add_argument("server")
+    q.set_defaults(func=cmd_mcp_logout)
+
     p = sub.add_parser("schedule", help="scheduled headless runs: add / ls / rm / run-now / edit")
     ssub = p.add_subparsers(dest="schedule_command", metavar="<add|ls|rm|run-now|edit>")
     ssub.required = True
@@ -1144,6 +1184,8 @@ def main(argv: list[str] | None = None) -> int:
         mountstate.MountChangeError,
         secretstore.SecretError,
         schedule.ScheduleError,
+        mcpcmd.McpCmdError,
+        mcpoauth.OAuthError,
     ) as e:
         err(str(e))
         return 1

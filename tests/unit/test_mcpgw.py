@@ -64,7 +64,7 @@ def test_egress_domains_and_ports():
         ({"url": "https://10.0.0.1/mcp"}, "10.0.0.1"),
         ({"command": ["pnpm", "dlx", "srv"]}, "not in the mcp-gateway image"),
         ({"command": ["/usr/bin/bunx", "x"]}, "not in the mcp-gateway image"),
-        ({"url": "https://mcp.example.com/mcp", "auth": "oauth"}, "P6b"),
+        ({"url": "http://host.docker.internal:9/mcp", "auth": "oauth"}, "remote https"),
     ],
 )
 def test_check_rejects(server, msg):

@@ -36,11 +36,14 @@ RUN python3 -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir --disable-pip-version-check \
       --require-hashes --only-binary=:all: -r /opt/mcp-gateway/requirements.lock \
  && useradd --uid 10002 --no-create-home --shell /usr/sbin/nologin mcpgw \
- && mkdir -p /var/log/mcp && chown mcpgw /var/log/mcp
+ && mkdir -p /var/log/mcp && chown mcpgw /var/log/mcp \
+ && mkdir -p /var/lib/mcp-oauth && chown mcpgw:mcpgw /var/lib/mcp-oauth && chmod 0700 /var/lib/mcp-oauth
 # Node.js into /usr/local (the tarball's uid 1001 was reset to root above).
 COPY --from=node /out/node/ /usr/local/
 COPY --from=uv /uv /uvx /usr/local/bin/
-COPY entrypoint.sh gateway.py /opt/mcp-gateway/
+# /var/lib/mcp-oauth: mount point of the gateway-only OAuth volume (P6b); a new
+# named volume copies this dir's owner and mode (mcpgw, 0700).
+COPY entrypoint.sh gateway.py upstream_oauth.py /opt/mcp-gateway/
 # Build-time ownership checks: nothing under /usr/local or /opt is owned by a
 # non-root uid or writable by group/other; no setuid/setgid; no world-writable
 # dirs (the gateway service is not read_only, see PLAN §2.6).

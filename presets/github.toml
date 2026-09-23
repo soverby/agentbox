@@ -1,0 +1,15 @@
+# GitHub: git over HTTPS, REST/GraphQL API, archives, raw files, release assets.
+# Source: https://api.github.com/meta "domains" (actions_inbound.full_domains,
+# website), fetched 2026-09-23. SSH (port 22) is blocked; the box rewrites
+# git@github.com: to https (PLAN §2.1).
+domains = [
+  "github.com",
+  "api.github.com",
+  "codeload.github.com",
+  "uploads.github.com",
+  "raw.githubusercontent.com",
+  "objects.githubusercontent.com",
+  "release-assets.githubusercontent.com",
+  "github-releases.githubusercontent.com",
+  "avatars.githubusercontent.com",
+]

@@ -38,6 +38,8 @@ the agent container, and it can send any request to any sidecar it can reach.
   `GH_TOKEN`). With the ChatGPT token and chatgpt.com allowed, the agent can
   also call the connector backend by raw HTTP.
 - A shared secret (§2.4) is visible in every box that uses it.
+- Domain fronting: squid sees the `CONNECT` host, not the TLS SNI, so a
+  CDN-hosted allowed domain (npm, PyPI) can front other tenants of that CDN.
 - A container-escape kernel bug in the Docker Desktop VM.
 - A sidecar compromise gives that sidecar's own secrets (each sidecar holds
   only its own).
@@ -54,6 +56,8 @@ Per profile, one Compose project `agentbox-<profile>` with two networks:
 - `internal` (`internal: true`, fixed subnet, fixed IP per service): all
   containers.
 - `external` (normal bridge): only `egress` and `ollama-gate`.
+- At every `up` the CLI calls `network.verify()` against Docker's in-use
+  subnets, excluding the profile's own Compose project.
 - The CLI allocates each profile a unique internal subnet (`10.213.<n>.0/24`,
   `n` stored in the profile state dir; Docker refuses overlapping bridge
   subnets) and fixed IPs inside it. `n` is 1–254; freed values are reused.
@@ -164,8 +168,11 @@ Per profile, one Compose project `agentbox-<profile>` with two networks:
     reverse-DNS matching, so an IP-literal request never matches a domain).
   - Always denied, all modes: IP-literal hosts (`dstdom_regex -n` for IPv4
     and bracketed IPv6); `dst` ACL for `0/8`, `10/8`, `100.64/10`, `127/8`,
-    `169.254/16`, `172.16/12`, `192.168/16`, `::1`, `fc00::/7`, `fe80::/10`
-    (never `::` or `::ffff:0:0/96`: squid parses them as `0.0.0.0/0`)
+    `169.254/16`, `172.16/12`, `192.168/16`, `::/96` (unspecified,
+    loopback, IPv4-compatible), `100::/64`, `2001::/32`, `2001:db8::/32`,
+    `64:ff9b:1::/48`, `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`,
+    `2002::/16` (never `::ffff:0:0/96`: squid stores IPv4 as mapped IPv6, so
+    it means all IPv4; `::1` next to `::/96` makes a squid warning)
     (checked on squid's resolved address, which is also the address it
     connects to); `CONNECT` to any port other than 443 (80 only with
     `allow_http`); `manager`.
@@ -483,7 +490,8 @@ docs/                  PLAN.md, SECURITY.md, USAGE.md
 
 Checks run inside the agent container (and, where marked, inside sidecars).
 Each check is pass/fail. The full suite runs on `agentbox doctor`, after
-`agentbox update`, and in Linux CI. Every `up` runs a fast subset (1, 2, 6,
+`agentbox update`, and in Linux CI (GitHub Actions workflow committed; it
+runs once the repo has a GitHub remote — until then Linux is untested). Every `up` runs a fast subset (1, 2, 6,
 9; target < 3 s) and refuses to start a session if it fails.
 
 1. `curl https://example.com` without proxy → fails (no route).
@@ -524,7 +532,10 @@ Each check is pass/fail. The full suite runs on `agentbox doctor`, after
 18. Host Ollama ≥ 0.14.0; no allowed model has a non-empty `remote_host`.
 19. `open` mode: public domain → 200; IP literal, RFC 1918, loopback,
     link-local, `host.docker.internal`, and a public name that resolves to a
-    private IP → 403.
+    private IP → 403. IPv6 cases run only when a canary IPv6 name resolves
+    from egress (squid `ERR_DNS_FAIL` → SKIP; Docker Desktop DNS returns no
+    AAAA). The harness adds a test-only squid `hosts_file` for its IPv6 test
+    names; no resolver runs in any box.
 
 ## 5. Phases
 

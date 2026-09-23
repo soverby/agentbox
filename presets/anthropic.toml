@@ -1,0 +1,13 @@
+# Claude Code (subscription and API). Source: https://code.claude.com/docs/en/network-config
+# ("Network access requirements", fetched 2026-09-23).
+# Never add mcp-proxy.anthropic.com (claude.ai connectors; PLAN §2.6).
+# Left out on purpose: downloads.claude.ai (auto-updater, disabled in the image),
+# Datadog intake hosts (telemetry, off via CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC),
+# storage.googleapis.com (plugin counts; far too broad), claudeusercontent.com.
+domains = [
+  "api.anthropic.com",
+  "claude.ai",
+  "claude.com",
+  "platform.claude.com",
+  "code.claude.com",
+]

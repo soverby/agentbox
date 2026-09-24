@@ -253,7 +253,13 @@ class Box:
         # Harness only: squid reads the IPv6 test names from a hosts file.
         # All other names still resolve through Docker's embedded DNS, and no
         # resolver is added to any network.
-        files["test_hosts"] = TEST_HOSTS
+        # `hosts_file` replaces squid's default /etc/hosts, where Linux puts
+        # the `extra_hosts` entry for host.docker.internal (Docker Desktop
+        # resolves it by DNS instead), so carry that mapping over.
+        hosts = TEST_HOSTS
+        if sys.platform.startswith("linux"):
+            hosts += f"{host_bind_ip()} host.docker.internal\n"
+        files["test_hosts"] = hosts
         files["squid.conf"] += f"hosts_file {egress.CONF_DIR}/test_hosts\n"
         egress.write(self.conf, files)
 

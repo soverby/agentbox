@@ -425,7 +425,8 @@ gateway `requirements.lock`, and the Modal `VLLM_IMAGE` and
 
 Not pinned: the `apt` packages from `[box] packages`, packages that the
 agent installs at runtime, and stdio MCP packages unless the profile pins
-them. The Linux CI workflow uses GitHub Actions by tag, not by commit.
+them. The Linux CI workflow pins its GitHub Actions by full commit SHA
+(`.github/workflows/isolation.yml`); these pins change only by hand.
 
 ## What agentbox does NOT protect against
 

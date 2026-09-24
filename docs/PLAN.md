@@ -353,7 +353,9 @@ Mount validation (T1):
   transcripts match the host). Override with `path`.
 - Refuse when the realpath equals, is an ancestor of, or is a descendant of
   any denylist entry: `/`, `/etc`, `/private`, `/var`, `/System`, `/Library`,
-  `/Users` (itself), `$HOME` (itself), the Docker socket, `~/Library`,
+  `/tmp`, `/run`, `/proc`, `/sys`, `/dev`, `/boot`, `/root`, `/snap` (Linux
+  agent sockets live in `/tmp` and `/run/user/<uid>`), `/Users` and `/home`
+  (itself), `$HOME` (itself), the Docker socket, `~/Library`,
   `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.config`,
   `~/.cache`, `~/.local`, `~/.claude`, `~/.codex`, `~/.pi`, `~/.netrc`,
   `~/.npmrc`, `~/.pypirc`, `~/.gitconfig`. Writable (`rw`) mounts also may

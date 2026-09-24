@@ -1,6 +1,7 @@
 """Mount validation (PLAN §2.3, T1): realpath, missing, denylist, dot-paths."""
 
 import os
+import sys
 
 import pytest
 from agentbox.profile import MountError, ProfileError, check_mount_host, parse_profile
@@ -75,7 +76,11 @@ def test_ancestor_of_denied_refused(home):
         chk(os.path.dirname(home), home)  # ancestor of $HOME/.ssh
 
 
-@pytest.mark.parametrize("p", ["/", "/etc", "/private", "/var", "/tmp", "/usr/../etc"])
+@pytest.mark.parametrize(
+    "p",
+    ["/", "/etc", "/private", "/var", "/tmp", "/usr/../etc", "/run", "/proc", "/dev", "/root",
+     "/home"],
+)  # fmt: skip
 def test_system_paths(home, p):
     if not os.path.exists(p):
         pytest.skip(f"{p} missing on this host")
@@ -198,7 +203,6 @@ def test_host_code_paths_refused_rw_only(home):
 
 
 def test_default_code_paths_include_interpreter(monkeypatch, tmp_path):
-    import sys
 
     from agentbox import profile
 

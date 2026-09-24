@@ -163,9 +163,13 @@ class Profile:
 
 # Mount denylist (PLAN §2.3, T1). "eq": only the path itself. "tree": the
 # path, any ancestor, and any descendant.
-DENY_EQ_ABS = ("/", "/Users")
+DENY_EQ_ABS = ("/", "/Users", "/home")
+# macOS and Linux system trees. Linux keeps live agent sockets here
+# (`/tmp/ssh-*` for ssh-agent, `/run/user/<uid>` for gpg-agent and rootless
+# Docker), so a mount of any of them would hand the agent host credentials.
 DENY_TREE_ABS = (
     "/etc", "/private", "/var", "/System", "/Library",
+    "/tmp", "/run", "/proc", "/sys", "/dev", "/boot", "/root", "/snap",
     "/var/run/docker.sock", "/run/docker.sock",
 )  # fmt: skip
 DENY_TREE_HOME = (

@@ -1,5 +1,5 @@
-# Linux CI for agentbox (PLAN §4, §5 P2). Not run yet: the repo has no
-# GitHub remote. Until it runs, Linux is untested.
+# Linux CI for agentbox (PLAN §4, §5): unit tests, the agent image build
+# and its tests, and the P2 network-isolation harness against real Docker.
 name: isolation
 on:
   push:
@@ -11,8 +11,8 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - run: uv run --project cli pytest tests/unit
       - run: uv run --project cli ruff check cli tests
       - run: uv run --project cli ruff format --check cli tests
@@ -21,10 +21,20 @@ jobs:
     needs: unit
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Docker and Compose versions
         run: docker version && docker compose version
       # Runs strict + open. On Linux the harness adds
       # extra_hosts host.docker.internal:host-gateway, binds the stub host MCP
       # server to the docker0 gateway IP, and chowns log dirs to the writer uid.
       - run: python3 tests/isolation/p2_harness.py --mode both
+  agent-image:
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Builds images/agent from the pinned versions.env and runs its checks
+      # (versions, doctor 16, with-secrets, Pi adapter) in a hardened container.
+      - run: bash images/agent/build.sh
+      - run: bash images/agent/test.sh

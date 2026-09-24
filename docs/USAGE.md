@@ -205,9 +205,12 @@ by default, so paths in errors and transcripts match the host.
 The CLI refuses a mount when its realpath is, contains, or is inside one of
 these paths (on macOS the compare ignores letter case):
 
-- `/etc`, `/private`, `/var`, `/System`, `/Library`, and the Docker socket.
-- `/`, `/Users`, and `$HOME` (only the path itself; subdirectories are
-  permitted).
+- `/etc`, `/private`, `/var`, `/System`, `/Library`, `/tmp`, `/run`,
+  `/proc`, `/sys`, `/dev`, `/boot`, `/root`, `/snap`, and the Docker socket.
+  On Linux, `/tmp` and `/run/user/<uid>` hold live ssh-agent, gpg-agent,
+  and rootless Docker sockets.
+- `/`, `/Users`, `/home`, and `$HOME` (only the path itself;
+  subdirectories are permitted).
 - In `$HOME`: `Library`, `.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`,
   `.config`, `.cache`, `.local`, `.claude`, `.codex`, `.pi`, `.netrc`,
   `.npmrc`, `.pypirc`, `.gitconfig`.

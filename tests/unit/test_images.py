@@ -1,10 +1,15 @@
 """Image tags: agent hash mirrors build.sh; derived packages image."""
 
 import re
+import shutil
 import subprocess
 
 from agentbox import images
 from conftest import ROOT
+
+# build.sh uses `shasum -a 256`; slim Linux images may only ship coreutils'
+# sha256sum, which prints the same digest.
+SHA256 = "shasum -a 256" if shutil.which("shasum") else "sha256sum"
 
 
 def test_agent_inputs_match_build_sh():
@@ -18,7 +23,7 @@ def test_agent_hash_equals_build_sh():
     script = (
         "set -e; cd " + str(d) + "; inputs=(" + " ".join(images.AGENT_INPUTS) + "); "
         'for f in "${inputs[@]}"; do printf \'%s\\0\' "$f"; cat "$f"; printf \'\\0\'; done'
-        " | shasum -a 256 | cut -c1-12"
+        " | " + SHA256 + " | cut -c1-12"
     )
     out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == images.agent_hash(ROOT)

@@ -98,6 +98,9 @@ def fakes(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_STORE", str(tmp_path / "store.json"))
     monkeypatch.setenv("FAKE_LOG", str(tmp_path / "log.jsonl"))
+    # The fake `security` stands in for macOS; simulate darwin so the keychain
+    # logic runs on Linux too (non-darwin refusal: test_secret_cli.py).
+    monkeypatch.setattr(secretstore, "keychain_available", lambda: True)
 
     class F:
         def log(self):

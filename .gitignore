@@ -2,6 +2,8 @@
 .env
 *.env
 !*.env.example
+# Build pins, not secrets:
+!images/agent/versions.env
 secrets/
 state/
 .run/

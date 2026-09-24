@@ -133,6 +133,10 @@ def roots(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTBOX_TEST_SECRET_STORE", str(store))
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", SECRET)
     monkeypatch.setenv("SOME_API_KEY", SECRET)
+    # job_env needs a `docker` on PATH; unit tests must not need a real one.
+    # Appended, so a test's own fake_bin dir placed first still wins.
+    fake_bin(tmp_path / "sysbin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", os.environ["PATH"] + os.pathsep + str(tmp_path / "sysbin"))
     return tmp_path
 
 

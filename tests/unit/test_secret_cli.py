@@ -190,6 +190,16 @@ def test_login_argv(env, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------- up wiring
+def no_real_docker(monkeypatch):
+    """On Linux, up() chowns log dirs via `docker run`; unit tests fake it."""
+
+    def run(args, **kw):
+        assert "chown" in args, args
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(boxmod.docker, "run", run)
+
+
 def test_up_passes_values_only_in_compose_env(env, monkeypatch):
     s = {
         "AGENTBOX_TEST_C_P1_AGENT_ONLY": "MARK-agent-only",
@@ -208,6 +218,7 @@ def test_up_passes_values_only_in_compose_env(env, monkeypatch):
     monkeypatch.setattr(network, "verify", lambda *a, **k: None)
     monkeypatch.setattr(boxmod, "wait_ready", lambda b: None)
     monkeypatch.setattr(boxmod, "apply_egress", lambda *a: None)
+    no_real_docker(monkeypatch)
     monkeypatch.setattr(boxmod, "host_git", lambda k: None)
     calls = []
 
@@ -556,6 +567,7 @@ def up_env(env, monkeypatch, running, dc_up=None):
     monkeypatch.setattr(network, "verify", lambda *a, **k: None)
     monkeypatch.setattr(boxmod, "wait_ready", lambda b: None)
     monkeypatch.setattr(boxmod, "apply_egress", lambda *a: None)
+    no_real_docker(monkeypatch)
     monkeypatch.setattr(boxmod, "git_setup", lambda *a: None)
     monkeypatch.setattr(boxmod, "is_running", lambda b: running)
     monkeypatch.setattr(boxmod, "keep_running_secrets", lambda *a: False)

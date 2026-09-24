@@ -20,7 +20,15 @@ LOG_DIR = "/var/log/agentbox"
 ACCESS_LOG = f"{LOG_DIR}/egress.log"
 PORT = 3128
 # Native "squid" logformat, then '"<url-encoded User-Agent>"' ("-" when absent).
-LOGFORMAT = '%ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru %[un %Sh/%<a %mt "%#{User-Agent}>h"'
+# Agent-chosen strings are width-capped (PLAN §2.6): URL <= URL_MAX, encoded
+# UA <= UA_MAX. Squid encodes first, then truncates (checked on 6.13), so a
+# cut never exposes raw bytes; at worst it leaves a partial "%2" escape.
+URL_MAX = 256
+UA_MAX = 128
+LOGFORMAT = (
+    f"%ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %.{URL_MAX}ru %[un %Sh/%<a %mt "
+    f'"%#.{UA_MAX}{{User-Agent}}>h"'
+)
 CLIENTS = ("agent", "router", "mcp-gateway")
 # `host_dom` (the gateway-only host-MCP forward rule) matches only
 # host.docker.internal. Both Docker Desktop host names are always denied

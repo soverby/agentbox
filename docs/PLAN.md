@@ -1,6 +1,6 @@
 # agentbox — Implementation Plan
 
-Status: r5 + usability pass u1. Adversarial design review: APPROVED in
+Status: v1 built (all phases committed on `build/p0-scaffold`). Design: r5 + usability pass u1, amended during the build. Adversarial design review: APPROVED in
 round 5 of 5, conditional on the R5 edits (applied). The usability pass (§9)
 was done by the architect after the review closed. Requirements: `PROJECT.md`.
 Change log: §8.
@@ -44,6 +44,38 @@ the agent container, and it can send any request to any sidecar it can reach.
 - Doctor results can be faked by a persistent agent process (same uid, no
   Yama ptrace restriction). Isolation does not depend on doctor; only its
   report does.
+- Host tools the user runs in a rw-mounted directory execute config the
+  agent can plant there: `.git/config` (`core.fsmonitor`, aliases),
+  `.git/hooks`, `.envrc`, `.vscode/tasks.json`, `package.json` scripts,
+  Makefiles, project `.claude/` and `.mcp.json` for host Claude Code.
+  Mitigation: review before running host tools there (USAGE, SECURITY),
+  plus host-side detection: at the end of every session and headless run
+  the CLI compares a snapshot (taken at session start) of host-executed
+  config in each rw mount — risky `.git/config` keys (`core.fsmonitor`,
+  `core.hooksPath`, `core.sshCommand`, `core.pager`, `core.editor`,
+  `core.askPass`, `core.gitProxy`, `sequence.editor`, `gpg[.*].program`,
+  `diff.external`, `diff.*.textconv|command`, `pager.*`, `merge.*.driver`,
+  `difftool|mergetool.*.cmd`, `remote.*.uploadpack|receivepack`,
+  `alias.*` starting with `!`, `filter.*`, `credential.helper`,
+  `include.path`/`includeIf`; repos at the mount root, enclosing it, or
+  one level below; the parser is tolerant, not git-exact: a leading BOM
+  is stripped, unclassified lines and non-UTF-8 content are reported as
+  changes; include targets and deeper repos are not scanned), non-sample
+  files in
+  `.git/hooks`, a `.git/commondir` file, `.envrc`, `.vscode/{tasks,settings,launch}.json` —
+  and warns (terminal, run meta, `schedule ls`) on any change. Warn-only;
+  never blocks. Rejected: read-only nested binds over `.git`
+  (`protect_git`): Docker Desktop drops nested binds from a running
+  container whenever any other container starts, and `.git/commondir`
+  bypassed it anyway.
+- Agent-planted hooks and rc files in the home volume run in every later
+  session, scheduled runs included; the full reset is `agentbox down -v`
+  (removes the home and gateway OAuth volumes).
+- Raw terminal escape sequences reach the user's terminal in interactive
+  sessions (terminal-emulator bugs, OSC 52 clipboard writes).
+- The agent can fill the home volume (Docker Desktop VM disk, shared with
+  other containers) and, through rw mounts, the host disk.
+- `agentbox denied` offers hostnames the agent chose (social engineering).
 - A container-escape kernel bug in the Docker Desktop VM.
 - A sidecar compromise gives that sidecar's own secrets (each sidecar holds
   only its own).
@@ -249,7 +281,7 @@ in that directory.
 | `agentbox mcp login <profile> <server>` | OAuth for an MCP upstream, on the host (§2.6). |
 | `agentbox up/down/ls` | Explicit start/stop/status (sessions auto-start). |
 | `agentbox schedule add/ls/rm` | Host scheduling (§2.7). |
-| `agentbox update` | Bump `versions.env` to current releases, rebuild, run full `doctor`; keep the previous image tag if doctor fails. |
+| `agentbox update` | Bump the agent image pins in `versions.env` to current releases (values validated), rebuild, run full `doctor`; keep the previous image tag if doctor fails. Sidecar image digests and the gateway lockfile change by hand (listed in SECURITY.md). |
 | `agentbox doctor [profile]` | Full isolation self-test (§4). |
 
 Agent launch flags set by the CLI (the box is the external sandbox):
@@ -355,7 +387,7 @@ Mount validation (T1):
   table without `to` that a sidecar uses goes only to that sidecar (T4).
   `CLAUDE_CODE_OAUTH_TOKEN`, when declared, must target exactly `agent`.
 - Reserved names (rejected in `[secrets]`, `key`, `bearer`):
-  `MCP_GATEWAY_TOKEN`, `AGENTBOX_*`, `PATH`, `HOME`, `USER`, `SHELL`,
+  `MCP_GATEWAY_*`, `AGENTBOX_*`, `PATH`, `HOME`, `USER`, `SHELL`,
   `LD_*`, `*_PROXY` and `NPM_CONFIG_*` (any case), `NODE_OPTIONS`,
   `PYTHON*`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `OLLAMA_HOST`,
   `DISABLE_AUTOUPDATER`, `DISABLE_UPDATES`, `ENABLE_CLAUDEAI_MCP_SERVERS`,

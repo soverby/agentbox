@@ -98,3 +98,17 @@ def kill_script(run_id: str) -> str:
         'for p in /proc/[0-9]*; do tr "\\0" "\\n" < "$p/environ" 2>/dev/null '
         f'| grep -qx "{RUN_ENV}={run_id}" && kill -KILL "${{p#/proc/}}" 2>/dev/null; done; true'
     )
+
+
+def kill_all_script() -> str:
+    """sh: SIGKILL every process in the box except init (pid 1), the box's
+    `sleep infinity` main process (child of pid 1), and this shell. For a
+    timed-out run in a box that is not pinned: agent leftovers die too."""
+    return (
+        'for p in /proc/[0-9]*; do n="${p#/proc/}"; '
+        '{ [ "$n" = 1 ] || [ "$n" = "$$" ]; } && continue; '
+        'c=$(tr "\\0" " " < "$p/cmdline" 2>/dev/null); '
+        "pp=$(sed -n 's/^PPid:[[:space:]]*//p' \"$p/status\" 2>/dev/null); "
+        '[ "$pp" = 1 ] && [ "$c" = "sleep infinity " ] && continue; '
+        'kill -KILL "$n" 2>/dev/null; done; true'
+    )

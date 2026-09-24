@@ -112,3 +112,41 @@ def test_doctor_runs_excluded_by_ua_and_window():
     first, last = float(LOG[0].split()[0]), float(LOG[-1].split()[0])
     kept = denied.parse(LOG, AGENT, ALLOW, exclude=[(first, last, "agentbox-doctor")])
     assert kept == denied.parse(LOG, AGENT, ALLOW)
+
+
+def test_tail_lines_reads_only_the_end(tmp_path):
+    f = tmp_path / "egress.log"
+    f.write_bytes(b"".join(b"%06d xxxxxxxxxx\n" % i for i in range(1000)))  # 18 bytes/line
+    got = list(denied.tail_lines(f, max_bytes=180))
+    assert got[-1].startswith("000999") and len(got) in (9, 10)
+    assert all(len(x) == 18 for x in got)  # the partial first line is dropped
+    assert len(list(denied.tail_lines(f))) == 1000
+
+
+def test_capped_line_format_and_truncated_host():
+    host = "a" * 250 + ".com"
+    connect = f"{host}:443"[: denied.URL_MAX]
+    lines = [
+        # new capped format: URL cut at 256, UA cut at 128 (may end in a partial escape)
+        f"102.000 3 10.213.1.10 TCP_DENIED/403 3348 CONNECT {connect} - HIER_NONE/- "
+        f'text/html "{"x" * 125}%2"',
+        f"102.100 3 10.213.1.10 TCP_DENIED/403 3348 GET http://ok.example.com/{'p' * 240}"[
+            : 57 + denied.URL_MAX
+        ]
+        + ' - HIER_NONE/- text/html "curl%2F8"',
+    ]
+    items = {d.host: d for d in denied.parse(lines, "10.213.1.10")}
+    cut = connect.rpartition(":")[0]
+    assert items[cut].allowable is False and "width cap" in items[cut].reason
+    assert items["ok.example.com"].allowable is True
+    assert denied.user_agent(lines[0].split()).endswith("%2")
+
+
+def test_max_hosts_counted(monkeypatch):
+    monkeypatch.setattr(denied, "MAX_HOSTS", 3)
+    lines = [
+        f"10{i}.0 3 10.213.1.10 TCP_DENIED/403 1 CONNECT h{i}.example.com:443 - HIER_NONE/- x"
+        for i in range(6)
+    ]
+    stats: dict = {}
+    assert len(denied.parse(lines, "10.213.1.10", stats=stats)) == 3 and stats["dropped"] == 3

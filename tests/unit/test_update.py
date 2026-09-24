@@ -201,3 +201,67 @@ def test_github_token_only_for_api_github(monkeypatch):
     update._get("https://registry.npmjs.org/x/latest")
     assert seen[0].get_header("Authorization") == "Bearer tok123"
     assert seen[1].get_header("Authorization") is None
+
+
+PAYLOAD = "9.9.9\nCLAUDE_KEY_FPR=ATTACKERFPR\x1b]0;PWN\x07"
+
+
+def test_lookup_rejects_injected_values(monkeypatch):
+    """P8: the reviewer's payload in a looked-up version (npm, apt, image)."""
+
+    def fetch_json(url):
+        if "api.github.com" in url:
+            return {"tag_name": "v1.2.3", "assets": [
+                {"name": "ollama-linux-amd64.tar.zst", "digest": "sha256:" + "A" * 64},
+                {"name": "uv-x86_64-unknown-linux-gnu.tar.gz", "digest": "sha256:" + "b" * 64},
+            ]}  # fmt: skip
+        if "nodejs.org" in url:
+            return [{"version": "v24." + PAYLOAD}]
+        if "npmjs" in url:
+            return {"version": PAYLOAD}
+        return [{"name": "Python 3.14.9", "pre_release": False}]
+
+    def fetch(url):  # apt stanzas are line-based: the part after \n is another field
+        return f"Package: claude-code\nVersion: {PAYLOAD.replace(chr(10), ' ')}\n".encode()
+
+    class R:
+        stdout = '{"digest": "sha256:' + "c" * 64 + '\\n"}'
+
+    monkeypatch.setattr(update.docker, "run", lambda *a, **k: R())
+    cur = {"NODE_VERSION": "24.1.0", "UBUNTU_IMAGE": "ubuntu:24.04@sha256:" + "0" * 64}
+    out = update.lookup(cur, fetch_json, fetch)
+    for k in ("CODEX_VERSION", "PI_VERSION", "CLAUDE_CODE_VERSION", "NODE_VERSION",
+              "NODE_SHA256", "OLLAMA_VERSION", "OLLAMA_SHA256", "UBUNTU_IMAGE"):  # fmt: skip
+        assert out[k].startswith(update.FAILED), k
+    assert out["UV_VERSION"] == "1.2.3" and out["UV_SHA256"] == "b" * 64
+    assert out["PYTHON_VERSION"] == "3.14.9"
+    rows = update.table({k: "1" for k in out}, out)
+    txt = update.format_table(rows)
+    assert "\x1b" not in txt and "\x07" not in txt
+    # a failure reason that carries the payload is shown escaped, on one line per pin
+    rows = [update.Row("X_VERSION", "1", f"{update.FAILED}: {PAYLOAD})")]
+    txt = update.format_table(rows)
+    assert "\x1b" not in txt and len(txt.splitlines()) == 2 and "\\x1b" in txt
+
+
+def test_write_env_refuses_injection():
+    text = "CODEX_VERSION=1.0.0\nCLAUDE_KEY_FPR=31DD\n"
+    for bad in (PAYLOAD, "1.0\n", "1.0=x", "1 0", "1.0\r"):
+        with pytest.raises(update.UpdateError, match="invalid value"):
+            update.write_env(text, {"CODEX_VERSION": bad})
+    with pytest.raises(update.UpdateError, match="invalid value"):
+        update.write_env("NODE_SHA256=x\n", {"NODE_SHA256": "g" * 64})
+    assert update.write_env(text, {"CODEX_VERSION": "1.1.0"}) == text.replace("1.0.0", "1.1.0")
+
+
+def test_value_problem_kinds():
+    assert update.value_problem("CODEX_VERSION", "0.156.1") is None
+    assert update.value_problem("CLAUDE_CODE_VERSION", "2.1.267-1") is None
+    assert update.value_problem("X_VERSION", "1:2.3~rc1+b@x") is None
+    assert update.value_problem("X_VERSION", "v" * 81)
+    assert update.value_problem("X_SHA256", "a" * 64) is None
+    assert update.value_problem("X_SHA256", "a" * 63)
+    img = "ubuntu:24.04@sha256:" + "0" * 64
+    assert update.value_problem("UBUNTU_IMAGE", img) is None
+    assert update.value_problem("UBUNTU_IMAGE", "ubuntu@sha256:" + "0" * 64)
+    assert update.value_problem("UBUNTU_IMAGE", img + "\n")

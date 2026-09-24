@@ -660,14 +660,35 @@ def ensure_docker(profile: str, name: str, wait: float, poll: float) -> bool:
     return False
 
 
-def left_up(rd) -> str | None:
-    """Why the run's box stayed up (from the run's meta.json), if it did."""
+def run_meta(rd, key: str) -> str | None:
     if not rd:
         return None
     try:
-        return json.loads((Path(rd) / "meta.json").read_text()).get("left_up")
+        v = json.loads((Path(rd) / "meta.json").read_text()).get(key)
     except (OSError, ValueError):
         return None
+    return v if isinstance(v, str) else None
+
+
+def host_changes(rd) -> list[str]:
+    """host_config_changes from the run's meta.json (PLAN §1 detection)."""
+    if not rd:
+        return []
+    try:
+        v = json.loads((Path(rd) / "meta.json").read_text()).get("host_config_changes")
+    except (OSError, ValueError):
+        return []
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
+
+
+def left_up(rd) -> str | None:
+    """Why the run's box stayed up (from the run's meta.json), if it did."""
+    return run_meta(rd, "left_up")
+
+
+def stopped_note(rd) -> str | None:
+    """ "killed leftover processes (...)" when the run's stop found some."""
+    return run_meta(rd, "stopped")
 
 
 def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
@@ -718,14 +739,27 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
                     log(profile, name, f"run {rd} exit {rc}")
                     if why := left_up(rd):
                         rec["left_up"] = f"left up: {why}"
+                    if note := stopped_note(rd):
+                        rec["stopped"] = f"stopped: {note}"
+                    if hc := host_changes(rd):
+                        rec["host_config_changes"] = hc
         except Terminated as e:
             rc, status, msg = RC_TERMINATED, "terminated", str(e)
+            rd = getattr(e, "run_dir", None) or rd
+            if note := stopped_note(rd):
+                rec["stopped"] = f"stopped: {note}"
+            if hc := host_changes(rd):
+                rec["host_config_changes"] = hc
             log(profile, name, msg)
         except Exception as e:  # noqa: BLE001 - every failure is recorded
             msg = f"run failed: {e}"
             rd = getattr(e, "run_dir", None)
             if why := left_up(rd):
                 rec["left_up"] = f"left up: {why}"
+            if note := stopped_note(rd):
+                rec["stopped"] = f"stopped: {note}"
+            if hc := host_changes(rd):
+                rec["host_config_changes"] = hc
             rc = getattr(e, "rc", None) or 125
             if rc == RC_TERMINATED:
                 status = "terminated"

@@ -37,7 +37,8 @@ REF_RES = (
     re.compile(r"env:[A-Za-z_][A-Za-z0-9_]*"),
 )
 RESERVED_SECRET_RE = re.compile(
-    r"MCP_GATEWAY_TOKEN|AGENTBOX_.*|PATH|HOME|USER|SHELL|LD_.*|NODE_OPTIONS|PYTHON.*"
+    r"MCP_GATEWAY_.*|AGENTBOX_.*|PATH|HOME|USER|SHELL|LD_.*|NODE_.*|PYTHON.*"
+    r"|BASH_ENV|ENV|IFS|PS4|SSL_CERT_.*|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|GIT_.*"
     r"|ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|OLLAMA_HOST|DISABLE_AUTOUPDATER|DISABLE_UPDATES"
     r"|ENABLE_CLAUDEAI_MCP_SERVERS|CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
     r"|_OP_SERVICE_ACCOUNT_TOKEN"  # host-only (op backend); never delivered to a box
@@ -173,6 +174,24 @@ DENY_TREE_HOME = (
 )  # fmt: skip
 
 
+# Writable mounts only (P8): system software dirs plus the dirs of the host
+# `docker` and `git` the CLI runs (equal, ancestor, descendant).
+DENY_TREE_RW_ABS = ("/usr", "/opt", "/Applications")
+
+
+def rw_deny_paths() -> tuple[str, ...]:
+    """DENY_TREE_RW_ABS plus the dir of `docker` and `git` on PATH, as found
+    and resolved (realpath)."""
+    import shutil
+
+    out = list(DENY_TREE_RW_ABS)
+    for tool in ("docker", "git"):
+        w = shutil.which(tool)
+        if w:
+            out += [os.path.dirname(os.path.abspath(w)), os.path.dirname(os.path.realpath(w))]
+    return tuple(dict.fromkeys(out))
+
+
 class MountError(ValueError):
     pass
 
@@ -270,6 +289,7 @@ def check_mount_host(
     system_deny: tuple[tuple[str, ...], tuple[str, ...]] | None = None,
     repo_roots: tuple[str, ...] | None = None,
     code_paths: tuple[str, ...] | None = None,
+    rw_deny: tuple[str, ...] | None = None,
 ) -> str:
     """Validate a mount host path; return its realpath. Raises MountError.
 
@@ -323,6 +343,14 @@ def check_mount_host(
                 "directory"
             )
     if writable:
+        for d in rw_deny_paths() if rw_deny is None else rw_deny:
+            for e in sorted({norm(v) for v in _variants(d)}):
+                if r == e or r.startswith(e + "/") or e.startswith(r + "/"):
+                    raise MountError(
+                        f"{host!r}: resolves to {real}, which is, contains, or is inside "
+                        f"{d} (system software or the docker/git the host runs); "
+                        'a writable mount there is denied; use `mode = "ro"`'
+                    )
         code = host_code_paths() if code_paths is None else code_paths
         hit = code_path_conflict(real, code, ci)
         if hit:

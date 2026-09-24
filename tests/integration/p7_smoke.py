@@ -10,7 +10,9 @@
    two jobs of one profile at once -> both run, box stopped after both;
    a user-`up` (pinned) box stays up after a scheduled run; the in-box
    kill script kills only the run's processes; SIGTERM during a fire ->
-   status terminated, rc 143, box stopped.
+   status terminated, rc 143, box stopped; P8: a SessionStart hook that
+   leaves a detached loop does not keep an unpinned box up (last.json
+   names the killed leftovers).
 4. Live launchd fire: `add --force --every 1m` (StartInterval 60) with
    label prefix com.agentbox-test.<tag> and a temp LaunchAgents dir
    (launchctl bootstrap accepts plists outside ~/Library/LaunchAgents),
@@ -27,6 +29,7 @@ Usage: python3 tests/integration/p7_smoke.py
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
@@ -279,6 +282,33 @@ def steps(e: Env) -> None:
         and len(e.history(job)) == n0 + 1 and not e.box_up() and ec in ("143", None),
         "SIGTERM: terminated rc 143 recorded, box stopped",
         f"rc={prc} last={last.get('status')}/{last.get('exit_code')} run_exit={ec}")  # fmt: skip
+    # 3f. P8, reviewer repro: a SessionStart hook in the home volume spawns a
+    # detached loop without AGENTBOX_RUN. The unpinned box still stops after
+    # the scheduled run, and last.json names the killed leftovers.
+    hook = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command":
+            "env -u AGENTBOX_RUN setsid nohup sh -c 'while :; do sleep 5; done' "
+            ">/dev/null 2>&1 &"}]}]}}  # fmt: skip
+    b64 = base64.b64encode(json.dumps(hook).encode()).decode()
+    r = e.ab(
+        "shell",
+        NAME,
+        "--",
+        "sh",
+        "-c",
+        f"mkdir -p ~/.claude && printf %s {b64} | base64 -d > ~/.claude/settings.json",
+    )
+    e.ab("down", NAME, timeout=300)  # the shell pinned the box
+    r2 = e.ab("schedule", "run-now", NAME, job, timeout=900)
+    last = e.last(job)
+    stopped = last.get("stopped") or ""
+    rec(r.returncode == 0 and not e.box_up() and "left_up" not in last
+        and stopped.startswith("stopped: killed leftover processes (") and "while" in stopped,
+        "leftover hook loop: unpinned box stopped, leftovers in last.json",
+        f"rc={r2.returncode} up={e.box_up()} stopped={stopped!r} "
+        f"left_up={last.get('left_up')!r}")  # fmt: skip
+    r = e.ab("schedule", "ls")
+    rec("stopped: killed leftover processes" in r.stdout, "schedule ls shows the stop note")
+
     r = e.ab("schedule", "rm", NAME, "second")
     rec(r.returncode == 0, "rm second job")
 

@@ -28,6 +28,7 @@ from . import (
     denied,
     docker,
     egress,
+    hostscan,
     images,
     launch,
     mcpcmd,
@@ -148,8 +149,12 @@ def cmd_up(args) -> int:
 
 def cmd_down(args) -> int:
     b = boxmod.load(resolve(args.profile))
-    boxmod.down(b)
-    print(f"{b.name}: down")
+    volumes = getattr(args, "volumes", False)
+    boxmod.down(b, volumes=volumes)
+    if volumes:
+        print(f"{b.name}: down; home and OAuth volumes removed (log in to Codex/Pi again)")
+    else:
+        print(f"{b.name}: down")
     return 0
 
 
@@ -169,13 +174,41 @@ def cmd_ls(args) -> int:
     return 0
 
 
+def host_scan_start(b: boxmod.Box, path: Path) -> None:
+    """Snapshot host-executed config in the rw mounts (PLAN §1); never blocks."""
+    try:
+        hostscan.save(path, hostscan.snapshot(b.profile))
+    except Exception as e:  # noqa: BLE001 - detection is warn-only
+        err(f"host config snapshot failed: {e}")
+
+
+def host_scan_end(b: boxmod.Box, path: Path) -> tuple[list[str], bool]:
+    """(changes, incomplete) since host_scan_start; removes the snapshot."""
+    old = hostscan.load(path)
+    path.unlink(missing_ok=True)
+    if old is None:
+        return [], False
+    try:
+        new = hostscan.snapshot(b.profile)
+    except Exception as e:  # noqa: BLE001
+        return [f"host config re-scan failed: {term.clean(e)}"], True
+    return hostscan.diff(old, new), bool(old.get("incomplete") or new.get("incomplete"))
+
+
 def session(b: boxmod.Box, cmd: list[str], env: dict[str, str] | None = None) -> int:
     with boxmod.session_lock(b):
         ensure_up(b)
         boxmod.pin(b)
         wd = launch.container_workdir(b.profile, os.getcwd())
         argv = launch.exec_argv(b.project, str(b.compose_file), wd, cmd, is_tty(), env)
-        return subprocess.call(argv)
+        snap = b.state / "hostscan" / f"session-{os.getpid()}-{secrets.token_hex(4)}.json"
+        host_scan_start(b, snap)
+        try:
+            return subprocess.call(argv)
+        finally:
+            changes, incomplete = host_scan_end(b, snap)
+            if msg := hostscan.report(changes, incomplete):
+                print(msg, file=sys.stderr, flush=True)
 
 
 def cmd_shell(args) -> int:
@@ -204,13 +237,14 @@ RC_TIMEOUT = 124
 RC_TERMINATED = 143
 
 
-def kill_run(b: boxmod.Box, run_id: str, proc: subprocess.Popen) -> None:
-    """Kill the `docker compose exec` client and the run's processes in the box."""
+def kill_run(b: boxmod.Box, run_id: str, proc: subprocess.Popen, all_procs: bool = False) -> None:
+    """Kill the `docker compose exec` client and the run's processes in the box
+    (`all_procs`: every process but init and the box main process)."""
     with contextlib.suppress(Exception):
         proc.kill()
+    script = runsmod.kill_all_script() if all_procs else runsmod.kill_script(run_id)
     with contextlib.suppress(Exception):
-        boxmod.dc(b, "exec", "-T", "agent", "sh", "-c", runsmod.kill_script(run_id),
-                  check=False, timeout=60)  # fmt: skip
+        boxmod.dc(b, "exec", "-T", "agent", "sh", "-c", script, check=False, timeout=60)
 
 
 def run_headless(
@@ -249,7 +283,6 @@ def run_headless(
     }
     transcript = runsmod.transcript_path(rd)
     rc = 125  # the box could not start / the run did not happen
-    done = False
     with boxmod.session_lock(b):
         was_running = boxmod.is_running(b)
         meta["box_was_running"] = was_running
@@ -263,6 +296,7 @@ def run_headless(
                 raise
             wd = launch.container_workdir(b.profile, host_dir)
             meta["workdir"] = wd
+            host_scan_start(b, rd / "hostscan.json")
             env = {**ln.env, runsmod.RUN_ENV: rd.name}
             cmd = launch.exec_argv(b.project, str(b.compose_file), wd, argv, tty=False, env=env)
             with transcript.open("wb") as t, prompt_file.open("rb") as stdin:
@@ -274,7 +308,8 @@ def run_headless(
                 try:
                     rc = proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
-                    kill_run(b, rd.name, proc)
+                    # An unpinned box is the run's own: leftovers die too.
+                    kill_run(b, rd.name, proc, all_procs=not boxmod.is_pinned(b))
                     proc.wait()
                     rc = RC_TIMEOUT
                     meta["killed"] = f"timeout after {timeout:.0f} s"
@@ -290,25 +325,34 @@ def run_headless(
                     if "killed" in meta:
                         t.write(f"\n[agentbox: run killed: {meta['killed']}]\n".encode())
             runsmod.finish(rd, rc, meta)
-            done = True
         except (Terminated, KeyboardInterrupt) as e:
             rc = RC_TERMINATED
             meta.setdefault("killed", str(e) or type(e).__name__)
             raise
         finally:
-            if not done:
-                runsmod.finish(rd, rc, meta)
-            why = stop_if_idle(b)
+            changes, incomplete = host_scan_end(b, rd / "hostscan.json")
+            if changes:
+                meta["host_config_changes"] = changes
+            if incomplete:
+                meta["host_config_scan"] = hostscan.INCOMPLETE
+            if msg := hostscan.report(changes, incomplete):
+                print(msg, file=sys.stderr, flush=True)
+            runsmod.finish(rd, rc, meta)
+            note: list[str] = []
+            why = stop_if_idle(b, note)
             if why:
                 meta["left_up"] = why
+            if note:
+                meta["stopped"] = note[0]
+            if why or note:
                 runsmod.finish(rd, rc, meta)
     return rc, rd
 
 
-def stop_if_idle(b: boxmod.Box) -> str | None:
+def stop_if_idle(b: boxmod.Box, note: list[str] | None = None) -> str | None:
     """Stop the box after a headless run unless it is pinned or in use."""
     try:
-        why = boxmod.stop_if_idle(b)
+        why = boxmod.stop_if_idle(b, note)
     except Exception as e:  # noqa: BLE001
         why = f"stop failed ({e})"
     if why and why != boxmod.PINNED:
@@ -367,11 +411,23 @@ def cmd_denied(args) -> int:
     logdir = b.state / "logs" / "egress"
     since = denied.parse_since(args.since) if args.since else 0.0
     allowlist = [] if b.profile.network.mode == "open" else boxmod.agent_domains(b.profile)
-    lines = []
-    for log in (logdir / "egress.log.1", logdir / "egress.log"):  # rotated file first
-        if log.is_file():
-            lines += log.read_text(errors="replace").splitlines()
-    items = denied.parse(lines, b.ips()["agent"], allowlist, since, doc.load_windows(b.state))
+
+    def lines():
+        # rotated file first; at most denied.READ_MAX bytes from the end of each
+        for log in (logdir / "egress.log.1", logdir / "egress.log"):
+            if log.is_file():
+                yield from denied.tail_lines(log)
+
+    stats: dict = {}
+    items = denied.parse(
+        lines(), b.ips()["agent"], allowlist, since, doc.load_windows(b.state), stats=stats
+    )
+    if stats.get("dropped"):
+        print(
+            f"note: {stats['dropped']} denied request(s) to more than "
+            f"{denied.MAX_HOSTS} hosts not listed",
+            file=sys.stderr,
+        )
     if args.json:
         print(json.dumps([d.as_json() for d in items], indent=1))
         return 0
@@ -393,9 +449,18 @@ def cmd_denied(args) -> int:
 
 def cmd_doctor(args) -> int:
     b = boxmod.load(resolve(args.profile))
-    if not boxmod.is_running(b):  # a running box is tested as it is, not re-rendered
-        boxmod.up(b)
-    ok = print_results(doc.full(b))
+    with boxmod.session_lock(b):  # a headless run's stop-if-idle sees doctor
+        started = not boxmod.is_running(b)
+        if started:  # a running box is tested as it is, not re-rendered
+            (b.state / boxmod.PIN_FILE).unlink(missing_ok=True)  # stale: box is down
+            boxmod.up(b)
+        try:
+            ok = print_results(doc.full(b))
+        finally:
+            if started:  # stop it again unless pinned or another session uses it
+                why = stop_if_idle(b)
+                if why is None and not boxmod.is_pinned(b):
+                    print(f"{b.name}: stopped again (doctor started it)")
     return 0 if ok else 1
 
 
@@ -643,6 +708,12 @@ def setup_token(from_stdin: bool) -> None:
 
 
 def cmd_setup(args) -> int:
+    vals = paths.read_config_values()
+    backend = vals.get("secret_backend")
+    if backend in (None, "keychain") and not secretstore.keychain_available():
+        where = "no secret_backend in" if backend is None else "secret_backend = keychain in"
+        raise CliError(f"{where} {paths.config_file()}: {secretstore.KEYCHAIN_ONLY_MAC}; "
+                       "then run setup again")  # fmt: skip
     r = docker.run(["docker", "info", "--format", "{{.ServerVersion}}"], check=False)
     if r.returncode != 0:
         raise CliError("Docker is not running (start Docker Desktop, then run setup again)")
@@ -655,8 +726,7 @@ def cmd_setup(args) -> int:
     print(f"images: {images.ensure_agent(repo)}")
     for side in ("egress", "ollama-gate", "mcp-gateway"):
         print(f"images: {images.ensure_sidecar(repo, side)}")
-    vals = paths.read_config_values()
-    if "secret_backend" not in vals:
+    if backend is None:
         vals["secret_backend"] = "keychain"
         print(f"config: wrote {paths.write_config(vals)} (secret_backend = keychain)")
     else:
@@ -943,6 +1013,10 @@ def cmd_schedule_ls(args) -> int:
             lines.append(f"  message: {last['message']}")
         if last.get("left_up"):
             lines.append(f"  {last['left_up']}")
+        if last.get("stopped"):
+            lines.append(f"  {last['stopped']}")
+        for c in last.get("host_config_changes") or []:
+            lines.append(f"  WARNING host config changed: {c}")
         for w in last.get("warnings") or []:
             lines.append(f"  warning: {w}")
         if sk := schedule.skip_summary(jd):
@@ -1030,6 +1104,14 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         p = sub.add_parser(cmd, help=hlp)
         p.add_argument("profile", nargs="?")
+        if cmd == "down":
+            p.add_argument(
+                "-v",
+                "--volumes",
+                action="store_true",
+                help="also remove the home volume (logins, caches, anything the agent left "
+                "there) and the gateway OAuth volume: a full reset",
+            )
         p.set_defaults(func=fn)
 
     p = sub.add_parser("ls", help="list profiles")

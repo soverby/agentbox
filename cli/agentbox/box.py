@@ -591,9 +591,12 @@ def session_lock(box: Box):
         f.close()
 
 
-def stop_if_idle(box: Box) -> str | None:
-    """Stop a box that `run` started unless someone else uses it. Holds up.lock
-    for the whole decision, so no `up` can start a session in between.
+def stop_if_idle(box: Box, note: list[str] | None = None) -> str | None:
+    """Stop a box that `run` started unless the user pinned it or another
+    agentbox session holds session.lock. Holds up.lock for the whole decision,
+    so no `up` can start a session in between. Other processes in an unpinned
+    box without a session are agent leftovers (a hook, a `setsid nohup` loop):
+    they do not keep the box up; `note` gets "killed leftover processes (...)".
     Returns why the box stays up, or None when it was stopped."""
     with up_lock(box):
         if is_pinned(box):
@@ -602,13 +605,16 @@ def stop_if_idle(box: Box) -> str | None:
             return "another agentbox session uses the box"
         try:
             others = other_processes(box)
-        except Exception as e:  # noqa: BLE001
-            return f"cannot list box processes ({e})"
-        if others:
-            short = ", ".join(x[:60] for x in others[:3]) + (", ..." if len(others) > 3 else "")
-            return f"other processes ({short})"
+        except Exception as e:  # noqa: BLE001 - the box stops anyway
+            others = [f"<cannot list: {e}>"]
         down_locked(box)
+        if others and note is not None:
+            note.append(f"killed leftover processes ({short_list(others)})")
         return None
+
+
+def short_list(procs: list[str], n: int = 3, width: int = 60) -> str:
+    return ", ".join(x[:width] for x in procs[:n]) + (", ..." if len(procs) > n else "")
 
 
 IDLE_PROCS = ("sleep infinity", "/sbin/docker-init", "docker-init")

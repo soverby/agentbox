@@ -209,3 +209,40 @@ def test_default_code_paths_include_interpreter(monkeypatch, tmp_path):
     assert os.path.realpath(tmp_path) in code
     assert "/nonexistent/x" not in code
     assert profile.code_path_conflict(os.path.dirname(os.path.realpath(sys.prefix)), code, False)
+
+
+def test_rw_deny_system_and_tool_dirs(home):
+    """P8: /usr, /opt, /Applications and the docker/git dirs: rw refused
+    (equal, ancestor, descendant), ro allowed."""
+    deny = (("/", os.path.dirname(home)), ())
+    tools = f"{home}/Projects/foo/src"
+    kw = dict(home=home, case_insensitive=False, system_deny=deny, repo_roots=(),
+              code_paths=(), rw_deny=(os.path.realpath(tools),))  # fmt: skip
+    for p in (tools, f"{home}/Projects/foo", f"{home}/Projects"):
+        with pytest.raises(MountError, match="docker/git"):
+            check_mount_host(p, **kw)
+        assert check_mount_host(p, writable=False, **kw)
+    os.makedirs(f"{tools}/deeper")
+    with pytest.raises(MountError, match="docker/git"):
+        check_mount_host(f"{tools}/deeper", **kw)
+    os.makedirs(f"{home}/Other")
+    assert check_mount_host(f"{home}/Other", **kw)
+
+
+def test_rw_deny_defaults(monkeypatch, tmp_path):
+    from agentbox import profile
+
+    bindir = tmp_path / "bin"
+    real = tmp_path / "cellar" / "git" / "bin"
+    real.mkdir(parents=True)
+    bindir.mkdir()
+    (real / "git").write_text("#!/bin/sh\n")
+    (real / "git").chmod(0o755)
+    os.symlink(real / "git", bindir / "git")
+    monkeypatch.setenv("PATH", str(bindir))
+    d = profile.rw_deny_paths()
+    assert {"/usr", "/opt", "/Applications"} <= set(d)
+    assert str(bindir) in d and os.path.realpath(real) in d
+    with pytest.raises(MountError, match="docker/git"):
+        check_mount_host("/usr/local", writable=True)
+    assert check_mount_host("/usr/local", writable=False) == os.path.realpath("/usr/local")

@@ -41,7 +41,8 @@ def test_strict_files_and_order():
     assert "cache deny all" in c
     assert f"access_log stdio:{e.ACCESS_LOG} agentbox" in c
     assert f"logformat agentbox {e.LOGFORMAT}" in c
-    assert e.LOGFORMAT.endswith('"%#{User-Agent}>h"')
+    assert e.LOGFORMAT.endswith('"%#.128{User-Agent}>h"')
+    assert " %.256ru " in e.LOGFORMAT
 
 
 def test_private_ranges_present():

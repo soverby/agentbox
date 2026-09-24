@@ -24,6 +24,23 @@ LINE_RE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 # checking the vendor docs).
 MANUAL = ("CLAUDE_KEY_FPR", "GH_KEY_FPRS")
 FAILED = "(failed"  # prefix of a lookup value that could not be fetched
+# Looked-up values come from the network: each must match its kind (P8).
+VERSION_RE = re.compile(r"[0-9A-Za-z.+~:@-]{1,80}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,127}:[A-Za-z0-9._-]{1,128}@sha256:[0-9a-f]{64}")
+
+
+def value_problem(key: str, value: object) -> str | None:
+    """Why `value` is not a valid pin for `key` (None: valid)."""
+    if not isinstance(value, str):
+        return f"not a string ({type(value).__name__})"
+    if key.endswith("_SHA256"):
+        rx, what = SHA256_RE, "64 lowercase hex digits"
+    elif key.endswith("_IMAGE"):
+        rx, what = IMAGE_RE, "name:tag@sha256:<64 hex>"
+    else:
+        rx, what = VERSION_RE, "a version ([0-9A-Za-z.+~:@-], at most 80)"
+    return None if rx.fullmatch(value) else f"invalid value, want {what}"
 
 
 class UpdateError(Exception):
@@ -45,6 +62,8 @@ def write_env(text: str, new: dict[str, str]) -> str:
     for k in new:
         if k not in have:
             raise UpdateError(f"versions.env has no {k}")
+        if value_problem(k, new[k]) or re.search(r"[\x00-\x1f\x7f-\x9f=\s]", new[k]):
+            raise UpdateError(f"refusing to write an invalid value for {k}")
     out = []
     for line in text.splitlines(keepends=True):
         m = LINE_RE.fullmatch(line.strip())
@@ -148,6 +167,16 @@ def _try(out: dict[str, str], keys: tuple[str, ...], fn: Callable[[], object]) -
         return
     if len(keys) == 1:
         vals = (vals,)
+    vals = tuple(vals)
+    if len(vals) != len(keys):
+        for k in keys:
+            out[k] = f"{FAILED}: lookup returned {len(vals)} values)"
+        return
+    bad = [(k, why) for k, v in zip(keys, vals, strict=True) if (why := value_problem(k, v))]
+    if bad:  # one bad value fails the whole source (version and checksum go together)
+        for k in keys:
+            out[k] = f"{FAILED}: {bad[0][0]}: {bad[0][1]})"
+        return
     out.update(zip(keys, vals, strict=True))
 
 
@@ -165,6 +194,8 @@ def lookup(current: dict[str, str], fetch_json=_json, fetch=_get) -> dict[str, s
     def node() -> tuple[str, str]:
         major = current.get("NODE_VERSION", "24").split(".")[0]
         v = node_latest(fetch_json("https://nodejs.org/dist/index.json"), major)
+        if why := value_problem("NODE_VERSION", v):
+            raise UpdateError(f"NODE_VERSION: {why}")
         sums = fetch(f"https://nodejs.org/dist/v{v}/SHASUMS256.txt").decode()
         fname = f"node-v{v}-linux-x64.tar.xz"
         m = re.search(rf"^([0-9a-f]{{64}})  {re.escape(fname)}$", sums, re.M)
@@ -242,7 +273,7 @@ def format_table(rows: list[Row]) -> str:
             f"{r.key:<{w}}  {r.status:<7}  {cur}"
             + {"newer": f" -> {lat}", "failed": f"  {r.latest}"}.get(r.status, "")
         )
-    return "\n".join(lines)
+    return "\n".join(term.clean(x) for x in lines)
 
 
 def apply(

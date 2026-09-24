@@ -630,6 +630,19 @@ def test_fire_records_left_up(roots, monkeypatch):
     assert last["left_up"] == "left up: other processes (sleep 99)"
 
 
+def test_fire_records_stopped_leftovers(roots, monkeypatch):
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = roots / "rd"
+    rd.mkdir()
+    (rd / "meta.json").write_text(json.dumps({"stopped": "killed leftover processes (sleep 9)"}))
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    last = json.loads((Path(job["dir"]) / "last.json").read_text())
+    assert last["stopped"] == "stopped: killed leftover processes (sleep 9)"
+    assert "left_up" not in last
+
+
 def test_job_code_paths():
     job = {"argv": ["/py/bin/python3", "-m", "agentbox.cli"], "env": {"PYTHONPATH": "/a:/b"}}
     assert schedule.job_code_paths(job) == ("/py/bin/python3", "/a", "/b")
@@ -649,3 +662,15 @@ def test_add_refuses_rw_mount_over_job_code(roots, cli_env, monkeypatch, capsys)
     assert not schedule.job_dir("p1", "c").exists()
     msg, _ = cli.sched_preflight("p1", "claude", None, (str(code),))
     assert msg and "overlaps" in msg
+
+
+def test_fire_records_host_config_changes(roots, monkeypatch):
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = roots / "rd"
+    rd.mkdir()
+    (rd / "meta.json").write_text(json.dumps({"host_config_changes": ["m: .envrc: added: x"]}))
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    last = json.loads((Path(job["dir"]) / "last.json").read_text())
+    assert last["host_config_changes"] == ["m: .envrc: added: x"]

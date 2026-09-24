@@ -88,3 +88,36 @@ def test_non_object_state_file_fails_closed(tree, content):
     p = prof([{"host": str(tree / "proj"), "mode": "rw"}])
     with pytest.raises(mountstate.MountChangeError, match="corrupt"):
         mountstate.check_and_record(st, p, accept=False)
+
+
+def test_nested_inside_rw_refused_without_symlink(tree):
+    (tree / "proj" / "sub").mkdir()
+    p = prof([{"host": str(tree / "proj"), "mode": "rw"},
+              {"host": str(tree / "proj" / "sub"), "path": "/s"}])  # fmt: skip
+    probs = mountstate.symlink_problems(p, ci=False)
+    assert len(probs) == 1 and "is inside the rw mount" in probs[0]
+
+
+def test_nested_via_outside_symlink_refused(tree):
+    """Profile path outside, realpath inside the rw mount: refused too."""
+    (tree / "proj" / "sub").mkdir()
+    os.symlink(tree / "proj" / "sub", tree / "b" / "alias")
+    p = prof([{"host": str(tree / "proj"), "mode": "rw"},
+              {"host": str(tree / "b" / "alias"), "path": "/s"}])  # fmt: skip
+    assert mountstate.nested_problems(p, ci=False)
+
+
+def test_nested_equal_and_case(tree):
+    p = prof([{"host": str(tree / "proj"), "mode": "rw"},
+              {"host": str(tree / "proj"), "path": "/again"}])  # fmt: skip
+    assert len(mountstate.nested_problems(p, ci=False)) == 1  # the ro one
+    p = prof([{"host": str(tree / "proj"), "mode": "rw"},
+              {"host": str(tree / "other"), "mode": "rw", "path": "/o"}])  # fmt: skip
+    assert mountstate.nested_problems(p, ci=False) == []
+
+
+def test_rw_inside_ro_allowed(tree):
+    (tree / "proj" / "sub").mkdir()
+    p = prof([{"host": str(tree / "proj"), "mode": "ro"},
+              {"host": str(tree / "proj" / "sub"), "mode": "rw", "path": "/s"}])  # fmt: skip
+    assert mountstate.nested_problems(p, ci=False) == []

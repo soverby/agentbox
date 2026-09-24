@@ -159,15 +159,35 @@ def test_run_exit_code_when_box_fails(roots, monkeypatch):
     assert "cmd" not in seen
 
 
-def test_run_leaves_box_up_when_joined(roots, monkeypatch):
-    events, _ = run_box(roots, monkeypatch, others=["/usr/local/bin/with-secrets sleep 40"])
+def test_run_stops_unpinned_box_with_leftovers(roots, monkeypatch):
+    """P8: other processes without a session are agent leftovers: box stops."""
+    events, _ = run_box(roots, monkeypatch, others=["sh -c while :; do sleep 1; done"])
     pf = roots / "p.txt"
     pf.write_text("hi")
     cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
-    assert events == ["up"]  # no down
+    assert events == ["up", "down"]
     rd = sorted((paths.state_dir("demo") / "runs").iterdir())[-1]
     meta = __import__("json").loads((rd / "meta.json").read_text())
-    assert meta["left_up"] == "other processes (/usr/local/bin/with-secrets sleep 40)"
+    assert "left_up" not in meta
+    assert meta["stopped"] == "killed leftover processes (sh -c while :; do sleep 1; done)"
+
+
+def test_run_leaves_pinned_box_up_with_leftovers(roots, monkeypatch):
+    events, _ = run_box(roots, monkeypatch, others=["sleep 99"])
+    pf = roots / "p.txt"
+    pf.write_text("hi")
+    orig = cli.ensure_up
+
+    def up_and_pin(b):  # the user pinned the box (`up`) while the run started
+        orig(b)
+        boxmod.pin(b)
+
+    monkeypatch.setattr(cli, "ensure_up", up_and_pin)
+    cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
+    assert events == ["up"]
+    rd = sorted((paths.state_dir("demo") / "runs").iterdir())[-1]
+    meta = __import__("json").loads((rd / "meta.json").read_text())
+    assert "stopped" not in meta and "left_up" not in meta
 
 
 def test_run_leaves_box_up_when_session_lock_held(roots, monkeypatch):
@@ -250,13 +270,15 @@ def test_run_timeout_kills(roots, monkeypatch):
 
     events, seen = run_box(roots, monkeypatch, wait=expire)
     killed = []
-    monkeypatch.setattr(cli, "kill_run", lambda b, rid, p: killed.append(rid))
+    monkeypatch.setattr(
+        cli, "kill_run", lambda b, rid, p, all_procs=False: killed.append((rid, all_procs))
+    )
     pf = roots / "p.txt"
     pf.write_text("hi")
     rc = cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf), "--timeout", "1m"])
     assert rc == 124 and seen["waited"] == 60
     rd = sorted((paths.state_dir("demo") / "runs").iterdir())[-1]
-    assert killed == [rd.name] and (rd / "exit_code").read_text() == "124\n"
+    assert killed == [(rd.name, True)] and (rd / "exit_code").read_text() == "124\n"
     assert "run killed: timeout after 60 s" in (rd / "transcript.log").read_text()
     assert f"AGENTBOX_RUN={rd.name}" in seen["cmd"]
     assert events == ["up", "down"]
@@ -268,7 +290,7 @@ def test_run_terminated_cleans_up(roots, monkeypatch):
 
     events, _ = run_box(roots, monkeypatch, wait=term)
     killed = []
-    monkeypatch.setattr(cli, "kill_run", lambda b, rid, p: killed.append(rid))
+    monkeypatch.setattr(cli, "kill_run", lambda b, rid, p, all_procs=False: killed.append(rid))
     pf = roots / "p.txt"
     pf.write_text("hi")
     b = boxmod.load("demo")
@@ -294,3 +316,85 @@ def test_run_prunes_old_runs(roots, monkeypatch):
     cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
     names = sorted(p.name for p in runs.iterdir())
     assert len(names) == 3 and names[0] == "20200101T000003Z-claude"
+
+
+@pytest.mark.parametrize(
+    "running,pinned,expect",
+    [(False, False, ["up", "full", "down"]), (True, False, ["full"]), (True, True, ["full"])],
+)
+def test_doctor_stops_box_it_started(roots, monkeypatch, running, pinned, expect):
+    """P8: doctor on a stopped box stops it again; a running box stays as it is."""
+    from agentbox import doctor as doc
+
+    setup_running_box(roots, monkeypatch, {})
+    events = []
+    monkeypatch.setattr(boxmod, "is_running", lambda b: running)
+    monkeypatch.setattr(boxmod, "up", lambda b, accept=False, explicit=False: events.append("up"))
+    monkeypatch.setattr(doc, "full", lambda b: events.append("full") or [])
+    monkeypatch.setattr(boxmod, "other_processes", lambda b: [])
+    monkeypatch.setattr(boxmod, "down_locked", lambda b, volumes=False: events.append("down"))
+    if pinned:
+        boxmod.pin(boxmod.load("demo"))
+    assert cli.main(["doctor", "demo"]) == 0
+    assert events == expect
+
+
+def test_doctor_keeps_box_pinned_meanwhile(roots, monkeypatch):
+    from agentbox import doctor as doc
+
+    setup_running_box(roots, monkeypatch, {})
+    events = []
+    monkeypatch.setattr(boxmod, "is_running", lambda b: False)
+    monkeypatch.setattr(boxmod, "up", lambda b, accept=False, explicit=False: events.append("up"))
+    monkeypatch.setattr(doc, "full", lambda b: boxmod.pin(b) or [])  # user `up` meanwhile
+    monkeypatch.setattr(boxmod, "down_locked", lambda b, volumes=False: events.append("down"))
+    assert cli.main(["doctor", "demo"]) == 0
+    assert events == ["up"]
+
+
+@pytest.mark.parametrize("argv,want", [(["down", "p3"], False), (["down", "-v", "p3"], True),
+                                       (["down", "--volumes", "p3"], True)])  # fmt: skip
+def test_down_volumes_flag(roots, monkeypatch, argv, want):
+    monkeypatch.setattr("agentbox.profile.check_mount_host", lambda h, d=False, **kw: h)
+    assert cli.main(["init", "p3", "--mount", str(roots)]) == 0
+    seen = []
+    monkeypatch.setattr(boxmod, "down", lambda b, volumes=False: seen.append(volumes))
+    assert cli.main(argv) == 0
+    assert seen == [want]
+
+
+def test_run_records_host_config_changes(roots, monkeypatch, capsys):
+    from agentbox import hostscan
+
+    events, _ = run_box(roots, monkeypatch)
+    snaps = iter([
+        {"items": {"/w/p: .envrc": "missing"}, "incomplete": False},
+        {"items": {"/w/p: .envrc": "sha256:abc"}, "incomplete": False},
+    ])  # fmt: skip
+    monkeypatch.setattr(hostscan, "snapshot", lambda p, budget=1.0: next(snaps))
+    pf = roots / "p.txt"
+    pf.write_text("hi")
+    cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
+    rd = sorted((paths.state_dir("demo") / "runs").iterdir())[-1]
+    meta = __import__("json").loads((rd / "meta.json").read_text())
+    assert meta["host_config_changes"] == ["/w/p: .envrc: added: sha256:abc"]
+    assert not (rd / "hostscan.json").exists()
+    err = capsys.readouterr().err
+    assert "WARNING: host-executed config changed" in err and "/w/p: .envrc" in err
+
+
+def test_session_prints_host_config_changes(roots, monkeypatch, capsys):
+    from agentbox import hostscan
+
+    setup_running_box(roots, monkeypatch, {})
+    monkeypatch.setattr(cli, "ensure_up", lambda b: None)
+    monkeypatch.setattr(cli.subprocess, "call", lambda argv: 0)
+    snaps = iter([
+        {"items": {"/w/p: .git/config [core.fsmonitor]": "missing"}, "incomplete": False},
+        {"items": {"/w/p: .git/config [core.fsmonitor]": "ab12 x"}, "incomplete": True},
+    ])  # fmt: skip
+    monkeypatch.setattr(hostscan, "snapshot", lambda p, budget=1.0: next(snaps))
+    assert cli.main(["shell", "demo"]) == 0
+    err = capsys.readouterr().err
+    assert "[core.fsmonitor]: added: ab12 x" in err and "scan incomplete" in err
+    assert not list((paths.state_dir("demo") / "hostscan").iterdir())

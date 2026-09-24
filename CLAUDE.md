@@ -6,7 +6,7 @@ ollama) with controlled filesystem, network, secrets, and MCP access.
 - Requirements: `PROJECT.md`. Design and phase plan: `docs/PLAN.md`. Read both
   before any change. The plan is the source of truth; change the plan first,
   then the code.
-- Status: plan r5 + u1 approved by design review; decisions recorded (§7). Build: P0 next.
+- Status: v1 built (P0–P8, P6b). Pending: user live acceptance (see docs/USAGE.md quick start).
 
 ## Security invariants (never weaken without a plan change)
 

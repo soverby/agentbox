@@ -121,6 +121,8 @@ def login(profile: str, server: str, no_browser: bool = False, timeout: float | 
     prof = _profile(profile)
     s = _server(prof, server)
     ref = token_ref(prof, cfg, server)
+    if ref.startswith(secretstore.OWNED) and not secretstore.keychain_available():
+        raise McpCmdError(f"mcp login cannot store the token set: {secretstore.KEYCHAIN_ONLY_MAC}")
     if ref.startswith("op://"):
         raise McpCmdError(
             "the op backend is read-only in agentbox, so `mcp login` cannot store the token "

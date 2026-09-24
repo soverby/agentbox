@@ -615,9 +615,9 @@ def main() -> int:  # noqa: C901 (linear scenario)
         elog = e.state / "logs" / "egress" / "egress.log"
         old_line = ("1790000000.000      0 10.0.0.1 TCP_DENIED/403 0 CONNECT "
                     "rotated-marker.example:443 - HIER_NONE/- text/html \"-\"\n")  # fmt: skip
-        with elog.open("a") as f:
-            f.write(old_line.replace("10.0.0.1", ips_agent(e)) * 2)
+        with elog.open("a") as f:  # marker last: `denied` reads the last 16 MB (P8)
             f.write("#" * (21 * 1024 * 1024) + "\n")
+            f.write(old_line.replace("10.0.0.1", ips_agent(e)) * 2)
         r = e.ab("up", NAME)
         e.box("curl -s -o /dev/null --noproxy '' -x http://egress:3128 -m 10 "
               "https://after-rotate.example.org/ || true")  # fmt: skip

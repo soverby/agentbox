@@ -134,6 +134,7 @@ def test_setup_token_validation(env, monkeypatch, capsys):
 
 
 def test_setup_writes_keychain_default(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.platform", "darwin")
     monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path / "cfg"))
     monkeypatch.setattr(docker, "run", lambda a, **k: subprocess.CompletedProcess(a, 0, "29", ""))
     monkeypatch.setattr(images, "ensure_agent", lambda r: "a")
@@ -644,6 +645,24 @@ def test_stop_if_idle_waits_for_up_and_sees_its_session(env, monkeypatch):
         assert boxmod.stop_if_idle(run_box) is None and downs == [1]  # now idle
 
 
+def test_stop_if_idle_kills_leftovers_unless_pinned(env, monkeypatch):
+    p = parse_profile(__import__("tomllib").loads(PROFILE), "p1")
+    b = boxmod.Box("p1", p, paths.state_dir("p1"), paths.load_config())
+    b.state.mkdir(parents=True, exist_ok=True)
+    downs = []
+    monkeypatch.setattr(boxmod, "down_locked", lambda b, volumes=False: downs.append(1))
+    procs = [f"sh -c loop{i}" for i in range(5)]
+    monkeypatch.setattr(boxmod, "other_processes", lambda b: procs)
+    note: list[str] = []
+    with boxmod.session_lock(b):  # the run's own session does not count
+        assert boxmod.stop_if_idle(b, note) is None
+    assert downs == [1]
+    assert note == ["killed leftover processes (sh -c loop0, sh -c loop1, sh -c loop2, ...)"]
+    boxmod.pin(b)
+    note.clear()
+    assert boxmod.stop_if_idle(b, note) == boxmod.PINNED and downs == [1] and not note
+
+
 def test_check_11_deferred(tmp_path, monkeypatch):
     b = dbox(tmp_path)
     tok = delivery.box_tokens(tmp_path)["MCP_GATEWAY_TOKEN"]
@@ -692,3 +711,72 @@ def test_scratch_17_env(tmp_path, out, scratch_status):
         doctor._full = orig
     ok = doctor.check_17(b, fetch=lambda ref: None, run=lambda box, pre: (0, "OK"))
     assert ok[0].kind == "ok" and ok[0].status == "FAIL"  # success with a fake token
+
+
+def test_setup_linux_never_writes_keychain(tmp_path, monkeypatch, capsys):
+    """P8: simulated Linux host, no backend configured -> clear stop, no config."""
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path / "cfg"))
+    calls = []
+    monkeypatch.setattr(docker, "run", lambda a, **k: calls.append(a))
+    assert cli.main(["setup", "--skip-token", "--skip-doctor"]) == 1
+    err = capsys.readouterr().err
+    assert "keychain secret backend is macOS-only" in err and 'secret_backend = "op"' in err
+    assert not paths.config_file().exists() and calls == []  # stops before Docker/builds
+    paths.write_config({"secret_backend": "keychain"})
+    assert cli.main(["setup", "--skip-token", "--skip-doctor"]) == 1
+    assert "macOS-only" in capsys.readouterr().err
+
+
+def test_setup_linux_with_env_backend(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path / "cfg"))
+    paths.write_config({"secret_backend": "env"})
+    monkeypatch.setattr(docker, "run", lambda a, **k: subprocess.CompletedProcess(a, 0, "29", ""))
+    monkeypatch.setattr(images, "ensure_agent", lambda r: "a")
+    monkeypatch.setattr(images, "ensure_sidecar", lambda r, s: s)
+    monkeypatch.setattr(cli, "ollama_note", lambda: "x")
+    assert cli.main(["setup", "--skip-token", "--skip-doctor"]) == 0
+    assert paths.load_config().secret_backend == "env"
+
+
+def test_keychain_on_linux_clear_error(tmp_path, monkeypatch, capsys):
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("AGENTBOX_STATE_HOME", str(tmp_path / "state"))
+    paths.write_config({"secret_backend": "keychain"})
+    paths.profiles_dir().mkdir(parents=True)
+    paths.profile_file("p1").write_text(PROFILE)
+    ran = []
+    monkeypatch.setattr(secretstore, "_run", lambda *a, **k: ran.append(a))
+    monkeypatch.setattr("sys.stdin", io.StringIO("v\n"))
+    assert cli.main(["secret", "set", "p1", "AGENT_ONLY", "--stdin"]) != 0
+    assert "keychain secret backend is macOS-only" in capsys.readouterr().err
+    assert secretstore.get("agentbox-keychain:agentbox/p1/AGENT_ONLY") is None  # owned: absent
+    with pytest.raises(secretstore.SecretError, match="macOS-only"):
+        secretstore.get("keychain:some/item")
+    assert ran == []  # `security` never called
+
+
+def test_mcp_login_keychain_on_linux(tmp_path, monkeypatch):
+    import sys
+
+    from agentbox import mcpcmd
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("AGENTBOX_STATE_HOME", str(tmp_path / "state"))
+    paths.write_config({"secret_backend": "keychain"})
+    paths.profiles_dir().mkdir(parents=True)
+    paths.profile_file("p1").write_text(
+        PROFILE + '\n[mcp.servers.od]\nurl = "https://mcp2.example.com/mcp"\nauth = "oauth"\n'
+    )
+    monkeypatch.setattr(mcpcmd.mcpoauth, "login", lambda *a, **k: pytest.fail("flow ran"))
+    with pytest.raises(mcpcmd.McpCmdError, match="macOS-only"):
+        mcpcmd.login("p1", "od")

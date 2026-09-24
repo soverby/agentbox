@@ -47,6 +47,30 @@ def test_kill_script_targets_run_env():
     assert "AGENTBOX_RUN=20260101T000000Z-claude" in s and "kill -KILL" in s
 
 
+def test_kill_all_script_spares_init_and_main(tmp_path):
+    """Run the script against a fake /proc: only leftovers get SIGKILL."""
+    import subprocess
+
+    from agentbox import runs
+
+    proc = tmp_path / "proc"
+    for pid, ppid, cmd in (
+        (1, 0, b"/sbin/docker-init\0--\0sleep\0infinity\0"),
+        (7, 1, b"sleep\0infinity\0"),
+        (50, 1, b"sh\0-c\0while :; do sleep 1; done\0"),
+        (51, 0, b"\0"),  # argv wiped: still killed
+    ):
+        d = proc / str(pid)
+        d.mkdir(parents=True)
+        (d / "cmdline").write_bytes(cmd)
+        (d / "status").write_text(f"Name:\tx\nPPid:\t{ppid}\n")
+    s = runs.kill_all_script().replace("/proc/", f"{proc}/")
+    log = tmp_path / "killed"
+    s = s.replace('kill -KILL "$n"', f'echo "$n" >> {log}')
+    subprocess.run(["sh", "-c", s], check=True)
+    assert sorted(log.read_text().split()) == ["50", "51"]
+
+
 def test_runs_keep_config(tmp_path, monkeypatch):
     import pytest
     from agentbox import paths

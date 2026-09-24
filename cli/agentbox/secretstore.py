@@ -26,6 +26,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from .paths import Config
@@ -93,6 +94,17 @@ def scrub(text: str, value: str | None) -> str:
     return res[-300:]
 
 
+KEYCHAIN_ONLY_MAC = (
+    'the keychain secret backend is macOS-only. On Linux, set secret_backend = "op" '
+    "(1Password CLI, with op_vault) in ~/.config/agentbox/config.toml; "
+    '"env" is for tests only'
+)
+
+
+def keychain_available() -> bool:
+    return sys.platform == "darwin"
+
+
 class Keychain:
     """macOS keychain generic passwords. owned=True: agentbox items (account
     `agentbox`, base64 envelope). owned=False: explicit refs, any account, raw,
@@ -107,8 +119,13 @@ class Keychain:
         if not SERVICE_RE.fullmatch(service):
             raise SecretError(f"keychain service {service!r} has characters agentbox does not use")
 
+    def _mac_only(self) -> None:
+        if not keychain_available():
+            raise SecretError(KEYCHAIN_ONLY_MAC)
+
     def _find(self, service: str, show: bool):
         self._check(service)
+        self._mac_only()
         argv = ["security", "find-generic-password"]
         if self.owned:
             argv += ["-a", ACCOUNT]
@@ -118,6 +135,8 @@ class Keychain:
         return _run(argv)
 
     def get(self, service: str) -> str | None:
+        if self.owned and not keychain_available():
+            return None  # nothing agentbox-owned can be stored there (set refuses)
         r = self._find(service, True)
         if r.returncode == KEYCHAIN_NOT_FOUND:
             return None
@@ -137,6 +156,8 @@ class Keychain:
             raise SecretError(f"keychain item {service} has a damaged value") from None
 
     def exists(self, service: str) -> bool:
+        if self.owned and not keychain_available():
+            return False
         r = self._find(service, False)
         if r.returncode == KEYCHAIN_NOT_FOUND:
             return False
@@ -154,6 +175,7 @@ class Keychain:
     def set(self, service: str, value: str) -> None:
         self._owned_only(service)
         self._check(service)
+        self._mac_only()
         if msg := value_problem(value):
             raise SecretError(msg)
         if len(value.encode()) > KEYCHAIN_MAX:
@@ -180,6 +202,7 @@ class Keychain:
     def delete(self, service: str) -> bool:
         self._owned_only(service)
         self._check(service)
+        self._mac_only()
         r = _run(["security", "delete-generic-password", "-a", ACCOUNT, "-s", service])
         if r.returncode == KEYCHAIN_NOT_FOUND:
             return False

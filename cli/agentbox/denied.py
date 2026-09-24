@@ -14,6 +14,22 @@ from datetime import datetime
 from .allowedit import domain_problem
 
 SINCE_RE = re.compile(r"(\d+)([smhd])")
+READ_MAX = 16 * 1024 * 1024  # bytes read from the end of each log file
+URL_MAX = 256  # egress.URL_MAX: the logformat width cap of the URL field
+MAX_HOSTS = 5000  # unique hosts kept; further new hosts are only counted
+
+
+def tail_lines(path, max_bytes: int = READ_MAX):
+    """Lines of the last max_bytes of `path` (a partial first line is dropped).
+    Streams: memory does not grow with the file size (PLAN §2.6)."""
+    with open(path, "rb") as fh:
+        size = fh.seek(0, 2)
+        start = max(0, size - max_bytes)
+        fh.seek(start)
+        if start:
+            fh.readline()  # partial line
+        for raw in fh:
+            yield raw.decode("utf-8", "replace")
 
 
 class DeniedError(Exception):
@@ -81,6 +97,16 @@ def host_port(method: str, url: str) -> tuple[str, str] | None:
     return parts.hostname.lower(), port
 
 
+def host_truncated(method: str, url: str) -> bool:
+    """True when the logformat width cap may have cut the host part."""
+    if len(url) < URL_MAX:
+        return False
+    if method == "CONNECT":
+        return True
+    rest = url.split("://", 1)[-1]
+    return "/" not in rest and "?" not in rest
+
+
 def allow_matches(host: str, allowlist: list[str]) -> bool:
     """Squid dstdomain semantics: `a.b` exact; `.a.b` = a.b and subdomains."""
     for e in allowlist:
@@ -99,15 +125,21 @@ def parse(
     allowlist: list[str] | None = None,
     since: float = 0.0,
     exclude: list[tuple[float, float, str]] = (),
+    stats: dict | None = None,
 ) -> list[Denial]:
     """Unique denied hosts from `client_ip`, allowable first, then most frequent.
 
     `exclude`: (start, end, user_agent) of doctor runs. A line is dropped only
     when its User-Agent equals that run's nonce UA AND its time is in that
     run's window; other traffic in the window stays visible. Lines in the old
-    native format (no UA field) are never dropped.
+    native format (no UA field) are never dropped. Old-format lines can carry
+    uncapped URLs; they parse the same way.
+
+    At most MAX_HOSTS unique hosts are kept; `stats["dropped"]` counts the
+    lines of further hosts.
     """
     out: dict[str, Denial] = {}
+    dropped = 0
     for line in lines:
         f = line.split()
         if len(f) < 7 or f[2] != client_ip or not f[3].startswith("TCP_DENIED"):
@@ -127,9 +159,14 @@ def parse(
         host, port = hp
         d = out.get(host)
         if d is None:
+            if len(out) >= MAX_HOSTS:
+                dropped += 1
+                continue
             d = out[host] = Denial(host, first=ts)
             problem = domain_problem(host)
-            if problem:
+            if host_truncated(f[5], f[6]):
+                d.allowable, d.reason = False, "host cut by the log width cap"
+            elif problem:
                 d.allowable, d.reason = False, problem
             elif allowlist is not None and allow_matches(host, allowlist):
                 d.allowable, d.reason = (
@@ -140,5 +177,8 @@ def parse(
                 d.reason = "not on the allowlist"
         d.count += 1
         d.last = max(d.last, ts)
-        d.ports.add(port)
+        if len(d.ports) < 20:
+            d.ports.add(port)
+    if stats is not None:
+        stats["dropped"] = dropped
     return sorted(out.values(), key=lambda d: (not d.allowable, -d.count, d.host))

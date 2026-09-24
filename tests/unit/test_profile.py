@@ -815,3 +815,64 @@ def test_home_user_ok():
 def test_reserved_hint_on_host():
     msg = problems({"mount": [{"host": "/etc/x"}]})["mount[0].host"]
     assert "set `path` to mount it elsewhere" in msg
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "BASH_ENV", "ENV", "IFS", "PS4", "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+        "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "Https_Proxy", "npm_Config_Userconfig",
+    ],
+)  # fmt: skip
+def test_reserved_p8(name):
+    """P8: the full PLAN §2.4 list (code execution or TLS weakening)."""
+    assert f"secrets.{name}" in problems(with_(secrets={name: "shared"}))
+    remote = {"remote": {"m": {"api_base": "https://x.io", "key": name}}}
+    assert "models.remote.m.key" in problems(with_(models=remote))
+
+
+@pytest.mark.parametrize("name", ["GITHUB_TOKEN", "ENVX", "MY_ENV", "GITLAB_TOKEN", "PS1"])
+def test_not_reserved_p8(name):
+    assert name in secrets(with_(secrets={name: {}}))
+
+
+def _reserved_case(script: str, prefix: str) -> str:
+    body = (ROOT / script).read_text()
+    block = body[body.index(f"      {prefix}*|PATH") : body.index(")", body.index("GIT_*"))]
+    return block.replace(prefix, "X_").replace("\\\n", "").replace(" ", "")
+
+
+def test_sidecar_shims_use_with_secrets_list():
+    ws = _reserved_case("images/agent/with-secrets", "__WS_")
+    assert _reserved_case("images/router/entrypoint.sh", "__S_") == ws
+    assert _reserved_case("images/mcp-gateway/entrypoint.sh", "__S_") == ws
+
+
+@pytest.mark.parametrize(
+    "script", ["images/router/entrypoint.sh", "images/mcp-gateway/entrypoint.sh"]
+)
+def test_sidecar_shim_skips_reserved(tmp_path, script):
+    sec = tmp_path / "secrets"
+    sec.mkdir()
+    for n, v in (("GOOD_KEY", "v1"), ("GIT_SSH_COMMAND", "x"), ("bash_env", "y"),
+                 ("MCP_GATEWAY_TOKEN", "t"), ("_MCP_OAUTH_DOCS", "o")):  # fmt: skip
+        (sec / n).write_text(v)
+    s = (ROOT / script).read_text().replace("/run/secrets", str(sec))
+    s = s[: s.rindex("exec ")] + "exec env\n"
+    r = subprocess.run(
+        ["sh", "-c", s], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}
+    )
+    assert r.returncode == 0, r.stderr
+    env = dict(x.split("=", 1) for x in r.stdout.splitlines() if "=" in x)
+    assert env["GOOD_KEY"] == "v1" and env["MCP_GATEWAY_TOKEN"] == "t"
+    assert env["_MCP_OAUTH_DOCS"] == "o"
+    assert "GIT_SSH_COMMAND" not in env and "bash_env" not in env
+    assert "skipped 2 secret(s) with a reserved name" in r.stderr
+    assert "x" not in r.stderr.replace("secret(s)", "")  # no values
+
+
+@pytest.mark.parametrize("name", ["MCP_GATEWAY_CONFIG", "MCP_GATEWAY_LOG", "MCP_GATEWAY_STATUS"])
+def test_gateway_env_names_reserved(name):
+    with pytest.raises(ProfileError, match="reserved"):
+        parse_profile({"mount": [{"host": "/srv/p"}], "secrets": {name: "shared"}}, "p1")

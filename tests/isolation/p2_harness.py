@@ -371,12 +371,15 @@ class Box:
                         "--user",
                         "0",
                         "--entrypoint",
-                        "chown",
+                        "sh",
                         "-v",
                         f"{d}:/d",
                         IMG["gate"],
-                        f"{uid}:{uid}",
-                        "/d",
+                        "-c",
+                        'chown -R "$1:$2" /d && chmod 2770 /d && chmod -R g+rwX /d',
+                        "sh",
+                        str(uid),
+                        str(os.getgid()),
                     ]
                 )
         in_use = docker_subnets()

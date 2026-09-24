@@ -132,6 +132,12 @@ def render_egress(box: Box, ctx: compose.Ctx) -> dict[str, str]:
     )
 
 
+LINUX_LOG_DIR_SCRIPT = (
+    'chown -R "$1:$2" /d && chmod 2770 /d && chmod -R g+rwX /d '
+    "&& find /d -mindepth 1 -type d -exec chmod g+s {} +"
+)
+
+
 def _prepare_log_dirs(box: Box, ctx: compose.Ctx, gate_image: str) -> None:
     for d, uid in (
         (ctx.egress_logs, compose.EGRESS_UID),
@@ -141,11 +147,15 @@ def _prepare_log_dirs(box: Box, ctx: compose.Ctx, gate_image: str) -> None:
         d.mkdir(parents=True, exist_ok=True)
         os.chmod(d, 0o755)
         if sys.platform.startswith("linux"):
-            # Linux bind mounts keep host uids: give the dir to the writer uid.
-            # Docker Desktop (macOS) maps container writes to the host user.
+            # Linux bind mounts keep host uids. The writer uid owns the dir; the
+            # host user's group owns it too, setgid, so files the container
+            # writes stay readable (and rotatable) by the host CLI (`denied`,
+            # log rotation). No access for other users. Docker Desktop (macOS)
+            # maps container writes to the host user instead.
             docker.run(
-                ["docker", "run", "--rm", "--user", "0", "--entrypoint", "chown",
-                 "-v", f"{d}:/d", gate_image, f"{uid}:{uid}", "/d"]
+                ["docker", "run", "--rm", "--user", "0", "--entrypoint", "sh",
+                 "-v", f"{d}:/d", gate_image, "-c", LINUX_LOG_DIR_SCRIPT,
+                 "sh", str(uid), str(os.getgid())]
             )  # fmt: skip
 
 

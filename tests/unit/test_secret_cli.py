@@ -194,7 +194,7 @@ def no_real_docker(monkeypatch):
     """On Linux, up() chowns log dirs via `docker run`; unit tests fake it."""
 
     def run(args, **kw):
-        assert "chown" in args, args
+        assert any("chown" in a for a in args), args
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(boxmod.docker, "run", run)

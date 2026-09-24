@@ -1,3 +1,6 @@
 {
-  "MD013": { "tables": false, "code_blocks": false }
+  "MD013": { "tables": false, "code_blocks": false },
+  // README header: centered logo (light/dark) and badges.
+  "MD033": { "allowed_elements": ["p", "picture", "source", "img", "a", "strong"] },
+  "MD041": false
 }

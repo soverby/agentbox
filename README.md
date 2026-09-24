@@ -1,11 +1,67 @@
-# agentbox
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)"
+      srcset="docs/assets/agentbox-logo-dark.svg">
+    <img alt="agentbox" src="docs/assets/agentbox-logo-light.svg" width="440">
+  </picture>
+</p>
 
-agentbox runs AI coding agents (Claude Code, Codex, Pi, and the ollama
-client) in Docker sandboxes. Each sandbox ("box") serves one purpose
-("profile"). A profile lists the host paths, network destinations, secrets,
-and MCP servers that the agents can use. The box blocks everything else. The
-host CLI starts the box, gives it only the secrets it needs, and runs a
-self-test (`agentbox doctor`) that proves the isolation.
+<p align="center">
+  <strong>Let AI coding agents run at full speed, in a box you control.</strong>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT"
+    src="https://img.shields.io/badge/license-MIT-4F46E5"></a>
+  <img alt="Platform: macOS | Linux"
+    src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-6366F1">
+  <img alt="Agents: Claude Code, Codex, Pi"
+    src="https://img.shields.io/badge/agents-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Pi-A5B4FC">
+</p>
+
+agentbox runs AI coding agents (Claude Code, Codex, Pi, and local or hosted
+open models) inside Docker sandboxes. You say which folders, websites,
+secrets, and MCP tools a box may use. The box blocks everything else, and
+one command proves it.
+
+## Who is this for?
+
+- **You let agents work unattended.** You want to use
+  `--dangerously-skip-permissions` or auto-approve, but not on your whole
+  laptop.
+- **You work on several projects or for several clients.** Each project
+  gets its own box, its own tokens, and its own network rules. One project
+  never sees another project's credentials.
+- **You run agents on a schedule.** Nightly triage, weekly dependency
+  updates, morning reports: `agentbox schedule add` runs them headless
+  and records every result.
+- **You mix subscriptions and open models.** Use your Claude and ChatGPT
+  subscriptions (no API keys), your local Ollama models, or your own
+  models on Modal, from the same box.
+- **You want MCP tools without handing over the keys.** The agent calls
+  tools through a gateway; the tokens stay in the gateway.
+
+## Why use it?
+
+An agent with permission to "just do it" can read `~/.ssh`, your cloud
+credentials, and every environment variable. It can push to any repository
+your token reaches and send data to any website. A prompt injection in a
+web page, a README, or a tool result can make it do these things. agentbox
+changes the default from "everything unless denied" to "nothing unless
+allowed":
+
+- **Files:** the agent sees only the folders you mount. Credential and
+  system folders cannot be mounted.
+- **Network:** traffic goes out only through a proxy with an allowlist, and
+  every request is logged. `agentbox denied` shows what was blocked, and
+  `agentbox allow` fixes it without a restart.
+- **Secrets:** they stay in your macOS Keychain. Each container gets only
+  the secrets it needs.
+- **Proof:** `agentbox doctor` tests every isolation property in the
+  running box. It does not rely on the configuration.
+
+Setup takes a few minutes; after that, `agentbox claude` in a project folder
+starts a sandboxed session in about two seconds.
 
 ## Security model
 
@@ -72,3 +128,7 @@ Read [docs/USAGE.md](docs/USAGE.md) for each step and for all other tasks.
 - [docs/SECURITY.md](docs/SECURITY.md): threat model and residual risks.
 - [docs/PLAN.md](docs/PLAN.md): design and phase plan.
 - [profiles/example.toml](profiles/example.toml): an example profile.
+
+## License
+
+MIT. Read [LICENSE](LICENSE).

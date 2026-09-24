@@ -1,6 +1,8 @@
 # agentbox — Implementation Plan
 
-Status: v1 built (all phases committed on `build/p0-scaffold`). Design: r5 + usability pass u1, amended during the build. Adversarial design review: APPROVED in
+Status: v1 built (all phases committed on `build/p0-scaffold`). Design: r5 +
+usability pass u1, amended during the build. Adversarial design review: APPROVED
+in
 round 5 of 5, conditional on the R5 edits (applied). The usability pass (§9)
 was done by the architect after the review closed. Requirements: `PROJECT.md`.
 Change log: §8.
@@ -62,7 +64,8 @@ the agent container, and it can send any request to any sidecar it can reach.
   is stripped, unclassified lines and non-UTF-8 content are reported as
   changes; include targets and deeper repos are not scanned), non-sample
   files in
-  `.git/hooks`, a `.git/commondir` file, `.envrc`, `.vscode/{tasks,settings,launch}.json` —
+  `.git/hooks`, a `.git/commondir` file, `.envrc`,
+  `.vscode/{tasks,settings,launch}.json` —
   and warns (terminal, run meta, `schedule ls`) on any change. Warn-only;
   never blocks. Rejected: read-only nested binds over `.git`
   (`protect_git`): Docker Desktop drops nested binds from a running
@@ -90,7 +93,8 @@ the agent container, and it can send any request to any sidecar it can reach.
   secrets (upstream bearers, OAuth token sets in `/run/secrets` and the
   OAuth volume — a stdio server could rotate a refresh token and lock the
   gateway out); one with a shell or file tool hands them to
-  the agent, and it shares the gateway's network position. Declare only trusted stdio servers; `uvx`/
+  the agent, and it shares the gateway's network position. Declare only trusted
+  stdio servers; `uvx`/
   `npx` packages are pinned only as far as the profile pins them.
 - A mounted repo can declare stdio MCP servers for Codex or Pi. They are only
   in-box code. Claude Code loads only the root-owned `managed-mcp.json`.
@@ -418,7 +422,8 @@ Mount validation (T1):
   credentials. User secrets never touch disk.
 - In the agent, `/run/secrets/*` are root:root 0444 (the agent cannot
   rewrite them; it is the only uid in the box). Compose hands the file to
-  the container user whenever `uid`/`gid` is set, so neither is set. Rendered Compose strings escape `$`.
+  the container user whenever `uid`/`gid` is set, so neither is set. Rendered
+  Compose strings escape `$`.
 - A secret change recreates the target container only when no session is
   using it; otherwise `up` keeps the running container and says the change
   applies after sessions end (or `agentbox down`).
@@ -475,7 +480,8 @@ third-party router.
     from the forwarded body — the ollama client sends both), spelled
     exactly, value allowed.
   - `GET /api/tags` and `/v1/models` responses are filtered to the allowed
-    models, so `ollama list` shows only what the box can use. Go's JSON decoder matches keys
+    models, so `ollama list` shows only what the box can use. Go's JSON decoder
+    matches keys
     case-insensitively, so `{"MODEL": …}` would otherwise reach Ollama
     unchecked.
   - Forwards its own re-serialized body with a fresh `Content-Length`.
@@ -495,14 +501,16 @@ third-party router.
   name still goes to squid and is denied. Router egress allowlist: the
   remote model domains only.
 - Router request hardening: a root-owned LiteLLM pre-call hook baked into
-  the image (`/opt/agentbox-router/agentbox_guard.py`) rejects body keys that steer the upstream call
+  the image (`/opt/agentbox-router/agentbox_guard.py`) rejects body keys that
+  steer the upstream call
   (`extra_headers`, `headers`, `api_key`, `extra_body`, any key matching
   `*api_base*|*base_url*|*_headers`) with 400, and drops body keys outside
   the OpenAI chat / Anthropic messages / Responses parameter sets (new
   optional client parameters degrade instead of failing). Client request
   headers are never forwarded upstream (`forward_client_headers_to_llm_api:
   false`); `mcp`-type tools are rejected. The router runs as uid 10003,
-  which owns nothing under `/app`, so it cannot modify LiteLLM. Residual: without a DB, some non-admin LiteLLM
+  which owns nothing under `/app`, so it cannot modify LiteLLM. Residual:
+  without a DB, some non-admin LiteLLM
   routes (`/ui` static bundle, `/openapi.json`, `/health/readiness`,
   SSO/login stubs) answer outside `allowed_routes`; none reach an admin
   action (doctor 21 samples them).
@@ -628,7 +636,8 @@ docs/                  PLAN.md, SECURITY.md, USAGE.md
 Checks run inside the agent container (and, where marked, inside sidecars).
 Each check is pass/fail. The full suite runs on `agentbox doctor`, after
 `agentbox update`, and in Linux CI (GitHub Actions workflow committed; it
-runs once the repo has a GitHub remote — until then Linux is untested). Every `up` runs a fast subset (1, 2, 6,
+runs once the repo has a GitHub remote — until then Linux is untested). Every
+`up` runs a fast subset (1, 2, 6,
 9; target < 3 s) and refuses to start a session if it fails.
 
 1. `curl https://example.com` without proxy → fails (no route).
@@ -670,14 +679,6 @@ runs once the repo has a GitHub remote — until then Linux is untested). Every 
     `managed-mcp.json` is root-owned and not writable.
 17. Headless `agentbox run` with only env-delivered tokens
     (`CLAUDE_CODE_OAUTH_TOKEN`, `MCP_GATEWAY_TOKEN`) succeeds.
-21. Router (when present): healthy; with the master key, admin routes
-    (`/model/info`, `/config/yaml`, `/key/generate`, `/config/update`) →
-    403/404; a request with `api_base: http://agent:9` does not connect.
-20. Gateway (also `oauth-store`, when OAuth servers exist: the token
-    volume is 0700 gateway-owned, files 0600, mounted by no other service): missing/wrong token → 401; only allowlisted namespaced tools
-    listed; non-allowlisted `tools/call` rejected; agent cannot reach
-    upstreams; gateway user writes only `/tmp` and its log dir, no setuid;
-    every declared upstream connected (else FAIL naming it).
 18. Host Ollama ≥ 0.14.0; no allowed model has a non-empty `remote_host`.
 19. `open` mode: public domain → 200; IP literal, RFC 1918, loopback,
     link-local, `host.docker.internal`, and a public name that resolves to a
@@ -685,6 +686,15 @@ runs once the repo has a GitHub remote — until then Linux is untested). Every 
     from egress (squid `ERR_DNS_FAIL` → SKIP; Docker Desktop DNS returns no
     AAAA). The harness adds a test-only squid `hosts_file` for its IPv6 test
     names; no resolver runs in any box.
+20. Gateway (also `oauth-store`, when OAuth servers exist: the token
+    volume is 0700 gateway-owned, files 0600, mounted by no other
+    service): missing/wrong token → 401; only allowlisted namespaced tools
+    listed; non-allowlisted `tools/call` rejected; agent cannot reach
+    upstreams; gateway user writes only `/tmp` and its log dir, no setuid;
+    every declared upstream connected (else FAIL naming it).
+21. Router (when present): healthy; with the master key, admin routes
+    (`/model/info`, `/config/yaml`, `/key/generate`, `/config/update`) →
+    403/404; a request with `api_base: http://agent:9` does not connect.
 
 ## 5. Phases
 

@@ -1,6 +1,6 @@
 [project]
 name = "agentbox"
-version = "0.0.1"
+version = "0.1.0"
 description = "Docker sandboxes for AI agents"
 requires-python = ">=3.11"
 license = "MIT"

@@ -452,8 +452,9 @@ them. The Linux CI workflow uses GitHub Actions by tag, not by commit.
 
 ## Report a problem
 
-The repository has no public remote or security contact yet. Report a
-security problem privately to the maintainer of your copy. Include:
+Do not open a public issue for a security problem. Report it privately
+with GitHub private vulnerability reporting:
+<https://github.com/soverby/agentbox/security/advisories/new>. Include:
 
 1. The agentbox commit (`git rev-parse HEAD`).
 2. The host OS and Docker version.

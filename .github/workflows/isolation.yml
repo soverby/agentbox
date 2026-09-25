@@ -16,6 +16,8 @@ jobs:
       - run: uv run --project cli pytest tests/unit
       - run: uv run --project cli ruff check cli tests
       - run: uv run --project cli ruff format --check cli tests
+      - name: examples/news-brief tests
+        run: uv run --with pytest --with fpdf2==2.8.8 pytest -q examples/news-brief/tests
   isolation:
     runs-on: ubuntu-latest
     needs: unit

@@ -25,6 +25,7 @@ AGENT_INPUTS = (
     "Dockerfile",
     "versions.env",
     "managed-mcp.json",
+    "managed-settings.json",
     "pi-mcp.json",
     "pi-wrapper",
     "pi-models.ts",

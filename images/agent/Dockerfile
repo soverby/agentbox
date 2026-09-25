@@ -168,6 +168,16 @@ RUN UV_PYTHON_INSTALL_DIR=/opt/python UV_PYTHON_BIN_DIR=/opt/python/bin \
 
 # Claude Code managed MCP: only the agentbox gateway.
 COPY managed-mcp.json /etc/claude-code/managed-mcp.json
+# Claude Code managed settings (Linux path /etc/claude-code/; highest
+# precedence, the agent cannot override them). Stops the official plugin
+# marketplace auto-install at interactive start (a GET to
+# downloads.claude.ai/claude-code-releases/plugins/claude-plugins-official,
+# then a git clone from github.com; both denied by egress):
+# - strictKnownMarketplaces []: no marketplace source is allowed, so no
+#   marketplace or plugin is fetched, installed or loaded.
+# - env CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1: skips the
+#   official marketplace auto-install (also set as ENV below).
+COPY managed-settings.json /etc/claude-code/managed-settings.json
 # Pi MCP config (pi-wrapper passes it with --mcp-config): only the gateway.
 COPY pi-mcp.json /etc/agentbox/pi-mcp.json
 # Pi model-route provider (pi-wrapper loads it with --extension; PLAN §2.5).
@@ -179,7 +189,8 @@ COPY with-secrets /usr/local/bin/with-secrets
 # No setuid/setgid binaries (doctor 16).
 RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + \
  && chmod 0755 /etc/claude-code /etc/agentbox /usr/local/bin/with-secrets \
- && chmod 0644 /etc/claude-code/managed-mcp.json /etc/agentbox/pi-mcp.json \
+ && chmod 0644 /etc/claude-code/managed-mcp.json /etc/claude-code/managed-settings.json \
+      /etc/agentbox/pi-mcp.json \
       /usr/local/lib/agentbox/pi-models.ts \
  && find /usr/local /opt/python /etc/claude-code /etc/agentbox -xdev \( ! -user root -o -perm -o+w \) \
       ! -type l -printf "%u %m %p\n" > /tmp/bad \
@@ -189,6 +200,7 @@ RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + \
 ENV DISABLE_AUTOUPDATER=1 \
     DISABLE_UPDATES=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1 \
     ENABLE_CLAUDEAI_MCP_SERVERS=false \
     NPM_CONFIG_PREFIX=/home/agent/.npm-global \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/agent/.npm-global/bin:/home/agent/.local/bin \

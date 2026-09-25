@@ -934,6 +934,7 @@ unchanged. Key fingerprints (`CLAUDE_KEY_FPR`,
 | Symptom (CLI message) | Cause | Fix |
 | --- | --- | --- |
 | `agentbox claude` shows the Claude Code login picker | Claude Code first-run onboarding is not marked done in the box (boxes from before 0.1.1a1). The shared token itself works (`doctor` 17 live PASS). | Press Ctrl-C. Run `agentbox up <profile>` with 0.1.1a1 or later: it marks onboarding done. Do not log in inside the box. |
+| `/plugin` or `claude plugin marketplace add` in the box: `blocked by enterprise policy. No external marketplaces are allowed.` | Intended. The image policy `/etc/claude-code/managed-settings.json` sets `strictKnownMarketplaces: []` and turns off the official marketplace auto-install, so Claude Code makes no plugin fetches (to `downloads.claude.ai` or `github.com`). | None. Plugins are not supported in the box. Use MCP servers through the gateway. |
 | `Docker is not running` | Docker Desktop is stopped. | Start Docker, then run the command again. |
 | `... is not an agentbox repo (no images/agent/build.sh)` | The CLI is not an editable install of a clone. | `uv tool install -e ./cli` in the clone, or set `AGENTBOX_REPO`. |
 | `no profile mounts <dir>; name one explicitly` | The current directory is in no mount. | Give the profile name, or `cd` into a mount. |

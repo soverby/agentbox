@@ -792,3 +792,31 @@ def test_mcp_login_keychain_on_linux(tmp_path, monkeypatch):
     monkeypatch.setattr(mcpcmd.mcpoauth, "login", lambda *a, **k: pytest.fail("flow ran"))
     with pytest.raises(mcpcmd.McpCmdError, match="macOS-only"):
         mcpcmd.login("p1", "od")
+
+
+def _sbox(agents):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(profile=SimpleNamespace(box=SimpleNamespace(agents=agents)))
+
+
+def test_claude_setup_seeds_onboarding_only_for_claude(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+    monkeypatch.setattr(
+        boxmod, "exec_in", lambda b, cmd, **k: calls.append(cmd) or SimpleNamespace(returncode=0)
+    )
+    boxmod.claude_setup(_sbox(["codex"]))
+    assert calls == []
+    boxmod.claude_setup(_sbox(["claude", "pi"]))
+    assert calls == [["sh", "-c", boxmod.CLAUDE_ONBOARDING_SCRIPT]]
+    assert "hasCompletedOnboarding" in boxmod.CLAUDE_ONBOARDING_SCRIPT
+
+
+def test_claude_setup_failure_only_warns(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(boxmod, "exec_in", lambda b, cmd, **k: SimpleNamespace(returncode=5))
+    boxmod.claude_setup(_sbox(["claude"]))  # must not raise
+    assert "onboarding" in capsys.readouterr().err

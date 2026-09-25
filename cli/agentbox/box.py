@@ -242,6 +242,29 @@ def git_setup(box: Box, agent_secrets: list[str] | None = None) -> None:
         gh_setup_git(box)
 
 
+# Interactive Claude Code shows its first-run login picker until
+# ~/.claude.json has hasCompletedOnboarding, even with CLAUDE_CODE_OAUTH_TOKEN
+# set. Set only that key, in the box (jq there): the host never parses this
+# agent-controlled file (PLAN §2.6).
+CLAUDE_ONBOARDING_SCRIPT = (
+    'f="$HOME/.claude.json"; [ -s "$f" ] || printf "{}" > "$f"; '
+    'jq -e ".hasCompletedOnboarding == true" "$f" >/dev/null 2>&1 && exit 0; '
+    'jq ".hasCompletedOnboarding = true" "$f" > "$f.agentbox-tmp" && mv -f "$f.agentbox-tmp" "$f"'
+)
+
+
+def claude_setup(box: Box) -> None:
+    """Mark Claude Code onboarding done so the shared token is used directly."""
+    if "claude" not in box.profile.box.agents:
+        return
+    r = exec_in(box, ["sh", "-c", CLAUDE_ONBOARDING_SCRIPT], timeout=30)
+    if r.returncode != 0:
+        warn(
+            "could not mark Claude Code onboarding done in the box; interactive "
+            "claude may show a login picker (press Ctrl-C; the token still works)"
+        )
+
+
 def gh_setup_git(box: Box) -> None:
     """`gh auth setup-git` through with-secrets: git uses gh (and so GH_TOKEN,
     read at each git call) as credential helper for github.com."""
@@ -446,6 +469,7 @@ def _up(box: Box, accept_mount_change: bool, explicit: bool = False) -> None:
     if files != old:
         apply_egress(box, ctx.conf_dir, old)
     git_setup(box, dl.names_for("agent"))
+    claude_setup(box)
     if (explicit or not running) and p.mcp_servers:
         warn_upstreams(box)
 

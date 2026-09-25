@@ -570,8 +570,15 @@ def check_gate_upstream(box: Box, run: str) -> None:
         x.get("path") == "/api/chat" and x.get("status") == 200 and x.get("bytes_out") for x in recs
     ):
         reasons.append("gate log lacks chat record with status/bytes")
-    if any("error" in x.get("event", "") for x in recs):
-        reasons.append("gate refresh errors in log")
+    # The refresh loop may start before the upstream is ready: errors before
+    # the first successful refresh are a startup race (nothing is allowed
+    # until then). Errors after it mean the refresh broke.
+    events = [x.get("event", "") for x in recs if x.get("event")]
+    first_ok = events.index("refresh") if "refresh" in events else len(events)
+    if any("error" in e for e in events[first_ok:]):
+        reasons.append("gate refresh errors in log after the first refresh")
+    if first_ok == len(events):
+        reasons.append("gate never refreshed its model list")
     status = "PASS" if not reasons else "FAIL"
     record(
         run,

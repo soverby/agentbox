@@ -1,0 +1,40 @@
+# agentbox profile "news": daily news brief from Perigon, to a Slack
+# channel (PDF upload or webhook text). Example: examples/news-brief.
+# Copy to ~/.config/agentbox/profiles/news.toml.
+
+[box]
+agents = ["claude"]
+# Unicode TTF for the PDF: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+packages = ["fonts-dejavu-core"]
+# No WebFetch/WebSearch. The brief must come only from Perigon, so every
+# story has a known source and publish time, and the run is reproducible.
+web_tools = false
+
+[[mount]]
+host = "~/agentbox-news"          # your copy of examples/news-brief (not inside the agentbox repo)
+mode = "rw"                                          # reports/ is written here
+
+[network]
+mode = "strict"
+presets = ["anthropic"]
+# slack.com: Web API. files.slack.com: upload_url host of
+# files.getUploadURLExternal. hooks.slack.com: incoming webhook (text mode).
+# pypi.org + files.pythonhosted.org: fpdf2 for `uv run tools/deliver.py`
+# (the image Python meets requires-python, so no uv Python download).
+allow = ["slack.com", "files.slack.com", "hooks.slack.com",
+         "pypi.org", "files.pythonhosted.org"]
+allow_http = false
+
+[secrets]
+# deliver.py uses the bot token if present (PDF upload), else the webhook
+# (text summary). Store at least one. Missing secrets do not stop `up`;
+# in webhook mode, the warnings for SLACK_BOT_TOKEN/SLACK_TARGET are expected.
+SLACK_BOT_TOKEN = {}             # profile scope, to agent: xoxb-...
+SLACK_WEBHOOK_URL = {}           # profile scope, to agent: https://hooks.slack.com/services/...
+SLACK_TARGET = {}                # PDF mode: C... channel or U... user
+PERIGON_API_KEY = { to = "mcp-gateway" }   # also inferred from bearer below
+
+[mcp.servers.perigon]
+url = "https://mcp.perigon.io/v1/mcp"
+bearer = "PERIGON_API_KEY"
+# tools omitted = all tools. Narrow after the first `agentbox doctor news`.

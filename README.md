@@ -98,6 +98,14 @@ agentbox claude
 
 Read [docs/USAGE.md](docs/USAGE.md) for each step and for all other tasks.
 
+## Example: a scheduled daily news brief
+
+[examples/news-brief](examples/news-brief/README.md) is a complete project
+to learn agentbox with. Each weekday, Claude gets the news through the
+Perigon MCP server, writes a brief, renders it to PDF, and sends it to
+Slack. The guide takes you through secrets, the MCP gateway, the network
+allowlist, headless runs, scheduling, and `agentbox doctor`, step by step.
+
 ## Requirements
 
 - macOS with Docker Desktop, or Linux with Docker Engine and Compose v2.
@@ -128,6 +136,8 @@ Read [docs/USAGE.md](docs/USAGE.md) for each step and for all other tasks.
 - [docs/SECURITY.md](docs/SECURITY.md): threat model and residual risks.
 - [docs/PLAN.md](docs/PLAN.md): design and phase plan.
 - [profiles/example.toml](profiles/example.toml): an example profile.
+- [examples/news-brief](examples/news-brief/README.md): guided example
+  project (MCP server, PDF, Slack, schedule).
 
 ## License
 

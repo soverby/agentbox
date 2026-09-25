@@ -1,0 +1,18 @@
+# Topics for the daily brief. The prompt tells Claude to read this file.
+max_stories = 8
+min_stories = 5
+lookback_hours = 24
+languages = ["en"]
+regions = ["US", "GB", "EU"]
+
+[[section]]
+name = "World"
+query = "world news, geopolitics, conflicts, elections"
+
+[[section]]
+name = "Tech & AI"
+query = "artificial intelligence, technology industry, cybersecurity"
+
+[[section]]
+name = "Business"
+query = "markets, economy, companies, central banks"

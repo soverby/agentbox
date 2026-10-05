@@ -820,3 +820,52 @@ def test_claude_setup_failure_only_warns(monkeypatch, capsys):
     monkeypatch.setattr(boxmod, "exec_in", lambda b, cmd, **k: SimpleNamespace(returncode=5))
     boxmod.claude_setup(_sbox(["claude"]))  # must not raise
     assert "onboarding" in capsys.readouterr().err
+
+
+def test_webhook_secret_is_host_only_in_secret_commands(env, monkeypatch, capsys):
+    """The notify webhook is a shared secret that no profile declares (PLAN §2.4)."""
+    hook = "https://hooks.slack.com/services/T0AAAAAAA/B0BBBBBBB/hookSECRETVALUE0123456789"
+    paths.write_config({
+        "secret_backend": "env", "secret_prefix": "agentbox-test-c",
+        "notify_webhook_secret": "SLACK_WEBHOOK_URL",
+    })  # fmt: skip
+    # ls --shared lists it, missing, as used by the host
+    assert cli.main(["secret", "ls", "--shared"]) == 0
+    row = next(x for x in capsys.readouterr().out.splitlines() if x.startswith("SLACK_WEBHOOK_URL"))
+    assert "missing" in row and "host: notify" in row
+    # a value that is not an https URL is refused and never echoed or stored
+    for bad in ("http://hooks.slack.com/services/x/SECRETTAIL", "not a url", "https://u:p@h/x"):
+        stdin(monkeypatch, bad + "\n")
+        assert cli.main(["secret", "set", "--shared", "SLACK_WEBHOOK_URL", "--stdin"]) == 1
+        out = capsys.readouterr()
+        assert "notification webhook" in out.err and "SECRETTAIL" not in out.out + out.err
+    assert store(env) == {}
+    stdin(monkeypatch, hook + "\n")
+    assert cli.main(["secret", "set", "--shared", "SLACK_WEBHOOK_URL", "--stdin"]) == 0
+    out = capsys.readouterr().out
+    assert "host only" in out and "hookSECRET" not in out
+    assert store(env) == {"AGENTBOX_TEST_C__SHARED_SLACK_WEBHOOK_URL": hook}
+    assert cli.main(["secret", "ls", "--shared"]) == 0
+    row = next(x for x in capsys.readouterr().out.splitlines() if x.startswith("SLACK_WEBHOOK_URL"))
+    assert "present" in row and "hookSECRET" not in row
+    # any other shared name is not checked as a URL
+    stdin(monkeypatch, "plain\n")
+    assert cli.main(["secret", "set", "--shared", "OTHER", "--stdin"]) == 0
+
+
+def test_secret_ls_shared_without_the_setting_is_unchanged(env, capsys):
+    assert cli.main(["secret", "ls", "--shared"]) == 0
+    out = capsys.readouterr().out
+    assert "host: notify" not in out and "SLACK" not in out
+
+
+def test_up_delivery_refuses_a_profile_that_declares_the_webhook(env):
+    paths.write_config({
+        "secret_backend": "env", "secret_prefix": "agentbox-test-c",
+        "notify_webhook_secret": "GH_TOKEN",
+    })  # fmt: skip
+    prof = parse_profile(
+        {"box": {"agents": ["claude"]}, "mount": [{"host": "/w/p"}],
+         "secrets": {"GH_TOKEN": "shared"}}, "p1")  # fmt: skip
+    with pytest.raises(secretstore.SecretError, match="stays on the host"):
+        delivery.collect(prof, paths.load_config(), None)

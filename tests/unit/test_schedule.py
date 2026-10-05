@@ -936,3 +936,403 @@ def test_preflight_command_job_keeps_mount_check(roots, cmd_env):
     code.mkdir()
     msg, w = cli.sched_preflight("p1", None, None, (str(code),))
     assert msg and "overlaps" in msg and w == []
+
+
+# ---------------------------------------------------------------- notifications (PLAN §2.7)
+HOOK = "https://hooks.slack.com/services/T0AAAAAAA/B0BBBBBBB/hookSECRETVALUE0123456789"
+
+
+@pytest.fixture
+def posts(roots, monkeypatch):
+    """Notifications on (shared secret in the env-backend store); notify.post
+    records (url, text) instead of using the network. Returns the list."""
+    from agentbox import notify
+
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    (roots / "cfg").mkdir(exist_ok=True)
+    (roots / "cfg" / "config.toml").write_text(
+        'secret_backend = "env"\nnotify_webhook_secret = "SLACK_WEBHOOK_URL"\n'
+    )
+    store = roots / "store.json"
+    store.write_text(json.dumps({"AGENTBOX__SHARED_SLACK_WEBHOOK_URL": HOOK}))
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(notify, "post", lambda url, text, timeout: calls.append((url, text)))
+    return calls
+
+
+def transcript_run(roots, text, name="rd", **meta):
+    rd = roots / name
+    rd.mkdir(exist_ok=True)
+    (rd / "transcript.log").write_text(text)
+    if meta:
+        (rd / "meta.json").write_text(json.dumps(meta))
+    return rd
+
+
+def last_of(job):
+    return json.loads((Path(job["dir"]) / "last.json").read_text())
+
+
+def hist_of(job):
+    lines = (Path(job["dir"]) / "history.jsonl").read_text().splitlines()
+    return [json.loads(x) for x in lines]
+
+
+def test_notify_ok_posts_once_with_the_last_transcript_line(roots, posts):
+    job = make_job(roots, schedule.Spec(every=60), name="eurusd", profile="fx")
+    rd = transcript_run(roots, "fetching\n== check: ECB date 2026-10-05\n\n")
+    assert schedule.fire("fx", "eurusd", lambda *a: (0, rd), ok_preflight) == 0
+    assert posts == [(HOOK, "agentbox fx/eurusd: ok (exit 0, 0s) — == check: ECB date 2026-10-05")]
+    assert last_of(job)["notify"] == "ok" and hist_of(job)[-1]["notify"] == "ok"
+
+
+def test_notify_nonzero_exit(roots, posts):
+    make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "boom: bad thing\n")
+    assert schedule.fire("p1", "daily", lambda *a: (3, rd), ok_preflight) == 3
+    assert posts == [(HOOK, "agentbox p1/daily: FAILED (exit 3, 0s) — boom: bad thing")]
+
+
+def test_notify_timeout_skips_the_kill_marker(roots, posts):
+    job = make_job(roots, schedule.Spec(every=60), name="household", profile="cves")
+    f = Path(job["dir"]) / "job.json"
+    f.write_text(json.dumps({**job, "timeout": 3600}))
+    rd = transcript_run(
+        roots,
+        "scanning 40/90\n[agentbox: run killed: timeout after 3600 s]\n",
+        killed="timeout after 3600 s",
+    )
+    assert schedule.fire("cves", "household", lambda *a: (124, rd), ok_preflight) == 124
+    assert posts == [
+        (HOOK, "agentbox cves/household: TIMEOUT after 1h (exit 124) — scanning 40/90")
+    ]
+
+
+def test_notify_terminated_two_paths(roots, posts, monkeypatch):
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "working\n[agentbox: run killed: terminated by signal 15]\n")
+
+    def runner(*a):
+        raise cli.RunFailed("terminated by signal 15", rd, schedule.RC_TERMINATED)
+
+    assert schedule.fire("p1", "daily", runner, ok_preflight) == 143
+    assert posts[-1][1] == "agentbox p1/daily: TERMINATED (exit 143, 0s) — working"
+    assert len(posts) == 1
+
+    def during_wait(*a):
+        raise schedule.Terminated(15)
+
+    posts.clear()
+    monkeypatch.setattr(schedule, "ensure_docker", during_wait)
+    assert schedule.fire("p1", "daily", runner, ok_preflight) == 143
+    assert [t for _, t in posts] == [
+        "agentbox p1/daily: TERMINATED (exit 143, 0s) — terminated by signal 15"
+    ]
+    assert [h["notify"] for h in hist_of(job)] == ["ok", "ok"]
+
+
+def test_notify_run_failed_to_start(roots, posts):
+    make_job(roots, schedule.Spec(every=60))
+
+    def runner(*a):
+        raise cli.RunFailed("box start failed: no space", None)
+
+    assert schedule.fire("p1", "daily", runner, ok_preflight) == 125
+    assert posts == [
+        (
+            HOOK,
+            "agentbox p1/daily: RUN FAILED (exit 125, 0s) — run failed: box start failed: no space",
+        )
+    ]
+
+
+def test_notify_docker_down(roots, posts, monkeypatch):
+    fake_bin(roots / "bin2", "docker", "exit 1\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin2'}:/usr/bin:/bin")
+    monkeypatch.setattr(schedule, "is_macos", lambda: False)
+    make_job(roots, schedule.Spec(every=60), name="household", profile="cves")
+
+    def runner(*a):
+        raise AssertionError("must not run")
+
+    rc = schedule.fire("cves", "household", runner, ok_preflight, wait=120, poll=0.1)
+    assert rc == schedule.RC_DOCKER_DOWN
+    assert posts == [
+        (
+            HOOK,
+            "agentbox cves/household: did not run (exit 69, 0s) — "
+            "Docker did not come up within 120 s",
+        )
+    ]
+
+
+def test_notify_preflight_failure(roots, posts):
+    make_job(roots, schedule.Spec(every=60))
+    fix = "CLAUDE_CODE_OAUTH_TOKEN is missing: run `agentbox setup`"
+    rc = schedule.fire("p1", "daily", lambda *a: 1 / 0, lambda p, a, m, c: (fix, []))
+    assert rc == schedule.RC_PREFLIGHT
+    assert posts == [(HOOK, f"agentbox p1/daily: did not run (exit 78, 0s) — {fix}")]
+
+
+def test_notify_skipped_when_the_job_still_runs(roots, posts):
+    import fcntl
+
+    job = make_job(roots, schedule.Spec(every=60))
+    with (Path(job["dir"]) / "fire.lock").open("a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert schedule.fire("p1", "daily", lambda *a: 1 / 0, ok_preflight) == schedule.RC_SKIPPED
+    assert posts == [
+        (HOOK, "agentbox p1/daily: SKIPPED (exit 75) — another run of this job is still active")
+    ]
+    assert hist_of(job)[-1]["notify"] == "ok"
+    assert json.loads((Path(job["dir"]) / "skipped.json").read_text())["notify"] == "ok"
+    assert not (Path(job["dir"]) / "last.json").exists()  # a skip never owned last.json
+
+
+def test_notify_cmd_job_and_legacy_job(roots, posts):
+    make_job(roots, schedule.Spec(every=60), kind="cmd")
+    rd = transcript_run(roots, "script done\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    assert posts == [(HOOK, "agentbox p1/daily: ok (exit 0, 0s) — script done")]
+    # job.json from before command jobs: no `kind`
+    posts.clear()
+    job = make_job(roots, schedule.Spec(every=60), name="old")
+    assert "kind" not in json.loads((Path(job["dir"]) / "job.json").read_text())
+    assert schedule.fire("p1", "old", lambda *a: (0, rd), ok_preflight) == 0
+    assert posts == [(HOOK, "agentbox p1/old: ok (exit 0, 0s) — script done")]
+
+
+def test_notify_text_from_the_box_is_neutralised(roots, posts):
+    make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "<!channel> <http://evil.example|ok> \x1b[2J& " + "z" * 400 + "\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    text = posts[0][1]
+    assert "<" not in text and ">" not in text and "\x1b" not in text
+    assert text.startswith("agentbox p1/daily: ok (exit 0, 0s) — &lt;!channel&gt; &lt;http://evil")
+    assert text.endswith("…") and len(text.split(" — ", 1)[1]) < 400
+
+
+def all_text_under(root: Path) -> str:
+    out = []
+    for f in root.rglob("*"):
+        if f.is_file() and f.name != "store.json" and f.name != "config.toml":
+            out.append(f.read_bytes().decode("utf-8", "replace"))
+    return "\n".join(out)
+
+
+@pytest.mark.parametrize("how", ["raises", "http500", "no-secret", "backend", "hung"])
+@pytest.mark.parametrize("rc", [0, 3])
+def test_notify_failure_never_changes_the_fire(roots, posts, monkeypatch, capsys, how, rc):
+    from agentbox import notify, secretstore
+
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "all good\n")
+    if how == "raises":
+
+        def boom(url, text, timeout):
+            raise OSError(f"cannot reach {url}")
+
+        monkeypatch.setattr(notify, "post", boom)
+    elif how == "http500":
+
+        def boom(url, text, timeout):
+            raise notify.NotifyError("HTTP 500")
+
+        monkeypatch.setattr(notify, "post", boom)
+    elif how == "no-secret":
+        (roots / "store.json").write_text("{}")
+    elif how == "backend":
+
+        def locked(cfg, profile):
+            raise secretstore.SecretError("keychain read of x failed: locked")
+
+        monkeypatch.setattr(notify, "read_webhook", locked)
+    else:
+        monkeypatch.setattr(notify, "NOTIFY_TIMEOUT", 0.2)
+        monkeypatch.setattr(notify, "post", lambda *a: time.sleep(5))
+    assert schedule.fire("p1", "daily", lambda *a: (rc, rd), ok_preflight) == rc
+    last = last_of(job)
+    assert last["exit_code"] == rc and last["status"] == ("ok" if rc == 0 else "failed")
+    assert last["notify"].startswith("error: ") and hist_of(job)[-1]["notify"] == last["notify"]
+    err = capsys.readouterr().err
+    assert f"schedule p1/daily: notify: {last['notify']}" in err
+    for text in (all_text_under(roots), err, json.dumps(last)):
+        assert HOOK not in text and "hookSECRET" not in text and "T0AAAAAAA" not in text
+
+
+def test_notify_success_leaves_no_secret_on_disk_or_in_logs(roots, posts, capsys):
+    make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "ok\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    assert posts and "hookSECRET" not in all_text_under(roots) + capsys.readouterr().err
+
+
+def test_notify_unset_changes_nothing(roots, monkeypatch):
+    """Setting absent: no HTTP, no secret read, and the records have no notify field."""
+    from agentbox import notify
+
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    for name in ("post", "read_webhook"):
+        monkeypatch.setattr(notify, name, lambda *a, **k: 1 / 0)
+    monkeypatch.setattr("urllib.request.build_opener", lambda *a: 1 / 0)
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+    for _ in range(2):  # no config.toml, then one without the key
+        assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+        (roots / "cfg").mkdir(exist_ok=True)
+        (roots / "cfg" / "config.toml").write_text('secret_backend = "env"\n')
+    assert sorted(last_of(job)) == [
+        "agent", "end", "exit_code", "kind", "message", "name", "profile", "run_dir", "start",
+        "status", "transcript", "warnings",
+    ]  # fmt: skip
+    assert all("notify" not in h for h in hist_of(job))
+
+
+def test_ls_shows_a_failed_notification_as_a_warning(roots, cli_env, posts, monkeypatch, capsys):
+    from agentbox import notify
+
+    monkeypatch.setattr(
+        notify, "post", lambda *a: (_ for _ in ()).throw(notify.NotifyError("HTTP 404"))
+    )
+    (roots / "cfg" / "config.toml").write_text(
+        'secret_backend = "env"\nsecret_prefix = "agentbox"\n'
+        'notify_webhook_secret = "SLACK_WEBHOOK_URL"\n'
+    )
+    make_job(roots, schedule.Spec(every=60))
+    assert schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight) == 0
+    capsys.readouterr()
+    assert cli.main(["schedule", "ls", "p1"]) == 0
+    out = capsys.readouterr().out
+    assert "  warning: notification failed: HTTP 404" in out
+    # a good notification shows nothing
+    monkeypatch.setattr(notify, "post", lambda *a: None)
+    assert schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight) == 0
+    capsys.readouterr()
+    assert cli.main(["schedule", "ls", "p1"]) == 0
+    assert "notification" not in capsys.readouterr().out
+
+
+def test_notify_script_exit_codes_are_not_agentbox_outcomes(roots, posts):
+    """A command script that exits 124, 125 or 143 itself is FAILED: the CLI did not
+    kill it (no meta `killed`), and the runner did not raise."""
+    make_job(roots, schedule.Spec(every=60), kind="cmd")
+    rd = transcript_run(roots, "the script quit\n", killed=None)
+    for rc in (124, 125, 143):
+        posts.clear()
+        assert schedule.fire("p1", "daily", lambda *a, rc=rc: (rc, rd), ok_preflight) == rc
+        assert posts == [(HOOK, f"agentbox p1/daily: FAILED (exit {rc}, 0s) — the script quit")]
+
+
+def test_notify_runner_exception_is_run_failed_and_signal_is_terminated(roots, posts):
+    make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "log\n")
+
+    def start_fail(*a):
+        raise cli.RunFailed("boom", rd)  # rc None -> 125
+
+    assert schedule.fire("p1", "daily", start_fail, ok_preflight) == 125
+    assert posts[-1][1].startswith("agentbox p1/daily: RUN FAILED (exit 125, 0s)")
+
+    def sigterm(*a):
+        raise cli.RunFailed("terminated by signal 15", rd, schedule.RC_TERMINATED)
+
+    assert schedule.fire("p1", "daily", sigterm, ok_preflight) == 143
+    assert posts[-1][1].startswith("agentbox p1/daily: TERMINATED (exit 143, 0s)")
+
+
+def test_notify_fallback_text_survives_a_stopped_note(roots, posts):
+    """Regression: `stopped` from meta.json must not replace the real error text."""
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "", stopped="killed leftover processes (sleep 99)")
+
+    def runner(*a):
+        raise cli.RunFailed("box start failed: no space", rd)
+
+    assert schedule.fire("p1", "daily", runner, ok_preflight) == 125
+    assert posts == [
+        (
+            HOOK,
+            "agentbox p1/daily: RUN FAILED (exit 125, 0s) — run failed: box start failed: no space",
+        )
+    ]
+    assert last_of(job)["stopped"] == "stopped: killed leftover processes (sleep 99)"
+    # terminated arm, empty transcript
+    posts.clear()
+
+    rd2 = transcript_run(roots, "", name="rd2", stopped="killed leftover processes (x)")
+    e = schedule.Terminated(15)
+    e.run_dir = rd2
+
+    def runner2(*a):
+        raise e
+
+    assert schedule.fire("p1", "daily", runner2, ok_preflight) == 143
+    assert posts[-1][1].endswith("— terminated by signal 15")
+
+
+def test_final_outcome_is_on_disk_before_the_post(roots, posts, monkeypatch):
+    """A kill during the post must leave the true status, not `running`."""
+    from agentbox import notify
+
+    job = make_job(roots, schedule.Spec(every=60))
+    jd = Path(job["dir"])
+    rd = transcript_run(roots, "done\n")
+    seen = {}
+
+    def post(url, text, timeout):
+        seen["last"] = last_of(job)
+        seen["hist"] = (jd / "history.jsonl").exists()
+
+    monkeypatch.setattr(notify, "post", post)
+    assert schedule.fire("p1", "daily", lambda *a: (3, rd), ok_preflight) == 3
+    during = seen["last"]
+    assert during["status"] == "failed" and during["exit_code"] == 3
+    assert during["end"] and during["run_dir"] == str(rd) and during["transcript"]
+    assert during["warnings"] == [] and "pid" not in during and "notify" not in during
+    assert seen["hist"] is False  # the history line is appended once, after the post
+    final = last_of(job)
+    assert final == {**during, "notify": "ok"}
+    assert hist_of(job) == [final]
+
+
+def test_skip_outcome_is_on_disk_before_the_post(roots, posts, monkeypatch):
+    import fcntl
+
+    from agentbox import notify
+
+    job = make_job(roots, schedule.Spec(every=60))
+    jd = Path(job["dir"])
+    seen = {}
+
+    def post(url, text, timeout):
+        seen["skipped"] = json.loads((jd / "skipped.json").read_text())
+        seen["hist"] = (jd / "history.jsonl").exists()
+
+    monkeypatch.setattr(notify, "post", post)
+    with (jd / "fire.lock").open("a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert schedule.fire("p1", "daily", lambda *a: 1 / 0, ok_preflight) == schedule.RC_SKIPPED
+    assert seen["skipped"]["status"] == "skipped" and "notify" not in seen["skipped"]
+    assert seen["hist"] is False
+    assert json.loads((jd / "skipped.json").read_text())["notify"] == "ok"
+    assert [h["notify"] for h in hist_of(job)] == ["ok"]
+
+
+def test_unset_writes_each_file_once(roots, monkeypatch):
+    """Setting absent: one last.json write, one history line, as before."""
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    job = make_job(roots, schedule.Spec(every=60))
+    writes = []
+    real = schedule.write_private
+
+    def spy(f, data, mode=0o600):
+        writes.append(Path(f).name)
+        real(f, data, mode)
+
+    monkeypatch.setattr(schedule, "write_private", spy)
+    assert schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight) == 0
+    assert writes == ["last.json", "last.json"]  # "running" marker, then the final record
+    assert len(hist_of(job)) == 1

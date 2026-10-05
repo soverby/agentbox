@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .network import DEFAULT_BASE, NetworkError, parse_base
+from .profile import CLAUDE_TOKEN, secret_name_problem
 
 
 class ConfigError(Exception):
@@ -65,7 +66,8 @@ def state_dir(name: str, create: bool = True) -> Path:
 BACKENDS = ("keychain", "op", "env")
 PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 OP_VAULT_RE = re.compile(r"[^/\s\"\\]+")
-CONFIG_KEYS = ("subnet_base", "secret_backend", "secret_prefix", "op_vault", "runs_keep")
+CONFIG_KEYS = ("subnet_base", "secret_backend", "secret_prefix", "op_vault", "runs_keep",
+               "notify_webhook_secret")  # fmt: skip
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,9 @@ class Config:
     secret_prefix: str = "agentbox"
     op_vault: str | None = None  # needed when secret_backend = "op"
     runs_keep: int = 200  # headless run dirs kept per profile (oldest pruned)
+    # NAME of the shared secret that holds the Slack webhook URL for scheduled-run
+    # notifications (PLAN §2.7). None = no notifications. Host-only: never delivered.
+    notify_webhook_secret: str | None = None
 
 
 def config_file() -> Path:
@@ -119,8 +124,13 @@ def load_config() -> Config:
     keep = data.get("runs_keep", "200")
     if not keep.isdigit() or int(keep) < 1:
         raise ConfigError(f'{f}: runs_keep must be a whole number >= 1, as a string ("200")')
+    notify = data.get("notify_webhook_secret")
+    if notify is not None and (msg := secret_name_problem(notify)):
+        raise ConfigError(f"{f}: notify_webhook_secret: {msg}")
+    if notify == CLAUDE_TOKEN:  # the other owned names are reserved, so refused above
+        raise ConfigError(f"{f}: notify_webhook_secret cannot be {CLAUDE_TOKEN} (agentbox owns it)")
     return Config(subnet_base=base, secret_backend=backend, secret_prefix=prefix, op_vault=vault,
-                  runs_keep=int(keep))  # fmt: skip
+                  runs_keep=int(keep), notify_webhook_secret=notify)  # fmt: skip
 
 
 def write_config(values: dict[str, str]) -> Path:

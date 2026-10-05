@@ -116,6 +116,22 @@ def rotate_box_tokens(state: Path) -> None:
         _write_private(state / TOKENS_FILE, json.dumps(_new_tokens()).encode())
 
 
+def item_key(ref: str) -> str:
+    """Identity of the store item behind a ref: `keychain:` and the internal
+    `agentbox-keychain:` form compare by service name; `op://` ignores case."""
+    for prefix in (secretstore.OWNED, "keychain:"):
+        if ref.startswith(prefix):
+            return "keychain:" + ref[len(prefix) :]
+    return ref.lower() if ref.startswith("op://") else ref
+
+
+def webhook_item(cfg: Config) -> str | None:
+    """item_key of the notification webhook (PLAN §2.7), None when unset."""
+    if cfg.notify_webhook_secret is None:
+        return None
+    return item_key(secretstore.default_ref(cfg, "_shared", cfg.notify_webhook_secret))
+
+
 def collect(
     profile: Profile,
     cfg: Config,
@@ -128,7 +144,16 @@ def collect(
     services = set(TARGET_SERVICES) if services is None else services
     fetch = fetch or secretstore.fetcher(cfg, profile.name)
     d = Delivery()
+    hook = webhook_item(cfg)
     for s in profile.secrets.values():
+        if hook is not None and item_key(secretstore.ref_for(s, profile.name, cfg)) == hook:
+            # Host-only (PLAN §2.4): the webhook URL must never reach a box.
+            raise secretstore.SecretError(
+                f"{s.name} points at the notification webhook (notify_webhook_secret = "
+                f"{cfg.notify_webhook_secret!r} in config.toml), which stays on the host and "
+                "cannot go into a box. Store the box's own value as a profile-scope secret "
+                f"(`{s.name} = {{}}`) or use another name"
+            )
         d.targets[s.name] = list(s.to)
         if not services & set(s.to):
             continue

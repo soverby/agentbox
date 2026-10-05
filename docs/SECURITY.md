@@ -297,6 +297,43 @@ Enforced in: `cli/agentbox/compose.py` (services, networks, fixed IPs),
 - Proved by: doctor 12 (runs only when another profile is running; else
   SKIP).
 
+### Scheduled-run notifications (host side)
+
+- Not a box property. When `notify_webhook_secret` is set in `config.toml`,
+  the host makes one outbound HTTPS request at the end of each scheduled
+  fire, to the host of the configured Slack webhook URL. Without the
+  setting, there is no request. The request uses the host network, not the
+  box network: no allowlist changes, and no box can send it.
+- The webhook URL is a shared-scope secret that has no container target. The
+  CLI reads it on the host at fire time. It does not write it to a generated
+  file, log, `job.json`, `last.json`, history, or argv. Error text is
+  scrubbed of it (`secretstore.scrub`).
+- Delivery refuses to put it into a box: `delivery.collect` stops when any
+  profile secret, whatever its name, scope, or `to`, resolves to the same
+  store item as the webhook (`keychain:` and `agentbox-keychain:` compare by
+  service name; `env:` refs compare as written; `op://` refs compare without
+  case). A profile-scope secret with the same name is a different item and
+  stays allowed. `notify_webhook_secret` cannot name
+  `CLAUDE_CODE_OAUTH_TOKEN` or a reserved name. The check compares refs, not
+  values. Residuals: a copy of the same URL that the owner stores under a
+  different item and declares in a profile; and an `op://` ref that names
+  the same item in a different way (by ID, or with query parameters).
+- The request is https only. It follows no redirect: a 3xx answer is an
+  error. A failure never changes the fire's exit code. A missing or damaged
+  `job.json` stops the fire before any result exists, so it posts nothing.
+- What the agent can influence: the last non-empty line of its run
+  transcript. The CLI strips control characters, collapses white space, caps
+  it at 300 characters, and escapes `&`, `<`, `>`. The text cannot make a
+  mention or link markup. It is still text that the agent chose, shown in a
+  channel that people read (residual risk 22). No other transcript text is
+  sent.
+- Enforced in: `cli/agentbox/notify.py`, `cli/agentbox/schedule.py`
+  (`fire`), `cli/agentbox/delivery.py` (`collect`), `cli/agentbox/paths.py`.
+- Proved by: unit tests (`tests/unit/test_notify.py`, `test_schedule.py`,
+  `test_secret_cli.py`). There is no doctor check: doctor tests the box, and
+  this property is host code. Doctor 11 shows that the agent holds only its
+  own declared secrets.
+
 ### Doctor on every session
 
 Each `up` and each session start runs checks 1, 2, 6, and 9. If one fails,
@@ -392,6 +429,17 @@ agentbox does not solve these risks. It documents them.
 21. **`agentbox denied` offers names that the agent chose.** An agent can
     request a lookalike or attacker-owned domain so that you allow it. Allow
     only names that you know.
+22. **Scheduled-run notifications show agent text.** With
+    `notify_webhook_secret` set, the last line of each run's transcript goes
+    to your Slack channel, as capped and escaped plain text. A prompt-injected
+    agent can write a misleading status line, for example a false "ok". Slack
+    can turn a plain URL in that text into a link. agentbox does not give
+    the webhook URL to a box (delivery refuses it), unless you store a copy
+    of the URL under another item and declare that in a profile. Read the
+    transcript, not only the Slack line, for a job that matters.
+23. **A copy of the webhook URL under another item.** Delivery compares store
+    items, not values. If you store the same URL twice and declare the copy
+    in a profile, the box gets it, and the box can post to your channel.
 
 ## Supply chain
 

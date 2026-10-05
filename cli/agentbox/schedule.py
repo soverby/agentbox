@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import paths
+from . import notify, paths
 
 EXPAND_CAP = 500
 DEFAULT_TIMEOUT = 7200
@@ -64,6 +64,7 @@ RC_PREFLIGHT = 78
 RC_SKIPPED = 75  # EX_TEMPFAIL
 RC_TERMINATED = 143
 SKIP_MSG = "skipped: a run is active"
+SKIP_NOTE = "another run of this job is still active"
 
 
 class Terminated(Exception):
@@ -641,13 +642,14 @@ def skip_summary(jd: Path) -> str | None:
     return f"skipped {n} since {first}" if n else None
 
 
-def record(jd: Path, rec: dict, last: bool = True) -> None:
-    rotate(jd / "history.jsonl")
+def record(jd: Path, rec: dict, last: bool = True, history: bool = True) -> None:
     if last:
         write_private(jd / "last.json", (json.dumps(rec, indent=1, sort_keys=True) + "\n").encode())
-    with (jd / "history.jsonl").open("a") as h:
-        h.write(json.dumps(rec, sort_keys=True) + "\n")
-    os.chmod(jd / "history.jsonl", 0o600)
+    if history:
+        rotate(jd / "history.jsonl")
+        with (jd / "history.jsonl").open("a") as h:
+            h.write(json.dumps(rec, sort_keys=True) + "\n")
+        os.chmod(jd / "history.jsonl", 0o600)
 
 
 def docker_up() -> bool:
@@ -707,6 +709,17 @@ def stopped_note(rd) -> str | None:
     return run_meta(rd, "stopped")
 
 
+def notify_record(rec: dict, profile: str, name: str, rc: int, **kw) -> None:
+    """End-of-fire notice (PLAN §2.7). Sets rec["notify"] and logs a failure.
+    Notifications off: rec is not touched. Never raises, never changes rc."""
+    result = notify.notify_fire(profile, name, rc=rc, **kw)
+    if result is None:
+        return
+    rec["notify"] = result
+    if result != "ok":
+        log(profile, name, f"notify: {result}")
+
+
 def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
          poll: float = DOCKER_POLL) -> int:  # fmt: skip
     """One scheduled run. runner(profile, agent, prompt_path, model, timeout) ->
@@ -722,6 +735,7 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
     kind = job_kind(job)
     agent = job["agent"] if kind == "agent" else None
     base = {"profile": profile, "name": name, "kind": kind, "agent": agent, "start": now_iso()}
+    t0 = time.monotonic()
     with (jd / "fire.lock").open("a") as lk:
         try:
             fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -729,13 +743,19 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
             log(profile, name, SKIP_MSG)
             skip = {**base, "status": "skipped", "end": now_iso(), "exit_code": RC_SKIPPED,
                     "message": SKIP_MSG}  # fmt: skip
+            skipped = jd / "skipped.json"
+            if notify.wanted():  # the true outcome is on disk before the post
+                write_private(skipped, (json.dumps(skip, indent=1) + "\n").encode())
+                notify_record(skip, profile, name, RC_SKIPPED, outcome="skipped", seconds=0,
+                              timeout=None, transcript=None, note=SKIP_NOTE)  # fmt: skip
             record(jd, skip, last=False)
-            write_private(jd / "skipped.json", (json.dumps(skip, indent=1) + "\n").encode())
+            write_private(skipped, (json.dumps(skip, indent=1) + "\n").encode())
             return RC_SKIPPED
         rec = {**base, "status": "running", "end": None, "exit_code": None, "run_dir": None,
                "transcript": None, "message": None, "warnings": [], "pid": os.getpid()}  # fmt: skip
         write_private(jd / "last.json", (json.dumps(rec, indent=1, sort_keys=True) + "\n").encode())
-        rc, rd, msg, status = RC_PREFLIGHT, None, None, None
+        rc, rd, msg, status, note = RC_PREFLIGHT, None, None, None, None
+        outcome = "not_run"  # what notify says; see notify.status_head
         try:
             if not ensure_docker(profile, name, wait, poll):
                 rc = RC_DOCKER_DOWN
@@ -743,6 +763,7 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
                     f"Docker did not come up within {wait:.0f} s; the job did not run. Start "
                     f"Docker Desktop, then run `agentbox schedule run-now {profile} {name}`"
                 )
+                note = f"Docker did not come up within {wait:.0f} s"
                 log(profile, name, msg)
             else:
                 msg, rec["warnings"] = preflight(profile, agent, job.get("model"),
@@ -750,23 +771,31 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
                 for w in rec["warnings"]:
                     log(profile, name, f"warning: {w}")
                 if msg is not None:
+                    note = msg
                     log(profile, name, msg)
                 else:
                     tmo = job.get("timeout", DEFAULT_TIMEOUT)
                     prompt = str(jd / job_file(kind))
                     rc, rd = runner(profile, agent, prompt, job.get("model"), tmo)
                     log(profile, name, f"run {rd} exit {rc}")
+                    # 124 is a timeout only when the CLI killed the run (a script may exit 124)
+                    killed = run_meta(rd, "killed") or ""
+                    outcome = "failed"
+                    if rc == 0:
+                        outcome = "ok"
+                    elif rc == 124 and killed.startswith("timeout"):
+                        outcome = "timeout"
                     if why := left_up(rd):
                         rec["left_up"] = f"left up: {why}"
-                    if note := stopped_note(rd):
-                        rec["stopped"] = f"stopped: {note}"
+                    if stop := stopped_note(rd):
+                        rec["stopped"] = f"stopped: {stop}"
                     if hc := host_changes(rd):
                         rec["host_config_changes"] = hc
         except Terminated as e:
-            rc, status, msg = RC_TERMINATED, "terminated", str(e)
+            rc, status, msg, outcome = RC_TERMINATED, "terminated", str(e), "terminated"
             rd = getattr(e, "run_dir", None) or rd
-            if note := stopped_note(rd):
-                rec["stopped"] = f"stopped: {note}"
+            if stop := stopped_note(rd):
+                rec["stopped"] = f"stopped: {stop}"
             if hc := host_changes(rd):
                 rec["host_config_changes"] = hc
             log(profile, name, msg)
@@ -775,16 +804,18 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
             rd = getattr(e, "run_dir", None)
             if why := left_up(rd):
                 rec["left_up"] = f"left up: {why}"
-            if note := stopped_note(rd):
-                rec["stopped"] = f"stopped: {note}"
+            if stop := stopped_note(rd):
+                rec["stopped"] = f"stopped: {stop}"
             if hc := host_changes(rd):
                 rec["host_config_changes"] = hc
             rc = getattr(e, "rc", None) or 125
+            outcome = "start_failed"
             if rc == RC_TERMINATED:
-                status = "terminated"
+                status, outcome = "terminated", "terminated"
             log(profile, name, msg)
+        limit = job.get("timeout", DEFAULT_TIMEOUT)
         if rc == 124 and msg is None:
-            msg = f"killed after the timeout ({fmt_every(job.get('timeout', DEFAULT_TIMEOUT))})"
+            msg = f"killed after the timeout ({fmt_every(limit)})"
         rec.update(
             status=status or ("ok" if rc == 0 else "failed"),
             end=now_iso(),
@@ -794,5 +825,12 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
             message=msg,
         )
         rec.pop("pid", None)
+        if notify.wanted():
+            record(jd, rec, history=False)  # the true outcome is on disk before the post
+            notify_record(rec, profile, name, rc, outcome=outcome,
+                          seconds=time.monotonic() - t0,
+                          timeout=fmt_every(limit) if limit else None,
+                          transcript=Path(rd) / "transcript.log" if rd else None,
+                          note=note or msg)  # fmt: skip
         record(jd, rec)
         return rc

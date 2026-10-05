@@ -35,6 +35,7 @@ from . import (
     mcpoauth,
     mountstate,
     network,
+    notify,
     paths,
     presets,
     schedule,
@@ -628,8 +629,13 @@ def read_value(prompt: str, from_stdin: bool) -> str:
 def cmd_secret_set(args) -> int:
     t = secret_target(args.shared, args.first, args.second)
     value = read_value(f"{t.name} (input hidden): ", args.stdin)
+    host_only = args.shared and t.name == paths.load_config().notify_webhook_secret
+    if host_only and (msg := notify.webhook_problem(value)):
+        raise CliError(f"{t.name} is the notification webhook: {msg}")
     secretstore.set(t.ref, value)
     print(f"{t.name}: stored ({t.where}, {t.ref})")
+    if host_only:
+        print(f"{t.name}: host only (schedule notifications); no box gets it")
     return 0
 
 
@@ -679,6 +685,8 @@ def cmd_secret_ls(args) -> int:
             for s in prof.secrets.values():
                 if s.scope == "shared":
                     users.setdefault(s.name, []).append(n)
+        if cfg.notify_webhook_secret:  # host-only: no profile declares it (PLAN §2.4)
+            users.setdefault(cfg.notify_webhook_secret, []).insert(0, "host: notify")
         print(f"{'NAME':<32} {'STATUS':<8} USED BY")
         for name in sorted(users):
             ref = secretstore.default_ref(cfg, "_shared", name)
@@ -1089,6 +1097,9 @@ def cmd_schedule_ls(args) -> int:
             lines.append(f"  WARNING host config changed: {c}")
         for w in last.get("warnings") or []:
             lines.append(f"  warning: {w}")
+        if str(last.get("notify", "")).startswith("error"):
+            why = last["notify"].removeprefix("error: ")
+            lines.append(f"  warning: notification failed: {why}")
         if sk := schedule.skip_summary(jd):
             lines.append(f"  {sk}")
         print(term.clean("\n".join(lines), multiline=True))
@@ -1124,6 +1135,8 @@ def cmd_schedule_run_now(args) -> int:
     print(term.clean(f"exit {rc}; transcript: {last.get('transcript') or '-'}"))
     if last.get("message"):
         print(term.clean(f"message: {last['message']}"))
+    if last.get("notify"):
+        print(term.clean(f"notify: {last['notify']}"))
     return rc
 
 

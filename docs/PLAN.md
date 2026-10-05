@@ -98,6 +98,10 @@ the agent container, and it can send any request to any sidecar it can reach.
   `npx` packages are pinned only as far as the profile pins them.
 - A mounted repo can declare stdio MCP servers for Codex or Pi. They are only
   in-box code. Claude Code loads only the root-owned `managed-mcp.json`.
+- The scheduled-run notification (§2.7) posts one line of box output (the
+  last transcript line) to the user's Slack webhook. The agent controls the
+  text: it is capped, stripped of control characters, and escaped, so it
+  cannot inject Slack mentions or links markup. It is shown as plain text.
 
 ## 2. Architecture
 
@@ -416,6 +420,26 @@ Mount validation (T1):
   credentials that are the same in every box anyway (the Claude token) or
   that the user chooses to share (a GitHub PAT). A profile-scoped secret is
   still the recommendation for sensitive work.
+- Host-only secret: the notification webhook (§2.7). Its name is the host
+  setting `notify_webhook_secret` (shared scope, stored with `secret set
+  --shared NAME`). The name must not be `CLAUDE_CODE_OAUTH_TOKEN` or any
+  other name that agentbox owns or reserves (`load_config` refuses it). The
+  secret has no container target: the CLI reads it on the host at fire time
+  and delivers it to no service. Delivery enforces this: `collect` refuses
+  any profile secret, whatever its name, scope, or target, whose resolved
+  ref is the same store item as the webhook (`keychain:` and
+  `agentbox-keychain:` compared by service name; `env:` refs compared as
+  written; `op://` refs compared without case). The error names the fix:
+  store the box's own value under a profile-scope secret or another name. A
+  profile-scope secret with the same name is a different item and stays
+  valid. The check compares refs, not values. Residuals: a copy of the same
+  URL that the owner stores under a different item and then declares in a
+  profile; and an `op://` ref that names the same item in a different way
+  (by ID, or with query parameters). `secret ls
+  --shared` lists the webhook with `host: notify` as its user. Error text is
+  scrubbed of the value (this section, Keychain bullet), and the value is
+  never in argv, a generated file, a log, `job.json`, `last.json`, or
+  history.
 - Targets: a secret's targets are its explicit `to` (a name or a list) plus
   the inferred ones: named by `[models.remote.*].key` → `router`; by
   `[mcp.servers.*].bearer` → `mcp-gateway`; no explicit `to` and no
@@ -655,6 +679,46 @@ third-party router.
   124). An overlapping fire is skipped (rc 75) and counted in `ls`.
   SIGTERM (launchd bootout, logout) runs cleanup and records the result.
   Transcripts are capped (50 MB, truncation marker); job logs rotate.
+- Notifications (host setting `notify_webhook_secret` in
+  `~/.config/agentbox/config.toml`; unset = off, no warning). Its value is
+  the NAME of a shared-scope secret (§2.4) that holds an `https://` Slack
+  incoming-webhook URL. At the end of every fire, `fire` POSTs
+  `{"text": "<message>"}` from the host (urllib, 10 s limit in total, https
+  only, no redirect followed: a 3xx answer is an error). The post covers
+  every terminal outcome that `fire` produces after it has read `job.json`:
+  ok, non-zero exit, timeout (124), terminated (143), failed to start
+  (125), Docker down (69), preflight failure (78), and skipped (75). A
+  missing or damaged `job.json` (or an unknown `kind`) stops `fire` before
+  any outcome exists: it posts nothing. The post applies to agent jobs and
+  command jobs alike. There is no per-job opt-out, and manual `agentbox run`
+  does not notify. The host posts, not the box: a killed or never-started
+  run cannot report on itself, and no box needs `hooks.slack.com` on its
+  allowlist for notifications. The webhook secret is host-only (§2.4). The
+  host makes one outbound HTTPS request per fire, to the webhook host.
+- Message: one line, `agentbox <profile>/<job>: <status> (exit N,
+  <duration>)` plus ` — <detail>`. The status word comes from what agentbox
+  did, not from the bare exit number: `TIMEOUT after <t>` only when the CLI
+  killed the run at its timeout (`meta.json` `killed`), `TERMINATED` only
+  when the fire was stopped by a signal, `RUN FAILED` only when the runner
+  itself failed, and `did not run` only when no run started (Docker down,
+  preflight). A script that exits 124, 143, or 125 by itself is `FAILED`.
+  The other words are `ok` and `SKIPPED`. Detail = the last non-empty line
+  of the run's `transcript.log` when a run happened (not agentbox's own
+  `[agentbox: run killed: …]` line), else the fire's own message. That line
+  is untrusted box output: control characters removed, whitespace
+  collapsed, capped at 300 characters with an ellipsis, then `&`, `<`, `>`
+  escaped as Slack requires. No other transcript text is sent.
+- A notification failure (secret missing, Keychain locked, network error,
+  non-2xx, timeout) never changes the exit code and never raises. Order of
+  writes: with the setting present, `fire` first writes the final outcome to
+  `last.json`, then posts, then rewrites `last.json` with `notify` and
+  appends the one `history.jsonl` line (also with `notify`; `"ok"` or
+  `"error: <scrubbed reason>"`), so a kill during the post leaves the true
+  status. The failure logs one line to the job log; `schedule ls` shows it as
+  a warning. With the setting unset the fire writes `last.json` once, one
+  history line, no `notify` field, and makes no HTTP call. The post runs in
+  a thread with a hard deadline, so on SIGTERM (5 s deadline) it cannot hang
+  the shutdown.
 - The box does not need to run between jobs.
 
 ## 3. Repository layout
@@ -828,6 +892,7 @@ P6; P7 needs P3.
   fallback.
 - u1: usability pass, see §9.
 - c1: command jobs (`run --cmd-file`, `schedule add --cmd-file`), §2.3 and §2.7. No isolation change.
+- n1: scheduled-run Slack notifications from the host (`notify_webhook_secret`, host-only shared secret), §1, §2.4, and §2.7. No box change; new outbound HTTPS from the host only.
 
 ## 9. Usability balance (architect, post-review)
 

@@ -142,6 +142,7 @@ All values are TOML strings. An unknown key is an error.
 | `secret_prefix` | `"agentbox"` | First part of default secret names. |
 | `subnet_base` | `10.213.0.0/16` | A private `/16`. Change it if a VPN uses the range. |
 | `runs_keep` | `"200"` | Run records kept per profile, a whole number ≥ 1. |
+| `notify_webhook_secret` | none | Name of a shared secret that holds a Slack `https://` webhook URL. Scheduled runs post their status there (read [Notifications](#notifications)). Unset: no posts. |
 
 ## Profiles
 
@@ -492,6 +493,9 @@ agentbox secret rm myproject HF_TOKEN
   box does not get it until you add it.
 - `secret ls` shows name, scope, status (`present` or `missing`), targets,
   and location. It also shows the per-box tokens that the CLI makes.
+- `secret ls --shared` also lists the secret that `notify_webhook_secret` names, with
+  `host: notify` as its user. No box gets that secret (read
+  [Notifications](#notifications)).
 
 A missing secret does not stop `up`. The CLI prints a warning with the fix
 command, and the box starts without that secret. A change to secrets
@@ -911,6 +915,80 @@ Exit codes of a fire:
 | 124 | Killed after the timeout. |
 | 125 | The run failed to start. |
 | 143 | Stopped by SIGTERM (for example logout). |
+
+### Notifications
+
+A scheduled fire can post its result to Slack. This holds for agent jobs and
+command jobs, and for fires that fail, time out, are skipped, or never start
+(Docker down, preflight failure). `schedule run-now` posts too. A manual
+`agentbox run` does not post. A job cannot opt out.
+
+1. Make a Slack incoming webhook. Copy its URL. It must start with `https://`.
+2. Store the URL as a shared secret:
+
+   ```sh
+   agentbox secret set --shared SLACK_WEBHOOK_URL
+   ```
+
+3. Name the secret in `~/.config/agentbox/config.toml`:
+
+   ```toml
+   notify_webhook_secret = "SLACK_WEBHOOK_URL"
+   ```
+
+4. Check it: `agentbox secret ls --shared` shows `SLACK_WEBHOOK_URL` as
+   `present`, used by `host: notify`.
+
+Without the setting, the CLI posts nothing and makes no network request.
+
+The host sends the post, not the box. The webhook URL stays on the host: the
+CLI reads it at fire time and does not write it to a file, a log, or a
+command line. No box needs `hooks.slack.com` on its allowlist for this. The
+CLI also refuses to deliver the URL to a box: `up` stops if a profile secret
+(any name, scope, or `to`) points at the same stored item, for example
+`SLACK_WEBHOOK_URL = "shared"` or `ref = "keychain:agentbox/_shared/SLACK_WEBHOOK_URL"`.
+The error tells you the fix: store the box's own value as a profile-scope
+secret, or use another name. The check compares secret locations, not
+values. The CLI cannot detect a copy of the same URL that you store under a
+different item and then declare in a profile, or a 1Password ref that names
+the same item in a different way (by ID, or with query parameters). Do not
+do that. `notify_webhook_secret` cannot be `CLAUDE_CODE_OAUTH_TOKEN` or
+another name that agentbox reserves.
+
+The post is one line of plain text:
+
+```text
+agentbox fx/eurusd: ok (exit 0, 12s) — == check: ECB date 2026-10-05, series end_date 2026-10-05
+agentbox cves/household: TIMEOUT after 1h (exit 124) — scanning 40/90
+agentbox cves/household: did not run (exit 69, 120s) — Docker did not come up within 120 s
+agentbox fx/eurusd: SKIPPED (exit 75) — another run of this job is still active
+```
+
+The status word says what agentbox did, not only the exit number: `ok`,
+`FAILED` (the run ended with a code of its own, even 124, 125, or 143),
+`TIMEOUT` (the CLI killed the run at its timeout), `TERMINATED` (a signal
+stopped the fire), `RUN FAILED` (the CLI could not run the job), `did not run`
+(Docker down or preflight failed), or `SKIPPED`. The text after the dash is the
+last non-empty line of the run's `transcript.log`. If no run happened, it is
+the message of the fire. The CLI skips its own `[agentbox: run killed: …]`
+line.
+
+The last transcript line is untrusted box output. The CLI removes control
+characters, collapses white space, cuts it to 300 characters, and escapes
+`&`, `<`, and `>`, so that it cannot make a Slack mention or link. Slack shows
+it as plain text. No other part of the transcript leaves the host.
+
+A failed post (secret missing, Keychain locked, network error, answer other
+than 2xx, no answer in 10 seconds) never changes the exit code of the fire.
+The CLI follows no redirect: a 3xx answer is an error (`error: HTTP 302`).
+The CLI writes one line to the job log, sets `notify` in `last.json` and
+`history.jsonl` (`ok` or `error: <reason>`), and `schedule ls` shows a
+warning. The CLI writes the final result to `last.json` before it posts, so a
+kill during the post keeps the true status. After SIGTERM the CLI waits at
+most 5 seconds for the post.
+
+Limit: if `job.json` is missing or damaged, or has an unknown `kind`, the
+fire stops before it has a result and posts nothing.
 
 Job files are in `<state>/schedules/<name>/`: `job.json`, `prompt.md` (or
 `command.sh` for a command job), `last.json`, and the logs `launchd.out` and `launchd.err` (rotated at

@@ -1,5 +1,5 @@
 """Headless run bookkeeping (PLAN §2.3 `run`): <state>/runs/<timestamp>-<agent>/
-with transcript.log, exit_code, meta.json."""
+(`-cmd` for a command job) with transcript.log, exit_code, meta.json."""
 
 from __future__ import annotations
 
@@ -16,7 +16,8 @@ def stamp(now: datetime | None = None) -> str:
 
 
 def new_run_dir(runs_root: Path, agent: str, now: datetime | None = None) -> Path:
-    """Create a fresh run dir atomically: mkdir, and on FileExistsError try the
+    """`agent` is the name suffix: an agent, or "cmd" for a command job.
+    Create a fresh run dir atomically: mkdir, and on FileExistsError try the
     next suffix (two fires in the same UTC second never share a dir)."""
     base = f"{stamp(now)}-{agent}"
     runs_root.mkdir(parents=True, exist_ok=True)

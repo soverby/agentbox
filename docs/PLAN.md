@@ -279,12 +279,13 @@ in that directory.
 | `agentbox claude\|codex\|pi [profile] [-- args]` | Start the box if needed and open that agent interactively in the current (or first) mount. |
 | `agentbox shell [profile]` | Bash in the box. |
 | `agentbox run <profile> --agent X --prompt-file F` | Headless run (`claude -p`, `codex exec`, `pi -p`); exit code and transcript to `<state>/runs/`. Starts and stops the box if it is not running. |
+| `agentbox run <profile> --cmd-file F [--timeout T]` | Headless command job: a shell script (no agent) runs in the box (§2.3 Command jobs). Same record, lock, timeout, and box start/stop as an agent run; the exit code is the script's. |
 | `agentbox login <profile> codex\|pi` | Subscription login in the box (`codex login --device-auth`; Pi paste-redirect-URL). |
 | `agentbox allow [profile] <domain>` / `agentbox denied [profile]` | Allowlist edit + live reload / review recent denials. |
 | `agentbox secret set/ls/rm [--shared \| profile] <NAME> [--stdin]` | Manage secrets (hidden prompt by default). |
 | `agentbox mcp login <profile> <server>` | OAuth for an MCP upstream, on the host (§2.6). |
 | `agentbox up/down/ls` | Explicit start/stop/status (sessions auto-start). |
-| `agentbox schedule add/ls/rm` | Host scheduling (§2.7). |
+| `agentbox schedule add/ls/rm/edit/run-now` | Host scheduling of agent runs and command jobs (§2.7). |
 | `agentbox update` | Bump the agent image pins in `versions.env` to current releases (values validated), rebuild, run full `doctor`; keep the previous image tag if doctor fails. Sidecar image digests and the gateway lockfile change by hand (listed in SECURITY.md). |
 | `agentbox doctor [profile]` | Full isolation self-test (§4). |
 
@@ -304,6 +305,37 @@ Agent launch flags set by the CLI (the box is the external sandbox):
   `web_tools = false` adds `-c web_search=disabled`.
 - Pi: default mode.
 - Working directory: current host dir if inside a mount, else first mount.
+
+Command jobs (`run --cmd-file`, `schedule add --cmd-file`): a shell script
+that runs headless in the box with no agent. This is for work that needs no
+LLM (a data fetch) or that starts its own `claude -p` (a pipeline).
+
+- Exactly one of `--agent` + `--prompt-file` or `--cmd-file`. `--model` is
+  refused with `--cmd-file`.
+- The script goes to the box on stdin, never on a command line (same rule as
+  a prompt). The CLI runs `with-secrets bash -euo pipefail` (non-login) via
+  `launch.exec_argv`. The flags are those of the repo's own scripts: a failed
+  command or an unset variable stops the job, so a half-run job does not
+  report success. The script can use `set +e` or `set +u`. A small
+  fixed wrapper (`bash -c`) first moves the script to fd 3 and gives it
+  `/dev/null` as stdin. Plain `bash -s` would let any child that reads stdin
+  (`claude -p`, `python -`) eat the rest of the script.
+- Same working directory rule, `session_lock`, `ensure_up`, run record,
+  timeout (rc 124), SIGTERM (rc 143), host-config scan, `stop_if_idle`, and
+  prune as an agent run. The record is `<state>/runs/<UTC time>-cmd/`. Its
+  `meta.json` has `kind: "cmd"`, `cmd_file`, and `cmd_sha256`, and no prompt
+  fields. The run's exit code is the script's exit code.
+- Isolation is that of an agent session in the same box: same container,
+  user, networks, mounts, and the same secrets (those the profile targets at
+  the agent, so a child `claude -p` finds the shared token if `claude` is in
+  `[box] agents`). The command job makes no new isolation claim and needs no
+  new doctor check. The script is trusted host input, the same as a prompt
+  file: it runs with the full rights of the box.
+- `skip_permissions`, `web_tools`, and `[box] agents` are launch settings for
+  the agents that the CLI starts. They do not apply to the script. An agent
+  that the script starts gets the flags the script gives it (so
+  `web_tools = false` does not cover it; the residual in §1 applies). A
+  command job needs no particular agent in `[box] agents`.
 - Sessions never start through a login shell (`bash -l`): Ubuntu's
   `~/.profile` would put `~/.local/bin` before system `PATH` entries.
 
@@ -597,10 +629,15 @@ third-party router.
 ### 2.7 Scheduling
 
 - Host-side. `agentbox schedule add <profile> --agent claude --prompt-file F
-  --cron "0 7 * * 1-5"` writes a launchd plist (`~/Library/LaunchAgents/
+  --cron "0 7 * * 1-5"` (an agent job) or `agentbox schedule add <profile>
+  --cmd-file F --cron …` (a command job, §2.3) writes a launchd plist (`~/Library/LaunchAgents/
   com.agentbox.<profile>.<name>.plist`) on macOS, or a crontab entry on Linux.
   The plist uses absolute paths for `agentbox` and `docker` and sets `PATH`
-  and `HOME`. The job calls `agentbox run`.
+  and `HOME`. The job calls `agentbox run`. A job is one of two kinds, stored
+  as `kind` in `job.json`: `agent` (also when the field is missing, so old
+  jobs keep working) or `cmd`. `add` copies the prompt (`prompt.md`) or the
+  script (`command.sh`) into the job directory, mode 0600. `schedule edit`
+  replaces the file of the matching kind only; the other option is refused.
 - When Docker Desktop is not running, the job starts it (`open -ga Docker`)
   and waits up to 120 s for `docker info`, then fails with a clear log line.
 - `agentbox schedule ls` shows last run time, exit code, and transcript path.
@@ -608,7 +645,11 @@ third-party router.
   `with-secrets`.
 - A fire fails (rc 78, fix command recorded) only when the chosen agent's
   own credential is missing; other missing secrets become warnings in
-  `last.json` and `schedule ls`. Every run ends with `stop_if_idle`, so
+  `last.json` and `schedule ls`. A command job has no agent credential to
+  require, so a missing secret (the Claude token too, which the script may
+  use) is only a warning. The other preflight checks (unsafe mount, rw mount
+  over the job's host code) apply to both kinds. `schedule ls` shows
+  `kind=cmd` for a command job. Every run ends with `stop_if_idle`, so
   overlapping jobs of one profile never leave the box up. Each job has a
   timeout (default 2 h, `--timeout`), after which the run is killed (rc
   124). An overlapping fire is skipped (rc 75) and counted in `ls`.
@@ -786,6 +827,7 @@ P6; P7 needs P3.
   router `NO_PROXY` text. R5-06 remote-plugin gate + `features.plugins`
   fallback.
 - u1: usability pass, see §9.
+- c1: command jobs (`run --cmd-file`, `schedule add --cmd-file`), §2.3 and §2.7. No isolation change.
 
 ## 9. Usability balance (architect, post-review)
 

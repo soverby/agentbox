@@ -90,7 +90,8 @@ If a step fails, read [Troubleshooting](#troubleshooting).
 | `agentbox validate <file> [--name N]` | Check a profile file and print it resolved. |
 | `agentbox claude\|codex\|pi [profile] [--model M] [-- args]` | Interactive agent session. |
 | `agentbox shell [profile] [-- cmd]` | Bash (or a command) in the box. |
-| `agentbox run <profile> --agent A --prompt-file F [--model M] [--timeout T]` | Headless run. |
+| `agentbox run <profile> --agent A --prompt-file F [--model M] [--timeout T]` | Headless agent run. |
+| `agentbox run <profile> --cmd-file F [--timeout T]` | Headless command job: a shell script, no agent. |
 | `agentbox login <profile> codex\|pi` | Subscription login in the box. |
 | `agentbox up [profile] [--accept-mount-change]` | Start the box and keep it up. |
 | `agentbox down [profile]` | Stop the box. The home volume stays. |
@@ -101,7 +102,7 @@ If a step fails, read [Troubleshooting](#troubleshooting).
 | `agentbox secret set\|rm [--shared \| profile] NAME` | Store or delete a secret. |
 | `agentbox secret ls [--shared \| profile]` | Secret names and status, never values. |
 | `agentbox mcp login\|status\|logout` | OAuth for MCP servers. |
-| `agentbox schedule add\|ls\|rm\|edit\|run-now` | Scheduled headless runs. |
+| `agentbox schedule add\|ls\|rm\|edit\|run-now` | Scheduled headless runs (agent or command job). |
 | `agentbox doctor [profile]` | Full isolation self-test. |
 | `agentbox update [--check]` | Update tool versions, rebuild, self-test. |
 
@@ -124,7 +125,7 @@ Files and directories:
 | `<state>/logs/egress/egress.log` | Proxy access log. |
 | `<state>/logs/gate/` | ollama-gate log. |
 | `<state>/logs/mcp/calls.jsonl` | MCP gateway call log. |
-| `<state>/runs/<time>-<agent>/` | Headless run records. |
+| `<state>/runs/<time>-<agent>/` | Headless run records (`<time>-cmd` for a command job). |
 | `<state>/schedules/<job>/` | Scheduled job files and logs. |
 
 The environment variables `AGENTBOX_CONFIG_HOME`, `AGENTBOX_STATE_HOME`, and
@@ -759,6 +760,47 @@ agentbox run myproject --agent claude --prompt-file task.md --timeout 30m
   (stdout and stderr, capped at 50 MB), `exit_code`, and `meta.json`. The
   CLI keeps the newest `runs_keep` records (default 200).
 
+### Command jobs
+
+A command job runs a shell script in the box. No agent is involved. Use it
+for work that needs no LLM (fetch and convert data), or for a script that
+starts its own `claude -p`.
+
+```sh
+agentbox run myproject --cmd-file update-fx.sh --timeout 10m
+```
+
+- Give exactly one of `--agent` with `--prompt-file`, or `--cmd-file`.
+  `--model` is an error with `--cmd-file`.
+- The CLI gives the script to bash on stdin. The script is never on a
+  command line. Bash is not a login shell and runs with
+  `-euo pipefail`: a failed command, an unset variable, or a failed
+  pipeline stops the script. Start the script with `set +e` or `set +u` if
+  you need a looser mode.
+- Stdin of the script's own commands is empty (`/dev/null`). A command such
+  as `claude -p` cannot read the rest of the script.
+- Bash always runs the script: a `#!` line has no effect. The script gets no
+  arguments, and `$0` is `/dev/fd/3`, not the path of the file. Thus do not
+  find other files with `dirname "$0"`; use absolute paths. File descriptor 3
+  stays open in the script's commands. Do not read it.
+- The script runs in the same directory as an agent run (the mount that
+  contains the current directory, else the first mount), with the secrets
+  that the profile targets at the agent. A `claude -p` that the script
+  starts finds the shared Claude token if `claude` is in `[box] agents`.
+- The exit code of `run` is the exit code of the script. The record is
+  `<state>/runs/<UTC time>-cmd/`. Its `meta.json` has `kind` `cmd`, the path
+  of the script (`cmd_file`), and its SHA-256 (`cmd_sha256`). There are no
+  prompt fields. Timeout, Ctrl+C, SIGTERM, the host-config scan, and the
+  box stop at the end work as for an agent run.
+- `skip_permissions`, `web_tools`, and `[box] agents` do not apply to the
+  script. An agent that the script starts gets the flags that the script
+  gives it. For example, `web_tools = false` does not remove the web tools
+  of a `claude` that the script starts.
+- A command job has the same isolation as an agent session in the same
+  box: same container, network allowlist, mounts, and secrets. The script is
+  trusted host input, the same as a prompt file. It runs with all the rights
+  of the box. Review a script before you give it to a box.
+
 ### Pinned boxes
 
 `agentbox up` and each interactive session (`claude`, `codex`, `pi`,
@@ -777,7 +819,7 @@ Exit codes of `run`:
 
 | Code | Meaning |
 | --- | --- |
-| agent's code | The agent ran and exited. |
+| agent's code | The agent ran and exited. For a command job: the script's exit code. |
 | 124 | Killed after `--timeout`. |
 | 143 | Stopped by SIGTERM or Ctrl+C. |
 | 1 | CLI error, message on stderr. If the box did not start, the run record has `exit_code` 125. |
@@ -809,7 +851,8 @@ Linux. The box does not have to run between jobs.
 | `--at` | `HH:MM` local time, each day, or with `--days`. |
 | `--days` | With `--at`: `mon-fri`, `sat-sun`, `mon,wed,fri`. |
 | `--timeout` | Default `2h`; `none` for no limit. |
-| `--model` | Same values as for sessions. |
+| `--model` | Same values as for sessions (agent jobs only). |
+| `--cmd-file` | A shell script instead of `--agent` and `--prompt-file` (see [Command jobs](#command-jobs)). |
 | `--force` | Replace a job with the same name. |
 
 Limits:
@@ -821,12 +864,25 @@ Limits:
 - On Linux, `--every` must divide 60 minutes or 24 hours, or be `1d`.
 - A schedule that does not fire within one year is refused.
 
-`add` copies the prompt file into the job directory. To change it later:
+To schedule a command job, use `--cmd-file` and no `--agent`:
+
+```sh
+agentbox schedule add myproject --name fx --cmd-file update-fx.sh --at 06:30
+```
+
+`add` copies the prompt file (or the script) into the job directory. To
+change it later:
 
 ```sh
 agentbox schedule edit myproject daily --prompt-file task.md
+agentbox schedule edit myproject fx --cmd-file update-fx.sh
 agentbox schedule edit myproject daily --timeout 1h
 ```
+
+`edit` takes `--prompt-file` for an agent job and `--cmd-file` for a command
+job. The other option is an error. `schedule ls` shows `agent=<name>` for an
+agent job and `kind=cmd` for a command job. A job file from an older version
+(no `kind`) is an agent job.
 
 To remove a job: `agentbox schedule rm myproject daily`. Run records stay.
 
@@ -836,7 +892,9 @@ When a job fires:
   waits up to 120 seconds.
 - The job fails before the run only when the agent's own credential is
   missing (today only the Claude token is checked). Other missing secrets
-  become warnings in `schedule ls`.
+  become warnings in `schedule ls`. A command job has no agent credential,
+  so it never fails for a missing secret. The missing Claude token is a
+  warning, because the script may start `claude -p`.
 - If the same job still runs, the new fire is skipped.
 - At the end, the box stops unless it is pinned or another session uses it
   (read [Pinned boxes](#pinned-boxes)). `schedule ls` shows why a box stayed
@@ -846,16 +904,16 @@ Exit codes of a fire:
 
 | Code | Meaning |
 | --- | --- |
-| 0 or agent's code | The run happened. |
+| 0 or agent's (script's) code | The run happened. |
 | 69 | Docker did not come up within 120 seconds. |
 | 75 | Skipped: the same job was still running. |
-| 78 | Preflight failed (missing credential, agent not in profile, unsafe mount). |
+| 78 | Preflight failed (agent job: missing credential or agent not in profile; both kinds: unsafe mount). |
 | 124 | Killed after the timeout. |
 | 125 | The run failed to start. |
 | 143 | Stopped by SIGTERM (for example logout). |
 
-Job files are in `<state>/schedules/<name>/`: `job.json`, `prompt.md`,
-`last.json`, and the logs `launchd.out` and `launchd.err` (rotated at
+Job files are in `<state>/schedules/<name>/`: `job.json`, `prompt.md` (or
+`command.sh` for a command job), `last.json`, and the logs `launchd.out` and `launchd.err` (rotated at
 5 MB). On macOS the plist is
 `~/Library/LaunchAgents/com.agentbox.<profile>.<name>.plist`.
 

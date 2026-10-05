@@ -398,3 +398,129 @@ def test_session_prints_host_config_changes(roots, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "[core.fsmonitor]: added: ab12 x" in err and "scan incomplete" in err
     assert not list((paths.state_dir("demo") / "hostscan").iterdir())
+
+
+# ---------------------------------------------------------------- command jobs (--cmd-file)
+def last_run(name="demo"):
+    return sorted((paths.state_dir(name) / "runs").iterdir())[-1]
+
+
+def test_run_cmd_file_on_stdin(roots, monkeypatch, capsys):
+    import hashlib
+    import json
+
+    from agentbox import launch
+
+    events, seen = run_box(roots, monkeypatch)
+    # a profile that lists no agent the script could use: a command job still runs
+    text = paths.profile_file("demo").read_text()
+    paths.profile_file("demo").write_text('[box]\nagents = ["pi"]\n\n' + text)
+    cf = roots / "job.sh"
+    script = b"set -x\n# --starts with dashes\n" + b"echo x\n" * 40_000
+    cf.write_bytes(script)
+    assert cli.main(["run", "demo", "--cmd-file", str(cf)]) == 1  # the fake exec exits 1
+    assert seen["stdin"] == script
+    cmd = seen["cmd"]
+    i = cmd.index(launch.WITH_SECRETS)
+    assert cmd[i + 1 :] == launch.command_argv()
+    assert cmd[i - 3 : i] == ["-w", "/w/p", "agent"]  # same workdir rule as an agent run
+    assert all(len(a) < 1000 for a in cmd)  # the script is never in argv
+    rd = last_run()
+    assert rd.name.endswith("-cmd") and (rd / "exit_code").read_text() == "1\n"
+    meta = json.loads((rd / "meta.json").read_text())
+    assert meta["kind"] == "cmd" and meta["cmd_file"] == str(cf.resolve())
+    assert meta["cmd_sha256"] == hashlib.sha256(script).hexdigest()
+    assert meta["argv"] == launch.command_argv() and meta["env"] == {}
+    assert meta["workdir"] == "/w/p" and meta["exit_code"] == 1
+    assert not {"agent", "model", "prompt", "prompt_file", "prompt_sha256"} & set(meta)
+    assert f"AGENTBOX_RUN={rd.name}" in cmd
+    assert (rd / "transcript.log").read_text() == "Not logged in\n"
+    assert events == ["up", "down"]
+    assert f"run: {rd} (exit 1)" in capsys.readouterr().out
+
+
+def test_run_agent_meta_has_kind(roots, monkeypatch):
+    import json
+
+    run_box(roots, monkeypatch)
+    pf = roots / "p.txt"
+    pf.write_text("hi")
+    cli.main(["run", "demo", "--agent", "claude", "--prompt-file", str(pf)])
+    meta = json.loads((last_run() / "meta.json").read_text())
+    assert meta["kind"] == "agent" and meta["agent"] == "claude" and "cmd_file" not in meta
+    assert last_run().name.endswith("-claude")
+
+
+@pytest.mark.parametrize(
+    "extra,msg",
+    [
+        (["--cmd-file", "{f}", "--agent", "claude"], "cannot be combined"),
+        (["--cmd-file", "{f}", "--prompt-file", "{f}"], "cannot be combined"),
+        (["--cmd-file", "{f}", "--model", "ollama/x"], "--model is not valid with --cmd-file"),
+        (["--cmd-file", ""], "--cmd-file needs a file path"),
+        ([], "give --agent and --prompt-file"),
+        (["--agent", "claude"], "give --agent and --prompt-file"),
+        (["--prompt-file", "{f}"], "give --agent and --prompt-file"),
+    ],
+)
+def test_run_cmd_file_bad_combinations(roots, monkeypatch, capsys, extra, msg):
+    events, seen = run_box(roots, monkeypatch)
+    cf = roots / "job.sh"
+    cf.write_text("true\n")
+    argv = ["run", "demo", *[a.format(f=cf) for a in extra]]
+    assert cli.main(argv) == 1
+    assert msg in capsys.readouterr().err
+    assert events == [] and "cmd" not in seen
+    assert not list((paths.state_dir("demo") / "runs").glob("*"))
+
+
+def test_run_cmd_file_unreadable(roots, monkeypatch, capsys):
+    events, seen = run_box(roots, monkeypatch)
+    assert cli.main(["run", "demo", "--cmd-file", str(roots / "nope.sh")]) == 1
+    assert "cannot read command file" in capsys.readouterr().err
+    assert events == [] and not list((paths.state_dir("demo") / "runs").glob("*"))
+
+
+def test_run_cmd_file_timeout(roots, monkeypatch):
+    def expire(timeout):
+        raise subprocess.TimeoutExpired("x", timeout)
+
+    events, seen = run_box(roots, monkeypatch, wait=expire)
+    killed = []
+    monkeypatch.setattr(
+        cli, "kill_run", lambda b, rid, p, all_procs=False: killed.append((rid, all_procs))
+    )
+    cf = roots / "job.sh"
+    cf.write_text("sleep 999\n")
+    assert cli.main(["run", "demo", "--cmd-file", str(cf), "--timeout", "1m"]) == 124
+    rd = last_run()
+    assert seen["waited"] == 60 and killed == [(rd.name, True)]
+    assert (rd / "exit_code").read_text() == "124\n"
+    assert "run killed: timeout after 60 s" in (rd / "transcript.log").read_text()
+    assert events == ["up", "down"]
+
+
+def test_run_cmd_file_terminated(roots, monkeypatch):
+    def term(timeout):
+        raise cli.Terminated(15)
+
+    events, _ = run_box(roots, monkeypatch, wait=term)
+    killed = []
+    monkeypatch.setattr(
+        cli, "kill_run", lambda b, rid, p, all_procs=False: killed.append((rid, all_procs))
+    )
+    cf = roots / "job.sh"
+    cf.write_text("sleep 999\n")
+    with pytest.raises(cli.Terminated):
+        cli.run_headless(boxmod.load("demo"), None, cf, None, "/")
+    rd = last_run()
+    assert killed == [(rd.name, False)]
+    assert (rd / "exit_code").read_text() == "143\n" and events == ["up", "down"]
+
+
+def test_run_headless_cmd_refuses_model(roots, monkeypatch):
+    run_box(roots, monkeypatch)
+    cf = roots / "job.sh"
+    cf.write_text("true\n")
+    with pytest.raises(cli.CliError, match="no model"):
+        cli.run_headless(boxmod.load("demo"), None, cf, "ollama/x", "/")

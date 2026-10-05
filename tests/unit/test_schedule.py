@@ -140,7 +140,8 @@ def roots(tmp_path, monkeypatch):
     return tmp_path
 
 
-def make_job(tmp_path, spec, profile="p1", name="daily"):
+def make_job(tmp_path, spec, profile="p1", name="daily", kind=None):
+    """kind None: a job.json from before command jobs (no `kind` field)."""
     prog, extra = schedule.program_args(argv0="")
     jd = schedule.job_dir(profile, name)
     jd.mkdir(parents=True, exist_ok=True)
@@ -151,8 +152,12 @@ def make_job(tmp_path, spec, profile="p1", name="daily"):
         "plist": str(schedule.launchagents_dir() / f"{label}.plist"),
         "argv": schedule.fire_argv(prog, profile, name), "env": schedule.job_env(extra),
     }  # fmt: skip
+    if kind is not None:
+        job["kind"] = kind
+    if kind == "cmd":
+        job["agent"] = None
     (jd / "job.json").write_text(json.dumps(job))
-    (jd / "prompt.md").write_text("hello\n")
+    (jd / schedule.job_file(schedule.job_kind(job))).write_text("hello\n")
     return job
 
 
@@ -678,3 +683,256 @@ def test_fire_records_host_config_changes(roots, monkeypatch):
     assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
     last = json.loads((Path(job["dir"]) / "last.json").read_text())
     assert last["host_config_changes"] == ["m: .envrc: added: x"]
+
+
+# ---------------------------------------------------------------- command jobs
+def test_job_kind_and_file():
+    assert schedule.job_kind({"agent": "claude"}) == "agent"  # job.json from before kinds
+    assert schedule.job_kind({"kind": "agent"}) == "agent"
+    assert schedule.job_kind({"kind": "cmd"}) == "cmd"
+    assert schedule.job_file("agent") == "prompt.md" and schedule.job_file("cmd") == "command.sh"
+    with pytest.raises(ScheduleError, match="unknown kind 'bash'"):
+        schedule.job_kind({"profile": "p", "name": "n", "kind": "bash"})
+
+
+def test_fire_legacy_job_runs_as_agent(roots, monkeypatch):
+    """A job.json without `kind` keeps working: agent job, prompt.md, agent preflight."""
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    job = make_job(roots, schedule.Spec(every=60))
+    assert "kind" not in json.loads((Path(job["dir"]) / "job.json").read_text())
+    seen = {}
+
+    def runner(profile, agent, prompt, model, timeout):
+        seen["run"] = (agent, Path(prompt).name, Path(prompt).read_text())
+        return 0, roots
+
+    def preflight(profile, agent, model=None, code=()):
+        seen["pre"] = agent
+        return None, []
+
+    assert schedule.fire("p1", "daily", runner, preflight) == 0
+    assert seen == {"run": ("claude", "prompt.md", "hello\n"), "pre": "claude"}
+    last = json.loads((Path(job["dir"]) / "last.json").read_text())
+    assert last["kind"] == "agent" and last["agent"] == "claude"
+
+
+def test_fire_cmd_job(roots, monkeypatch):
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    job = make_job(roots, schedule.Spec(every=60), kind="cmd")
+    seen = {}
+
+    def runner(profile, agent, prompt, model, timeout):
+        seen["run"] = (agent, Path(prompt).name, Path(prompt).read_text(), model, timeout)
+        return 124, roots
+
+    def preflight(profile, agent, model=None, code=()):
+        seen["pre"] = (agent, model)
+        return None, []
+
+    assert schedule.fire("p1", "daily", runner, preflight) == 124
+    assert seen == {"run": (None, "command.sh", "hello\n", None, 7200), "pre": (None, None)}
+    last = json.loads((Path(job["dir"]) / "last.json").read_text())
+    assert last["kind"] == "cmd" and last["agent"] is None and last["exit_code"] == 124
+    assert "killed after the timeout" in last["message"]
+
+
+def test_fire_unknown_kind_is_a_hard_error(roots):
+    job = make_job(roots, schedule.Spec(every=60), kind="cmd")
+    f = Path(job["dir"]) / "job.json"
+    f.write_text(json.dumps({**job, "kind": "weird"}))
+    with pytest.raises(ScheduleError, match="unknown kind"):
+        schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight)
+
+
+def test_sched_runner_passes_command_job_through(roots, cli_env, monkeypatch):
+    got = {}
+
+    def fake(b, agent, prompt_file, model, host_dir, made=None, timeout=None):
+        got.update(agent=agent, file=prompt_file, model=model, dir=host_dir, timeout=timeout)
+        return 0, roots
+
+    monkeypatch.setattr(cli, "run_headless", fake)
+    assert cli.sched_runner("p1", None, "/x/command.sh", None, 60) == (0, roots)
+    assert got == {"agent": None, "file": Path("/x/command.sh"), "model": None, "dir": "/",
+                   "timeout": 60}  # fmt: skip
+
+
+def add_cmd(roots, *extra, name="fx", profile="p1"):
+    return cli.main(["schedule", "add", profile, "--name", name, "--cmd-file",
+                     str(roots / "fx.sh"), *extra])  # fmt: skip
+
+
+@pytest.fixture
+def cmd_env(roots, cli_env, monkeypatch):
+    monkeypatch.setattr(schedule, "launchctl",
+                        lambda *a: _cp(1 if a[0] == "print" else 0))  # fmt: skip
+    (roots / "fx.sh").write_text("curl -s example.com | python3 -c 'pass'\n")
+    # a profile whose [box] agents has neither claude nor codex: a command job still works
+    (roots / "cfg" / "profiles" / "p2.toml").write_text(
+        PROFILE.format(mount=roots).replace('agents = ["claude", "codex"]', 'agents = ["pi"]')
+    )
+    return cli_env
+
+
+def test_cli_add_cmd_job_ls_rm(roots, cmd_env, capsys):
+    assert add_cmd(roots, "--at", "06:30", "--timeout", "10m", profile="p2") == 0
+    out = capsys.readouterr()
+    assert (
+        "p2/fx" in out.out and "timeout 10m" in out.out and "agentbox schedule run-now" in out.out
+    )
+    jd = schedule.job_dir("p2", "fx")
+    job = json.loads((jd / "job.json").read_text())
+    assert job["kind"] == "cmd" and job["agent"] is None and job["model"] is None
+    assert job["timeout"] == 600
+    assert (jd / "command.sh").read_text() == "curl -s example.com | python3 -c 'pass'\n"
+    assert (jd / "command.sh").stat().st_mode & 0o777 == 0o600
+    assert not (jd / "prompt.md").exists()
+    assert SECRET.encode() not in (jd / "job.json").read_bytes()
+    assert cli.main(["schedule", "ls"]) == 0
+    ls = capsys.readouterr().out
+    line = next(x for x in ls.splitlines() if x.startswith("p2/fx"))
+    assert "kind=cmd" in line and "agent=" not in line and "cron 30 6 * * *" in line
+    assert cli.main(["schedule", "rm", "p2", "fx"]) == 0 and not jd.exists()
+
+
+def test_cli_ls_shows_kind_for_both(roots, cmd_env, capsys):
+    pf = str(roots / "prompt.txt")
+    assert cli.main(["schedule", "add", "p1", "--name", "a", "--agent", "claude",
+                     "--prompt-file", pf, "--every", "1h"]) == 0  # fmt: skip
+    assert add_cmd(roots, "--every", "2h") == 0
+    # and a job.json from before kinds
+    make_job(roots, schedule.Spec(every=60), name="old")
+    capsys.readouterr()
+    assert cli.main(["schedule", "ls", "p1"]) == 0
+    lines = {x.split()[0]: x for x in capsys.readouterr().out.splitlines() if x.startswith("p1/")}
+    assert "agent=claude" in lines["p1/a"] and "kind=cmd" in lines["p1/fx"]
+    assert "agent=claude" in lines["p1/old"] and "kind=" not in lines["p1/old"]
+
+
+@pytest.mark.parametrize(
+    "extra,msg",
+    [
+        (["--agent", "claude"], "cannot be combined"),
+        (["--prompt-file", "{p}"], "cannot be combined"),
+        (["--model", "ollama/x"], "--model is not valid with --cmd-file"),
+    ],
+)
+def test_cli_add_cmd_bad_combinations(roots, cmd_env, capsys, extra, msg):
+    extra = [x.format(p=roots / "prompt.txt") for x in extra]
+    assert add_cmd(roots, "--every", "1h", *extra) == 1
+    assert msg in capsys.readouterr().err
+    assert not schedule.job_dir("p1", "fx").exists()
+
+
+def test_cli_add_needs_agent_or_cmd(roots, cmd_env, capsys):
+    pf = str(roots / "prompt.txt")
+    for extra in ([], ["--agent", "claude"], ["--prompt-file", pf]):
+        assert cli.main(["schedule", "add", "p1", "--name", "x", "--every", "1h", *extra]) == 1
+        assert "give --agent and --prompt-file (agent run) or --cmd-file" in capsys.readouterr().err
+    assert not schedule.job_dir("p1", "x").exists()
+
+
+def test_cli_add_cmd_missing_file(roots, cmd_env, capsys):
+    (roots / "fx.sh").unlink()
+    assert add_cmd(roots, "--every", "1h") == 1
+    assert "cannot read command file" in capsys.readouterr().err
+    assert not schedule.job_dir("p1", "fx").exists()
+
+
+def test_cli_add_cmd_still_refuses_rw_mount_over_job_code(roots, cmd_env, monkeypatch, capsys):
+    code = roots / "code"
+    code.mkdir()
+    monkeypatch.setattr(schedule, "program_args",
+                        lambda argv0=None: (["/usr/bin/python3", "-m", "agentbox.cli"],
+                                            {"PYTHONPATH": str(code)}))  # fmt: skip
+    assert add_cmd(roots, "--every", "1h") == 1
+    assert "overlaps" in capsys.readouterr().err
+    assert not schedule.job_dir("p1", "fx").exists()
+
+
+def test_cli_force_switches_kind_and_drops_stale_file(roots, cmd_env, capsys):
+    pf = str(roots / "prompt.txt")
+    base = ["schedule", "add", "p1", "--name", "x", "--every", "1h", "--force"]
+    assert cli.main([*base, "--agent", "claude", "--prompt-file", pf]) == 0
+    jd = schedule.job_dir("p1", "x")
+    assert (jd / "prompt.md").is_file()
+    assert cli.main([*base, "--cmd-file", str(roots / "fx.sh")]) == 0
+    assert (jd / "command.sh").is_file() and not (jd / "prompt.md").exists()
+    assert schedule.job_kind(schedule.load_job("p1", "x")) == "cmd"
+    assert cli.main([*base, "--agent", "claude", "--prompt-file", pf]) == 0
+    assert (jd / "prompt.md").is_file() and not (jd / "command.sh").exists()
+    job = schedule.load_job("p1", "x")
+    assert job["kind"] == "agent" and job["agent"] == "claude"
+
+
+def test_cli_edit_rules(roots, cmd_env, capsys):
+    pf = str(roots / "prompt.txt")
+    assert add_cmd(roots, "--every", "1h") == 0
+    assert cli.main(["schedule", "add", "p1", "--name", "a", "--agent", "claude",
+                     "--prompt-file", pf, "--every", "1h"]) == 0  # fmt: skip
+    capsys.readouterr()
+    cmd_jd, agent_jd = schedule.job_dir("p1", "fx"), schedule.job_dir("p1", "a")
+    (roots / "fx2.sh").write_text("echo v2\n")
+    (roots / "prompt.txt").write_text("v2\n")
+    # command job: --cmd-file replaces command.sh; --prompt-file is refused
+    assert cli.main(["schedule", "edit", "p1", "fx", "--cmd-file", str(roots / "fx2.sh")]) == 0
+    assert "command replaced" in capsys.readouterr().out
+    assert (cmd_jd / "command.sh").read_text() == "echo v2\n"
+    assert (cmd_jd / "command.sh").stat().st_mode & 0o777 == 0o600
+    assert cli.main(["schedule", "edit", "p1", "fx", "--prompt-file", pf]) == 1
+    assert "is a command job: use --cmd-file" in capsys.readouterr().err
+    assert not (cmd_jd / "prompt.md").exists()
+    # agent job: the reverse
+    assert cli.main(["schedule", "edit", "p1", "a", "--cmd-file", str(roots / "fx2.sh")]) == 1
+    assert "is an agent job: use --prompt-file" in capsys.readouterr().err
+    assert not (agent_jd / "command.sh").exists()
+    assert cli.main(["schedule", "edit", "p1", "a", "--prompt-file", pf]) == 0
+    assert (agent_jd / "prompt.md").read_text() == "v2\n"
+    # a refused edit changes nothing, even with a valid --timeout
+    assert cli.main(["schedule", "edit", "p1", "a", "--cmd-file", str(roots / "fx2.sh"),
+                     "--timeout", "5m"]) == 1  # fmt: skip
+    assert schedule.load_job("p1", "a")["timeout"] == schedule.DEFAULT_TIMEOUT
+    # timeout alone works for both kinds; nothing to change is an error
+    assert cli.main(["schedule", "edit", "p1", "fx", "--timeout", "5m"]) == 0
+    assert schedule.load_job("p1", "fx")["timeout"] == 300
+    assert cli.main(["schedule", "edit", "p1", "fx"]) == 1
+    assert "--cmd-file" in capsys.readouterr().err
+
+
+def test_cli_edit_legacy_job_is_an_agent_job(roots, cli_env, capsys):
+    make_job(roots, schedule.Spec(every=60))  # no `kind`
+    assert (
+        cli.main(["schedule", "edit", "p1", "daily", "--cmd-file", str(roots / "prompt.txt")]) == 1
+    )
+    assert "is an agent job" in capsys.readouterr().err
+    assert cli.main(["schedule", "edit", "p1", "daily", "--prompt-file",
+                     str(roots / "prompt.txt")]) == 0  # fmt: skip
+    assert (schedule.job_dir("p1", "daily") / "prompt.md").read_text() == "do the thing\n"
+
+
+def test_preflight_command_job_has_no_agent_credential(roots, cmd_env, capsys):
+    """Agent job: the missing Claude token is an error (rc 78). Command job: a warning."""
+    (roots / "store.json").write_text("{}")
+    e, w = cli.sched_preflight("p1", "claude")
+    assert e.startswith("CLAUDE_CODE_OAUTH_TOKEN is missing")
+    e, w = cli.sched_preflight("p1", None)
+    assert e is None
+    assert len(w) == 2 and any(x.startswith("CLAUDE_CODE_OAUTH_TOKEN is missing") for x in w)
+    assert ANY_MYTOK in w  # other missing secrets stay warnings, as for agent jobs
+    # a cmd job needs no agent in [box] agents; an agent job still does
+    assert cli.sched_preflight("p2", "claude") == ("claude is not in [box] agents of p2", [])
+    assert cli.sched_preflight("p2", None)[0] is None
+    # add warns the same way and still succeeds
+    assert add_cmd(roots, "--every", "1h") == 0
+    err = capsys.readouterr().err
+    assert "warning: CLAUDE_CODE_OAUTH_TOKEN is missing" in err and "warning: MYTOK" in err
+    assert "login" not in err  # no codex/pi login note for a command job
+
+
+def test_preflight_command_job_keeps_mount_check(roots, cmd_env):
+    code = roots / "code"
+    code.mkdir()
+    msg, w = cli.sched_preflight("p1", None, None, (str(code),))
+    assert msg and "overlaps" in msg and w == []

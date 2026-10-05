@@ -220,6 +220,20 @@ def agent_argv(profile: Profile, agent: str, args: list[str], headless: bool = F
     return argv + list(args)
 
 
+# Command job (PLAN §2.3): the script is on stdin, never in argv. Plain
+# `bash -s` would hand the rest of the script to any child that reads stdin
+# (`claude -p`, `python -`), so a fixed wrapper moves the script to fd 3 and
+# gives the script /dev/null as stdin. -euo pipefail as in the repo's scripts.
+CMD_WRAPPER = "exec 3<&0 </dev/null; exec bash -euo pipefail /dev/fd/3"
+CMD_ARGV0 = "agentbox-cmd"
+
+
+def command_argv() -> list[str]:
+    """argv (after with-secrets) of a command job. Non-login; no profile
+    setting applies (`skip_permissions`, `web_tools`, `[box] agents`)."""
+    return ["bash", "-c", CMD_WRAPPER, CMD_ARGV0]
+
+
 def _norm(p: str, ci: bool) -> str:
     return p.casefold() if ci else p
 

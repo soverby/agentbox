@@ -139,3 +139,59 @@ def test_resolve_profile(tmp_path):
 def test_resolve_no_profiles(tmp_path):
     with pytest.raises(launch.ResolveError, match="agentbox init"):
         launch.resolve_profile(tmp_path / "none", str(tmp_path))
+
+
+# ---------------------------------------------------------------- command jobs
+def test_command_argv_is_fixed_and_non_login():
+    argv = launch.command_argv()
+    assert argv[0] == "bash" and "-l" not in argv and "--login" not in argv
+    assert argv[1:3] == ["-c", launch.CMD_WRAPPER]
+    assert "-euo pipefail" in launch.CMD_WRAPPER and "-s" not in argv
+    assert argv == launch.command_argv()  # nothing from the script or the profile
+
+
+def test_command_exec_argv_through_with_secrets():
+    argv = launch.exec_argv("agentbox-p1", "/s/c.yml", "/work/proj", launch.command_argv(),
+                            tty=False, env={"AGENTBOX_RUN": "r1"})  # fmt: skip
+    i = argv.index(launch.WITH_SECRETS)
+    assert argv[:2] == ["docker", "compose"] and "-T" in argv[:i]
+    assert argv[i - 3 : i] == ["-w", "/work/proj", "agent"]
+    assert argv[i + 1 :] == launch.command_argv()
+    assert argv[argv.index("-e") + 1] == "AGENTBOX_RUN=r1"
+
+
+def test_command_argv_needs_no_agent():
+    # agent_argv refuses an agent that is not in [box] agents; command_argv takes no profile
+    p = prof(agents=["pi"])
+    with pytest.raises(launch.ResolveError):
+        launch.agent_argv(p, "claude", [], headless=True)
+    assert launch.command_argv()[0] == "bash"
+
+
+def _run_wrapper(script: bytes, tmp_path):
+    import shutil
+    import subprocess
+
+    if not shutil.which("bash") or not os.path.exists("/dev/fd/0"):
+        pytest.skip("needs bash and /dev/fd")
+    return subprocess.run(launch.command_argv(), input=script, capture_output=True, timeout=30,
+                          cwd=tmp_path)  # fmt: skip
+
+
+def test_command_wrapper_child_cannot_read_the_script(tmp_path):
+    """Plain `bash -s` lets `cat` eat the rest of the script; the wrapper does not."""
+    r = _run_wrapper(b"echo one\ncat > /dev/null\nread x || echo stdin-eof\necho two\n", tmp_path)
+    assert r.stdout.decode().split() == ["one", "stdin-eof", "two"] and r.returncode == 0
+
+
+def test_command_wrapper_strict_flags_and_exit_code(tmp_path):
+    r = _run_wrapper(b"echo a\nfalse\necho NOTREACHED\n", tmp_path)
+    assert r.stdout == b"a\n" and r.returncode == 1  # -e
+    r = _run_wrapper(b'echo "$UNSET_VAR_XYZ"\necho NOTREACHED\n', tmp_path)
+    assert b"NOTREACHED" not in r.stdout and r.returncode != 0  # -u
+    r = _run_wrapper(b"false | true\necho NOTREACHED\n", tmp_path)
+    assert b"NOTREACHED" not in r.stdout and r.returncode == 1  # pipefail
+    r = _run_wrapper(b"echo done; exit 7", tmp_path)  # no trailing newline; the script's code
+    assert r.stdout == b"done\n" and r.returncode == 7
+    big = b"echo start\n" + b"x=1\n" * 50_000 + b"exit 9\n"
+    assert _run_wrapper(big, tmp_path).returncode == 9

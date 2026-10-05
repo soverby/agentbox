@@ -1,8 +1,10 @@
 """Host scheduling of headless runs (PLAN §2.7).
 
-A job is `<state>/<profile>/schedules/<name>/` with job.json (agent, model,
-schedule), prompt.md (0600 copy of the prompt), last.json (last fire),
-history.jsonl (every fire), fire.lock, and launchd.{out,err}.
+A job is `<state>/<profile>/schedules/<name>/` with job.json (kind, agent,
+model, schedule), prompt.md (0600 copy of the prompt) or, for a command job,
+command.sh (0600 copy of the script), last.json (last fire), history.jsonl
+(every fire), fire.lock, and launchd.{out,err}. `kind` is "agent" or "cmd"; a
+job.json without it is an agent job.
 
 macOS: a launchd agent plist (`StartCalendarInterval` from cron / --at, or
 `StartInterval` for --every) that runs `agentbox schedule _fire`. Linux: one
@@ -343,6 +345,20 @@ def load_job(profile: str, name: str) -> dict:
     if not f.is_file():
         raise ScheduleError(f"no schedule {name!r} for profile {profile!r} ({f})")
     return json.loads(f.read_text())
+
+
+def job_kind(job: dict) -> str:
+    """ "agent" or "cmd". A job.json from before command jobs has no kind.
+    Any other value is a hard error (never a silent default)."""
+    kind = job.get("kind", "agent")
+    if kind not in ("agent", "cmd"):
+        raise ScheduleError(f"job {job.get('profile')}/{job.get('name')}: unknown kind {kind!r}")
+    return kind
+
+
+def job_file(kind: str) -> str:
+    """Name of the job's input copy (prompt or script) in its job dir."""
+    return "command.sh" if kind == "cmd" else "prompt.md"
 
 
 def list_jobs(profile: str | None = None) -> list[dict]:
@@ -695,14 +711,17 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
          poll: float = DOCKER_POLL) -> int:  # fmt: skip
     """One scheduled run. runner(profile, agent, prompt_path, model, timeout) ->
     (rc, run_dir); an exception may carry .run_dir and .rc. preflight(profile,
-    agent, model) -> (error or None, warnings). Never interactive."""
+    agent, model, code_paths) -> (error or None, warnings). Never interactive.
+    For a command job, agent is None and prompt_path is the script."""
     if wait is None:
         wait = float(os.environ.get("AGENTBOX_DOCKER_WAIT", DOCKER_WAIT))
     job = load_job(profile, name)
     jd = Path(job["dir"])
     for f in ("launchd.out", "launchd.err"):
         rotate(jd / f)
-    base = {"profile": profile, "name": name, "agent": job["agent"], "start": now_iso()}
+    kind = job_kind(job)
+    agent = job["agent"] if kind == "agent" else None
+    base = {"profile": profile, "name": name, "kind": kind, "agent": agent, "start": now_iso()}
     with (jd / "fire.lock").open("a") as lk:
         try:
             fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -726,7 +745,7 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
                 )
                 log(profile, name, msg)
             else:
-                msg, rec["warnings"] = preflight(profile, job["agent"], job.get("model"),
+                msg, rec["warnings"] = preflight(profile, agent, job.get("model"),
                                                  job_code_paths(job))  # fmt: skip
                 for w in rec["warnings"]:
                     log(profile, name, f"warning: {w}")
@@ -734,8 +753,8 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
                     log(profile, name, msg)
                 else:
                     tmo = job.get("timeout", DEFAULT_TIMEOUT)
-                    prompt = str(jd / "prompt.md")
-                    rc, rd = runner(profile, job["agent"], prompt, job.get("model"), tmo)
+                    prompt = str(jd / job_file(kind))
+                    rc, rd = runner(profile, agent, prompt, job.get("model"), tmo)
                     log(profile, name, f"run {rd} exit {rc}")
                     if why := left_up(rd):
                         rec["left_up"] = f"left up: {why}"

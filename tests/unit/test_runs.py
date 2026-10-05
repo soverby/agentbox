@@ -109,3 +109,17 @@ def test_new_run_dir_same_second_no_collision(tmp_path):
     (tmp_path / "x").mkdir()
     assert runs.new_run_dir(tmp_path / "x", "pi", now).name == "20260101T000000Z-pi"
     assert runs.new_run_dir(tmp_path / "x", "pi", now).name == "20260101T000000Z-pi-2"
+
+
+def test_cmd_run_dir_name_and_meta(tmp_path):
+    now = datetime(2026, 9, 23, 7, 0, 5, tzinfo=UTC)
+    d = runs.new_run_dir(tmp_path, "cmd", now)
+    assert d.name == "20260923T070005Z-cmd"
+    assert runs.new_run_dir(tmp_path, "cmd", now).name == "20260923T070005Z-cmd-2"
+    runs.finish(d, 0, {"profile": "p", "kind": "cmd", "cmd_file": "/f.sh", "cmd_sha256": "ab"})
+    meta = json.loads((d / "meta.json").read_text())
+    assert meta["kind"] == "cmd" and meta["exit_code"] == 0 and "prompt_sha256" not in meta
+    # prune treats a -cmd dir like any other (names start with the UTC stamp)
+    older = tmp_path / "20200101T000000Z-claude"
+    older.mkdir()
+    assert runs.prune(tmp_path, 2, current=d) == [older]

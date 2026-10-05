@@ -223,11 +223,33 @@ def cmd_agent(args) -> int:
     return session(b, ln.argv, ln.env)
 
 
+def check_job_args(
+    agent: str | None, prompt_file: str | None, cmd_file: str | None, model: str | None
+) -> str | None:
+    """Agent job or command job, never both or neither. Returns the cmd file
+    for a command job, else None."""
+    if cmd_file is not None:
+        if not cmd_file:
+            raise CliError("--cmd-file needs a file path")
+        if agent is not None or prompt_file is not None:
+            raise CliError("--cmd-file cannot be combined with --agent or --prompt-file")
+        if model is not None:
+            raise CliError("--model is not valid with --cmd-file (a command job has no agent)")
+        return cmd_file
+    if agent is None or prompt_file is None:
+        raise CliError("give --agent and --prompt-file (agent run) or --cmd-file (command job)")
+    return None
+
+
 def cmd_run(args) -> int:
+    cmd_file = check_job_args(args.agent, args.prompt_file, args.cmd_file, args.model)
     b = boxmod.load(args.profile)
     timeout = schedule.parse_timeout(args.timeout) if args.timeout else None
-    rc, rd = run_headless(b, args.agent, Path(args.prompt_file), args.model, os.getcwd(),
-                          timeout=timeout)  # fmt: skip
+    if cmd_file is not None:
+        rc, rd = run_headless(b, None, Path(cmd_file), None, os.getcwd(), timeout=timeout)
+    else:
+        rc, rd = run_headless(b, args.agent, Path(args.prompt_file), args.model, os.getcwd(),
+                              timeout=timeout)  # fmt: skip
     print(term.clean(f"run: {rd} (exit {rc})"))
     return rc
 
@@ -249,7 +271,7 @@ def kill_run(b: boxmod.Box, run_id: str, proc: subprocess.Popen, all_procs: bool
 
 def run_headless(
     b: boxmod.Box,
-    agent: str,
+    agent: str | None,
     prompt_file: Path,
     model: str | None,
     host_dir: str,
@@ -257,30 +279,50 @@ def run_headless(
     timeout: float | None = None,
 ) -> tuple[int, Path]:
     """`run` bookkeeping; `made` gets the run dir as soon as it exists.
-    Always ends with stop_if_idle (a pinned box stays up)."""
+    Always ends with stop_if_idle (a pinned box stays up).
+    agent None: a command job; `prompt_file` is the script (PLAN §2.3), `model`
+    must be None. Both kinds send the file on stdin."""
+    cmd_job = agent is None
     try:
-        prompt = prompt_file.read_bytes()
+        data = prompt_file.read_bytes()
     except OSError as e:
-        raise CliError(f"cannot read prompt file: {e}") from None
-    route = launch.parse_model(b.profile, model)
-    ln = launch.agent_launch(b.profile, agent, [], headless=True, model=route)
-    argv = ln.argv
-    rd = runsmod.new_run_dir(b.state / "runs", agent)
+        raise CliError(f"cannot read {'command' if cmd_job else 'prompt'} file: {e}") from None
+    started = datetime.now(UTC).isoformat(timespec="seconds")
+    if cmd_job:
+        if model is not None:
+            raise CliError("a command job has no model")
+        argv, run_env = launch.command_argv(), {}
+        meta = {
+            "profile": b.name,
+            "kind": "cmd",
+            "argv": argv,
+            "env": run_env,
+            "cmd_file": str(prompt_file.resolve()),
+            "cmd_sha256": hashlib.sha256(data).hexdigest(),
+            "started": started,
+            "timeout": timeout,
+        }
+    else:
+        route = launch.parse_model(b.profile, model)
+        ln = launch.agent_launch(b.profile, agent, [], headless=True, model=route)
+        argv, run_env = ln.argv, ln.env
+        meta = {
+            "profile": b.name,
+            "kind": "agent",
+            "agent": agent,
+            "model": model,
+            "argv": argv,
+            "env": run_env,
+            "prompt": "stdin",
+            "prompt_file": str(prompt_file.resolve()),
+            "prompt_sha256": hashlib.sha256(data).hexdigest(),
+            "started": started,
+            "timeout": timeout,
+        }
+    rd = runsmod.new_run_dir(b.state / "runs", "cmd" if cmd_job else agent)
     if made is not None:
         made.append(rd)
     runsmod.prune(b.state / "runs", b.cfg.runs_keep, current=rd)
-    meta = {
-        "profile": b.name,
-        "agent": agent,
-        "model": model,
-        "argv": argv,
-        "env": ln.env,
-        "prompt": "stdin",
-        "prompt_file": str(prompt_file.resolve()),
-        "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
-        "started": datetime.now(UTC).isoformat(timespec="seconds"),
-        "timeout": timeout,
-    }
     transcript = runsmod.transcript_path(rd)
     rc = 125  # the box could not start / the run did not happen
     with boxmod.session_lock(b):
@@ -297,7 +339,7 @@ def run_headless(
             wd = launch.container_workdir(b.profile, host_dir)
             meta["workdir"] = wd
             host_scan_start(b, rd / "hostscan.json")
-            env = {**ln.env, runsmod.RUN_ENV: rd.name}
+            env = {**run_env, runsmod.RUN_ENV: rd.name}
             cmd = launch.exec_argv(b.project, str(b.compose_file), wd, argv, tty=False, env=env)
             with transcript.open("wb") as t, prompt_file.open("rb") as stdin:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -792,8 +834,9 @@ class RunFailed(Exception):
         self.rc = rc
 
 
-def sched_runner(profile: str, agent: str, prompt: str, model: str | None, timeout=None):
-    """In-process `run` for `schedule _fire`; the host dir "/" selects the first mount."""
+def sched_runner(profile: str, agent: str | None, prompt: str, model: str | None, timeout=None):
+    """In-process `run` for `schedule _fire`; the host dir "/" selects the first mount.
+    agent None: a command job, `prompt` is its script."""
     made: list[Path] = []
     try:
         b = boxmod.load(profile)
@@ -816,10 +859,11 @@ def secret_fix(prof, m) -> str:
     return f"{m.name} ({m.ref}) is missing: {how}"
 
 
-def agent_credential(prof, agent: str, model: str | None) -> str | None:
+def agent_credential(prof, agent: str | None, model: str | None) -> str | None:
     """The secret the chosen agent itself needs, if a missing one is detectable.
     Claude needs the shared token unless --model routes to ollama/ or remote/.
-    Codex and Pi log in inside the box (not cheaply detectable): None."""
+    Codex and Pi log in inside the box (not cheaply detectable): None.
+    A command job (agent None) has no agent: None."""
     if agent != "claude":
         return None
     route = launch.parse_model(prof, model)
@@ -828,22 +872,24 @@ def agent_credential(prof, agent: str, model: str | None) -> str | None:
     return CLAUDE_TOKEN
 
 
-def sched_check(prof, cfg, agent: str, model: str | None) -> tuple[str | None, list[str]]:
-    """(error, warnings): error only for the agent's own missing credential."""
+def sched_check(prof, cfg, agent: str | None, model: str | None) -> tuple[str | None, list[str]]:
+    """(error, warnings): error only for the agent's own missing credential.
+    A command job has none, and its script may start `claude -p`, so the
+    missing Claude token is a warning there."""
     need = agent_credential(prof, agent, model)
     error, warnings = None, []
     for m in delivery.collect(prof, cfg, None).missing:
         if m.name == need:
             error = secret_fix(prof, m)
-        elif m.name != CLAUDE_TOKEN:  # not needed by this agent/route
+        elif m.name != CLAUDE_TOKEN or agent is None:  # else: not needed by this agent/route
             warnings.append(secret_fix(prof, m))
     return error, warnings
 
 
-def sched_preflight(profile: str, agent: str, model: str | None = None, code: tuple = ()):
+def sched_preflight(profile: str, agent: str | None, model: str | None = None, code: tuple = ()):
     try:
         b = boxmod.load(profile)
-        if agent not in b.profile.box.agents:
+        if agent is not None and agent not in b.profile.box.agents:
             return f"{agent} is not in [box] agents of {profile}", []
         if msg := code_mount_problem(b.profile, tuple(code)):
             return msg, []
@@ -861,10 +907,13 @@ def _schedule_name(profile: str | None, name: str | None = None) -> None:
 
 def cmd_schedule_add(args) -> int:
     _schedule_name(args.profile, args.name)
+    cmd_file = check_job_args(args.agent, args.prompt_file, args.cmd_file, args.model)
+    kind = "agent" if cmd_file is None else "cmd"
     b = boxmod.load(args.profile)
-    if args.agent not in b.profile.box.agents:
-        raise CliError(f"{args.agent} is not in [box] agents of {b.name}")
-    launch.parse_model(b.profile, args.model)
+    if kind == "agent":  # a command job needs no agent in [box] agents
+        if args.agent not in b.profile.box.agents:
+            raise CliError(f"{args.agent} is not in [box] agents of {b.name}")
+        launch.parse_model(b.profile, args.model)
     spec = schedule.make_spec(args.cron, args.every, args.at, args.days)
     schedule.validate_for_platform(spec)
     now = datetime.now()
@@ -878,16 +927,18 @@ def cmd_schedule_add(args) -> int:
         if not args.force:
             raise CliError(f"schedule {args.name} exists for {b.name}; use --force to replace it")
         old = schedule.load_job(b.name, args.name)
+    what = "command" if kind == "cmd" else "prompt"
     try:
-        prompt = Path(args.prompt_file).read_bytes()
+        data = Path(cmd_file or args.prompt_file).read_bytes()
     except OSError as e:
-        raise CliError(f"cannot read prompt file: {e}") from None
+        raise CliError(f"cannot read {what} file: {e}") from None
     prog, extra = schedule.program_args()
     label = schedule.label_for(b.name, args.name)
     job = {
         "profile": b.name,
         "name": args.name,
-        "agent": args.agent,
+        "kind": kind,
+        "agent": args.agent,  # None for a command job
         "model": args.model,
         "schedule": spec.as_json(),
         "timeout": timeout,
@@ -907,7 +958,10 @@ def cmd_schedule_add(args) -> int:
     try:
         jd.mkdir(parents=True, exist_ok=True)
         os.chmod(jd, 0o700)
-        schedule.write_private(jd / "prompt.md", prompt)
+        schedule.write_private(jd / schedule.job_file(kind), data)
+        for other in ("agent", "cmd"):  # --force from the other kind: drop its stale copy
+            if other != kind:
+                (jd / schedule.job_file(other)).unlink(missing_ok=True)
         schedule.write_private(jd / "job.json", (json.dumps(job, indent=1) + "\n").encode())
         schedule.install(job)
     except BaseException:
@@ -933,7 +987,8 @@ def cmd_schedule_add(args) -> int:
     return 0
 
 
-def schedule_warnings(b: boxmod.Box, agent: str, model: str | None, extra: dict) -> list[str]:
+def schedule_warnings(b: boxmod.Box, agent: str | None, model: str | None,
+                      extra: dict) -> list[str]:  # fmt: skip
     error, warns = sched_check(b.profile, b.cfg, agent, model)
     out = [f"warning: {x}" for x in ([error] if error else []) + warns]
     if "PYTHONPATH" in extra:
@@ -962,18 +1017,30 @@ def schedule_warnings(b: boxmod.Box, agent: str, model: str | None, extra: dict)
 def cmd_schedule_edit(args) -> int:
     _schedule_name(args.profile, args.name)
     job = schedule.load_job(args.profile, args.name)
-    if args.prompt_file is None and args.timeout is None:
-        raise CliError("give --prompt-file and/or --timeout")
+    kind = schedule.job_kind(job)
+    new_file = args.cmd_file if kind == "cmd" else args.prompt_file
+    if args.prompt_file is None and args.cmd_file is None and args.timeout is None:
+        raise CliError("give --prompt-file (agent job), --cmd-file (command job), and/or --timeout")
+    if kind == "cmd" and args.prompt_file is not None:
+        raise CliError(
+            f"{args.profile}/{args.name} is a command job: use --cmd-file, not --prompt-file"
+        )
+    if kind == "agent" and args.cmd_file is not None:
+        raise CliError(
+            f"{args.profile}/{args.name} is an agent job: use --prompt-file, not --cmd-file"
+        )
+    timeout = schedule.parse_timeout(args.timeout) if args.timeout is not None else None
     jd = Path(job["dir"])
-    if args.prompt_file is not None:
+    what = "command" if kind == "cmd" else "prompt"
+    if new_file is not None:
         try:
-            prompt = Path(args.prompt_file).read_bytes()
+            data = Path(new_file).read_bytes()
         except OSError as e:
-            raise CliError(f"cannot read prompt file: {e}") from None
-        schedule.write_private(jd / "prompt.md", prompt)
-        print(f"{args.profile}/{args.name}: prompt replaced")
+            raise CliError(f"cannot read {what} file: {e}") from None
+        schedule.write_private(jd / schedule.job_file(kind), data)
+        print(f"{args.profile}/{args.name}: {what} replaced")
     if args.timeout is not None:
-        job["timeout"] = schedule.parse_timeout(args.timeout)
+        job["timeout"] = timeout
         schedule.write_private(jd / "job.json", (json.dumps(job, indent=1) + "\n").encode())
         print(f"{args.profile}/{args.name}: timeout {args.timeout}")
     return 0
@@ -1001,9 +1068,12 @@ def cmd_schedule_ls(args) -> int:
         if status == "running" and schedule.lock_free(jd):
             status = "running (stale: the fire process is gone)"
         rc = last.get("exit_code")
+        try:
+            what = "kind=cmd" if schedule.job_kind(j) == "cmd" else f"agent={j['agent']}"
+        except schedule.ScheduleError:
+            what = f"kind={j.get('kind')!r} (unknown)"
         lines = [
-            f"{j['profile']}/{j['name']}  agent={j['agent']}  {spec.text()}  "
-            f"[{schedule.installed(j)}]",
+            f"{j['profile']}/{j['name']}  {what}  {spec.text()}  [{schedule.installed(j)}]",
             f"  next: {nxt_s}",
             f"  last: {last.get('start', 'never')}  status={status}  "
             f"exit={'-' if rc is None else rc}",
@@ -1129,10 +1199,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--model", help=model_help)
         p.set_defaults(func=cmd_agent)
 
-    p = sub.add_parser("run", help="headless agent run")
+    p = sub.add_parser("run", help="headless run: --agent A --prompt-file F, or --cmd-file F")
     p.add_argument("profile")
-    p.add_argument("--agent", required=True, choices=AGENTS)
-    p.add_argument("--prompt-file", required=True)
+    p.add_argument("--agent", choices=AGENTS)
+    p.add_argument("--prompt-file", help="the prompt, on stdin of the agent (with --agent)")
+    p.add_argument("--cmd-file", help="a shell script to run in the box, on stdin of bash")
     p.add_argument("--model", help=model_help)
     p.add_argument("--timeout", help="kill the run after this long: 30m, 2h (rc 124)")
     p.set_defaults(func=cmd_run)
@@ -1202,11 +1273,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("schedule", help="scheduled headless runs: add / ls / rm / run-now / edit")
     ssub = p.add_subparsers(dest="schedule_command", metavar="<add|ls|rm|run-now|edit>")
     ssub.required = True
-    q = ssub.add_parser("add", help="add a job: add <profile> --name N --agent A --prompt-file F")
+    q = ssub.add_parser("add", help="add a job: add <profile> --name N "
+                        "(--agent A --prompt-file F | --cmd-file F)")  # fmt: skip
     q.add_argument("profile")
     q.add_argument("--name", required=True)
-    q.add_argument("--agent", required=True, choices=AGENTS)
-    q.add_argument("--prompt-file", required=True, help="copied into the state dir at add")
+    q.add_argument("--agent", choices=AGENTS)
+    q.add_argument("--prompt-file", help="the prompt, copied into the state dir at add")
+    q.add_argument("--cmd-file", help="a shell script instead of an agent, copied at add")
     q.add_argument("--model", help=model_help)
     q.add_argument("--cron", help='5 fields, local time: "m h dom mon dow"')
     q.add_argument("--every", help="interval: 30m, 2h, 1d")
@@ -1221,14 +1294,19 @@ def build_parser() -> argparse.ArgumentParser:
     for cmd, fn, hlp in (
         ("rm", cmd_schedule_rm, "unload and remove a job"),
         ("run-now", cmd_schedule_run_now, "run a job now, exactly as the scheduler does"),
-        ("edit", cmd_schedule_edit, "replace the prompt: edit <profile> <name> --prompt-file F"),
+        (
+            "edit",
+            cmd_schedule_edit,
+            "replace the prompt or script: edit <profile> <name> --prompt-file F | --cmd-file F",
+        ),
         ("_fire", cmd_schedule_fire, None),  # hidden: the scheduler calls it
     ):
         q = ssub.add_parser(cmd, **({"help": hlp} if hlp else {}))
         q.add_argument("profile")
         q.add_argument("name")
         if cmd == "edit":
-            q.add_argument("--prompt-file")
+            q.add_argument("--prompt-file", help="new prompt (agent job)")
+            q.add_argument("--cmd-file", help="new script (command job)")
             q.add_argument("--timeout", help="30m, 2h, 1d, or none")
         q.set_defaults(func=fn)
 

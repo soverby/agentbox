@@ -1119,7 +1119,8 @@ unchanged. Key fingerprints (`CLAUDE_KEY_FPR`,
 
 ## Linux host notes
 
-Linux is a secondary target and is not tested yet.
+Linux is a secondary target. CI tests it on `ubuntu-latest`. Interactive
+use on Linux is not tested.
 
 - Install Docker Engine and the Compose v2 plugin. Your user must be able
   to run `docker`.

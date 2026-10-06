@@ -133,8 +133,12 @@ allowlist, headless runs, scheduling, and `agentbox doctor`, step by step.
 
 - The main test host is macOS on Intel (x86_64) with Docker Desktop. The
   images are amd64 only.
-- Linux is a secondary target. The Linux CI workflow is in the repository,
-  but it has not run yet. Linux is not tested.
+- Linux is a secondary target. CI on Linux (`ubuntu-latest`) runs the unit
+  tests, the agent image build, and the network-isolation harness.
+  Interactive use on Linux is not tested.
+- Some paths are not tested live yet: Codex, Pi, OAuth MCP servers, a real
+  host Ollama, remote models, and the `op` and `env` secret backends. Read
+  "Tested paths" in [docs/releases/v1.0.0.md](docs/releases/v1.0.0.md).
 - On Linux, the default secret backend (macOS Keychain) is not available.
   Use the 1Password backend (`op`).
 - Host tools (git, VS Code, direnv, npm, make) that you run in a writable

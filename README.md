@@ -85,6 +85,19 @@ or a wrong tool call. The box keeps these properties against it:
 Read [docs/SECURITY.md](docs/SECURITY.md) for the enforcement of each
 property and for the risks that agentbox accepts.
 
+## Architecture
+
+The diagram shows where agentbox keeps definitions and state, the containers
+and networks of one box, and which parts need a replacement on a cloud host.
+Read [docs/PLAN.md](docs/PLAN.md) §2 for the full design.
+
+<a href="docs/assets/architecture.svg">
+  <img alt="agentbox architecture: definitions and state on the host, one box
+    with agent, mcp-gateway, router, ollama-gate and egress on an internal
+    network, and a cloud portability table"
+    src="docs/assets/architecture.svg" width="100%">
+</a>
+
 ## Quick start
 
 ```sh

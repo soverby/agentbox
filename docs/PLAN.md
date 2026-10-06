@@ -105,6 +105,9 @@ the agent container, and it can send any request to any sidecar it can reach.
 
 ## 2. Architecture
 
+Diagram: [`docs/assets/architecture.svg`](assets/architecture.svg) (storage,
+runtime topology, cloud portability).
+
 Per profile, one Compose project `agentbox-<profile>` with two networks:
 
 - `internal` (`internal: true`, fixed subnet, fixed IP per service): all

@@ -5,8 +5,16 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "cli"))
 
 import os  # noqa: E402
+import time  # noqa: E402
 
 import pytest  # noqa: E402
+
+# One fixed local time zone for the whole suite, set before any test module
+# builds local times at import (CI runs in UTC; fleet tests use Lisbon wall
+# clock, including its DST changes).
+os.environ["TZ"] = "Europe/Lisbon"
+if hasattr(time, "tzset"):
+    time.tzset()
 
 
 @pytest.hookimpl(tryfirst=True)

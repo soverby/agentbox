@@ -16,6 +16,7 @@ from . import notify, paths, schedule
 from .fleet import NOT_UNDERSTOOD, Fire, Report, label, parse_dt
 
 MAX_PROBLEM_LINES = 20
+EXCERPT = 80  # characters of the last line shown after an investigator answer
 COMMAND_LIMIT = 60.0
 FAILED_PREFIX = "🚦 fleet report FAILED: "
 # Classes that count as "failed" in the summary (T, S, X and P have their own).
@@ -69,24 +70,51 @@ def fire_line(f: Fire) -> str:
         head += f" (exit {f.exit_code})"
     if f.origin in ("manual", "extra"):
         head += f" [{f.origin}]"
+    if has_answer(f):
+        return answer_line(f, head)
     cause = full_cause(f)
     return f"{head}: {cause}" if cause else head
 
 
-def problem_lines(report: Report) -> list[str]:
-    """Every problem, uncapped: runs (a failed status post is its own line),
-    then idle boxes, then job copy drift."""
+def has_answer(f: Fire) -> bool:
+    return bool(f.investigation and f.investigation.startswith("investigator: "))
+
+
+def answer_line(f: Fire, head: str) -> str:
+    """With an investigator answer the answer comes first, then the start of
+    the rule cause (the transcript's last line): `<head>: investigator: <answer>
+    (last line: <first 80 characters>…)`. The line cap never cuts this line: the
+    answer is at most 200 characters, and the excerpt is at most 80."""
+    line = f"{head}: {notify.clean_line(f.investigation, 10**6)}"
+    if f.note:
+        line += f" ({f.note})"
+    last = notify.clean_line(f.cause or "", 10**6)
+    if last:
+        line += f" (last line: {last[:EXCERPT]}{'…' if len(last) > EXCERPT else ''})"
+    return line
+
+
+def problem_entries(report: Report) -> list[tuple[str, bool]]:
+    """(line, has an investigator answer). Runs (a failed status post is its
+    own line), then idle boxes, then job copy drift."""
     out = []
     for f in report.fires:
         if f.problem:
-            out.append(fire_line(f))
+            out.append((fire_line(f), has_answer(f)))
         if f.notify_error:
-            out.append(f"• {f.job} {label(parse_dt(f.when))} status post failed: {f.notify_error}")
+            out.append(
+                (f"• {f.job} {label(parse_dt(f.when))} status post failed: {f.notify_error}", False)
+            )
     for b in report.idle_boxes:
-        out.append(f"• idle box {b.profile} (up {b.up_hours} h): {b.cause}")
+        out.append((f"• idle box {b.profile} (up {b.up_hours} h): {b.cause}", False))
     for d in report.drift:
-        out.append(f"• {d['job']}: {d['text']}")
+        out.append((f"• {d['job']}: {d['text']}", False))
     return out
+
+
+def problem_lines(report: Report) -> list[str]:
+    """Every problem line, uncapped in number."""
+    return [line for line, _ in problem_entries(report)]
 
 
 def counts(report: Report) -> dict[str, int]:
@@ -157,16 +185,19 @@ def every_lines(report: Report) -> list[str]:
 
 def render_text(report: Report, slack: bool = False) -> str:
     """The text form. Slack: no interval-job lines, and `&`, `<`, `>` escaped."""
-    lines = [summary(report)]
-    probs = problem_lines(report)
-    lines += probs[:MAX_PROBLEM_LINES]
+    entries = [(summary(report), False)]
+    probs = problem_entries(report)
+    entries += probs[:MAX_PROBLEM_LINES]
     if len(probs) > MAX_PROBLEM_LINES:
-        lines.append(f"… and {len(probs) - MAX_PROBLEM_LINES} more")
+        entries.append((f"… and {len(probs) - MAX_PROBLEM_LINES} more", False))
     if report.idle_check != "ok" and probs:
-        lines.append(report.idle_check)
+        entries.append((report.idle_check, False))
     if not slack:
-        lines += every_lines(report)
-    lines = [notify.clean_line(x) for x in lines]
+        entries += [(x, False) for x in every_lines(report)]
+    # A line with an investigator answer is cleaned but never cut: the answer is
+    # already at most 200 characters, and the excerpt after it is at most 80.
+    lines = [notify.clean_line(x, max(len(x), 1) if keep else notify.LINE_CAP)
+             for x, keep in entries]  # fmt: skip
     return "\n".join(notify.slack_escape(x) for x in lines) if slack else "\n".join(lines)
 
 

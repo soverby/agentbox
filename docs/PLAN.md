@@ -1009,6 +1009,10 @@ Missed causes, in this order (first match wins):
     file`. Plural words are spelled out ("1 idle box", "2 idle boxes").
   - Every-job lines ("N runs (about M expected)") are in the text and JSON
     forms only, not in Slack.
+  - With an investigator answer, the answer comes first and is never cut by
+    the line cap: `• p/n MM-DD HH:MM failed (exit N): investigator: <answer> (last line:
+    <first 80 characters>[…])`; "…" only when the last line is longer than 80. Without an answer the cause is the rule cause,
+    as above. The same order applies to the text and Slack forms.
   - Every line goes through `clean_line`; Slack lines also through
     `slack_escape`. At most 20 problem lines; then "… and N more".
 - Failure of the report itself (an exception): with `--post`, it still

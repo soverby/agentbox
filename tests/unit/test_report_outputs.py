@@ -127,12 +127,73 @@ def test_carried_note_and_investigator_text():
     f = fire("failed", rc=1, cause="DIFFERENT", note="late, due 08:10",
              investigation="investigator: x")  # fmt: skip
     assert report_outputs.fire_line(f) == (
-        "• p/j 10-08 08:15 failed (exit 1): DIFFERENT (late, due 08:10); investigator: x"
+        "• p/j 10-08 08:15 failed (exit 1): investigator: x (late, due 08:10) "
+        "(last line: DIFFERENT)")  # fmt: skip
+    f.investigation = "(investigation failed: timed out after 3 min)"  # no answer: unchanged
+    assert report_outputs.fire_line(f) == (
+        "• p/j 10-08 08:15 failed (exit 1): DIFFERENT (late, due 08:10) "
+        "(investigation failed: timed out after 3 min)")  # fmt: skip
+
+
+def answered(last, answer, **kw):
+    return fire("failed", rc=1, cause=last, investigation=f"investigator: {answer}", **kw)
+
+
+def test_answer_comes_first_and_is_never_cut_by_the_line_cap():
+    last, answer = "L" * 250, "A" * 186  # "investigator: " + 186 = 200 characters
+    f = answered(last, answer)
+    r = report([f])
+    line = f"• p/j 10-08 08:15 failed (exit 1): investigator: {answer} (last line: {'L' * 80}…)"
+    assert report_outputs.fire_line(f) == line
+    assert report_outputs.render_text(r).splitlines()[1] == line
+    assert report_outputs.render_text(r, slack=True).splitlines()[1] == line
+    # the old order would have been cut inside the answer
+    assert len(f"• p/j 10-08 08:15 failed (exit 1): {last}; investigator: {answer}") > 300
+
+
+def test_answer_survives_cap_and_escaping_in_text_and_slack():
+    answer = "<@U1> & " + "B" * 190
+    last = "<!here> " + "L" * 242  # 250 characters
+    r = report([answered(last, answer)])
+    text, slack = (report_outputs.render_text(r), report_outputs.render_text(r, slack=True))
+    assert f"investigator: {answer}" in text.splitlines()[1]
+    esc = notify.slack_escape(answer)
+    assert f"investigator: {esc}" in slack.splitlines()[1]
+    assert "<@U1>" not in slack and "<!here>" not in slack
+    assert "(last line: <!here> " in text and "(last line: &lt;!here&gt; " in slack
+    for t in (text, slack):
+        assert t.splitlines()[1].endswith("…)")
+
+
+def test_last_line_excerpt_is_80_characters_with_an_ellipsis_only_when_cut():
+    f = answered("x" * 81, "ok")
+    assert report_outputs.fire_line(f).endswith("(last line: " + "x" * 80 + "…)")
+    f = answered("x" * 80, "ok")
+    assert report_outputs.fire_line(f).endswith("(last line: " + "x" * 80 + ")")
+    f = answered("short line", "ok")
+    assert report_outputs.fire_line(f).endswith("investigator: ok (last line: short line)")
+    f = answered("", "ok")
+    assert report_outputs.fire_line(f).endswith("investigator: ok")
+
+
+def test_answer_line_with_a_long_job_name_keeps_answer_and_excerpt():
+    answer = "C" * 186
+    f = answered("L" * 250, answer, job="p" * 31 + "/" + "j" * 31)
+    line = report_outputs.render_text(report([f])).splitlines()[1]
+    assert f"investigator: {answer} (last line: {'L' * 80}…)" in line and len(line) > 300
+
+
+def test_a_line_without_an_answer_is_unchanged():
+    f = fire("failed", rc=1, cause="boletim delta: DIFFERENT")
+    assert report_outputs.fire_line(f) == (
+        "• p/j 10-08 08:15 failed (exit 1): boletim delta: DIFFERENT"
     )
-    f.investigation = "(investigation failed: timed out after 3 min)"
-    assert report_outputs.fire_line(f).endswith(
-        "DIFFERENT (late, due 08:10) (investigation failed: timed out after 3 min)"
-    )
+    long = fire("failed", rc=1, cause="L" * 400)
+    line = report_outputs.render_text(report([long])).splitlines()[1]
+    assert len(line) == 300 and line.endswith("…")  # the cap still applies
+    for note in ("(investigation skipped: secrets unreadable)", "(investigation failed: exit 1)"):
+        g = fire("failed", rc=1, cause="DIFFERENT", investigation=note)
+        assert report_outputs.fire_line(g) == f"• p/j 10-08 08:15 failed (exit 1): DIFFERENT {note}"
 
 
 def test_every_job_lines_only_in_the_text_form():

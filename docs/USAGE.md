@@ -103,6 +103,8 @@ If a step fails, read [Troubleshooting](#troubleshooting).
 | `agentbox secret ls [--shared \| profile]` | Secret names and status, never values. |
 | `agentbox mcp login\|status\|logout` | OAuth for MCP servers. |
 | `agentbox schedule add\|ls\|rm\|edit\|run-now` | Scheduled headless runs (agent or command job). |
+| `agentbox schedule report [--since S] [--json] [--post] [--no-investigate]` | Fleet report: what was due, what ran, idle boxes (read [Fleet report](#fleet-report)). |
+| `agentbox schedule report --install [--at HH:MM]` / `--uninstall` | Install or remove the daily report job. |
 | `agentbox doctor [profile]` | Full isolation self-test. |
 | `agentbox update [--check]` | Update tool versions, rebuild, self-test. |
 
@@ -127,6 +129,7 @@ Files and directories:
 | `<state>/logs/mcp/calls.jsonl` | MCP gateway call log. |
 | `<state>/runs/<time>-<agent>/` | Headless run records (`<time>-cmd` for a command job). |
 | `<state>/schedules/<job>/` | Scheduled job files and logs. |
+| `~/.local/state/agentbox/_report/` | Fleet report job logs and `last.json` (0700). |
 
 The environment variables `AGENTBOX_CONFIG_HOME`, `AGENTBOX_STATE_HOME`, and
 `AGENTBOX_REPO` change these roots.
@@ -143,6 +146,9 @@ All values are TOML strings. An unknown key is an error.
 | `subnet_base` | `10.213.0.0/16` | A private `/16`. Change it if a VPN uses the range. |
 | `runs_keep` | `"200"` | Run records kept per profile, a whole number ≥ 1. |
 | `notify_webhook_secret` | none | Name of a shared secret that holds a Slack `https://` webhook URL. Scheduled runs post their status there (read [Notifications](#notifications)). Unset: no posts. |
+| `report_outputs` | `"slack"` | Comma list of outputs for `schedule report --post`: `stdout`, `json`, `slack`, `command`. Any other name is an error. `command` needs `report_command`. |
+| `report_command` | none | The program for the `command` output. A command line, split like a shell would split it, but run without a shell. The first word must be an absolute path. |
+| `report_investigator` | none | Name of a profile that explains failed runs in the fleet report (read [Investigator](#investigator)). Unset: off. |
 
 ## Profiles
 
@@ -890,6 +896,25 @@ agent job and `kind=cmd` for a command job. A job file from an older version
 
 To remove a job: `agentbox schedule rm myproject daily`. Run records stay.
 
+`add` and `edit` also store `source` in `job.json`: the full path of the
+file that they copied, and `source_sha256`, the SHA-256 of the copied bytes.
+A job from before this change has no `source` and gets no check. The CLI
+never copies the source again by itself, because the source can be in a
+folder that a box writes. You decide.
+
+`schedule ls` warns when the copy and the source differ:
+
+```text
+  warning: job copy differs from /w/brief.sh; run `agentbox schedule edit boletim brief --cmd-file /w/brief.sh` to update it
+  warning: source gone (/w/brief.sh)
+  warning: source is not a plain file (/w/brief.sh)
+```
+
+The CLI opens the source without following a symlink and without waiting
+on a pipe. It reads the file only if it is a regular file of at most 1 MiB,
+and only to hash it. Other files give the "not a plain file" warning. No
+file content goes to the screen or to the report.
+
 When a job fires:
 
 - If Docker is down, the job starts Docker Desktop (`open -ga Docker`) and
@@ -915,6 +940,13 @@ Exit codes of a fire:
 | 124 | Killed after the timeout. |
 | 125 | The run failed to start. |
 | 143 | Stopped by SIGTERM (for example logout). |
+
+Each fire records how it started, as `trigger` in `last.json` and
+`history.jsonl`: `schedule` (launchd or cron) or `run-now`. `schedule run-now`
+sets `AGENTBOX_FIRE_TRIGGER=run-now` for the fire. The scheduler never passes
+this variable, so a box or a shell cannot set it for a scheduled fire. Any
+other value refuses the fire (exit 78 with a message). A record without
+`trigger` (older versions) counts as `schedule`.
 
 ### Notifications
 
@@ -998,6 +1030,221 @@ Job files are in `<state>/schedules/<name>/`: `job.json`, `prompt.md` (or
 `schedule add` refuses a profile with a `rw` mount that overlaps the code
 that the job runs on the host.
 
+### Fleet report
+
+`agentbox schedule report` gives one view of all scheduled jobs and boxes on
+the host. It runs on the host, because a box cannot see the state folder.
+It reads files and probes lock files. It changes no job and no box. It
+writes only lock files and its own files in `_report/`.
+
+```sh
+agentbox schedule report                       # the last 24 hours, to the screen
+agentbox schedule report --since 3d --json     # the report object, schema version 1
+agentbox schedule report --post                # deliver to report_outputs (default: Slack)
+agentbox schedule report --no-investigate      # skip the investigator for this report
+```
+
+`--since` takes `Nh` or `Nd`, from `1h` to `14d`. The exit code is 0 when the
+report was made (also when it lists problems) and 1 when the report itself
+failed. `--json` and `--post` do not combine.
+
+All well, one line:
+
+```text
+🚦 all 8 scheduled runs completed, no idle boxes
+```
+
+For one run it reads `🚦 1 scheduled run completed, no idle boxes`. For none
+it reads `🚦 no scheduled runs were due, no idle boxes`. Manual runs add
+`(+2 manual runs)`. If Docker does not answer, "no idle boxes" becomes
+"idle-box check skipped: Docker not running". Otherwise a summary line, then one line for each problem:
+
+```text
+⚠️ 7 of 8 scheduled runs completed normally, 1 failed, 2 idle boxes
+• boletim/delta 10-08 08:15 failed (exit 1): boletim delta: DIFFERENT vs 2026-10-07
+• idle box portfolio (up 17 h): pinned since 10-06 18:52 (manual `up` or an interactive session)
+• idle box boletim (up 15 h): pinned since 10-06 18:30 (manual `up` or an interactive session)
+```
+
+The summary shows each count that is not zero: `failed`, `timed out`,
+`skipped`, `missed`, `not run yet`, `idle box(es)`, `job copies changed`, and
+`status posts failed`. The first five count due fires only, so the number of
+normal runs plus these counts is N. A failed run-now run or extra run is
+counted apart (`1 manual run failed`, `1 extra run failed`). N counts the due fires that ran, were missed, or have
+not run yet, plus the runs from before a job was last replaced. A fire that
+is still running, or was due less than 30 minutes ago, is not counted. A
+run-now run, or a run that matches no due time, is counted apart from N
+(`manual`, `extra`). If it failed, it is still a problem line. The report
+shows at most 20 problem lines, then `… and N more`. Every line is cleaned of
+control characters and cut at 300 characters. Slack lines also escape `&`,
+`<`, and `>`.
+
+**Window.** Without `--post`, the window is the last `--since` before now.
+With `--post`, the window starts where the last posted report ended (at most
+14 days back), so a report that runs late after a wake leaves no gap and no
+overlap. After a delivery that worked, the report writes
+`~/.local/state/agentbox/_report/last.json` with the end of the window and the
+due times that it could not judge yet (not run yet, too recent, or still
+running). The next posted report checks them again, also against a run that
+started before its window. It marks a late match as `(late, due 07:05)`; a
+run that was still running has no note. If `last.json` cannot
+be read, or ends in the future, the window is the last `--since`.
+
+**What was due.** The report reads the live schedules. A cron job is due at
+each cron time in the window that is at or after the job was added (or
+re-added with `--force`). Times are local wall-clock times. A time that does
+not exist (spring-forward gap) is not due. A time that happens twice
+(fall-back) is due once. A run before the job was replaced counts with its
+own status and is never `missed`.
+
+An `--every` job has no exact due times on macOS: launchd skips an interval
+that falls in sleep. The report never says `missed` for it. It shows `N runs
+(about M expected)` in the screen form and lists only the problem runs. On
+Linux, `--every` is cron, so its times are exact.
+
+**Matching.** A due time takes the first run of the job that starts from 2
+minutes before it up to 6 hours after it, but not past the next due time.
+The 6 hours cover a run after wake. launchd runs one catch-up fire for all
+times that it missed during sleep: the report matches that run to the last
+due time, and the earlier times are `missed` with the cause "coalesced into
+the catch-up fire".
+
+| Class | Meaning and cause shown |
+| --- | --- |
+| `ok` | The run exited 0. |
+| `timeout` | The CLI killed the run at its timeout. A script that exits 124 itself is `failed`. |
+| `failed` | Another non-zero exit. The cause is the last line of the transcript. |
+| `docker_down` | Exit 69. Docker did not come up. |
+| `preflight` | Exit 78, no run. The cause is the message of the fire. |
+| `start_failed` | Exit 125. The runner failed. |
+| `terminated` | A signal stopped the fire (logout, shutdown, bootout). |
+| `skipped` | A run of the job was still active. |
+| `still_running` | The run is active now. Not a problem. An earlier due time with no run follows the other rules. |
+| `stale_running` | The record says running, but no fire process holds the lock. |
+| `not_run_yet` | No run yet, and a late run can still come. A problem line (`not run yet`, plus the missed cause when one is found). |
+| `missed` | No run. The cause comes from the first of these that fits: the job is not loaded (or not in the crontab); the host booted after the due time; the Mac slept (`pmset -g log`, macOS only, 20 seconds at most); else "no fire recorded". |
+
+A history line that the report cannot read, or that has an unknown status,
+gives one line, `history row not understood`. It does not stop the report.
+
+A run whose Slack post failed gets an extra line (`status post failed:
+<reason>`), also when the run was `ok`.
+
+**Idle boxes.** The report lists a box that runs, is not used by a job or a
+session, and started more than 1 hour ago. This is the state now; `--since`
+does not apply. The cause is `pinned since <time>`, or the note that the last
+run left it up, or "running, not pinned, no run left it up". A box that is
+starting or stopping is not listed. If Docker does not answer in 30 seconds,
+the report says "idle-box check skipped: Docker not running" and goes on.
+
+**Job copies.** A job whose copy differs from its `source` gets a line (read
+[Scheduling](#scheduling)).
+
+#### Install the daily report
+
+```sh
+agentbox schedule report --install              # every day at 09:30
+agentbox schedule report --install --at 08:45
+agentbox schedule report --uninstall
+```
+
+This writes one host job that runs `agentbox schedule report --post`. On macOS
+the launchd label is `com.agentbox._report` (the prefix follows
+`AGENTBOX_LAUNCHD_PREFIX`). On Linux the crontab entry has the tag
+`# agentbox:_report`. Its logs and `last.json` are in
+`~/.local/state/agentbox/_report/`. `agentbox doctor` checks that the job is
+loaded (check 22). To test the text first, run `agentbox schedule report`.
+`--post` needs `notify_webhook_secret` for the default `slack` output (read
+[Notifications](#notifications)). The report posts to the same webhook.
+
+#### Outputs
+
+`report_outputs` in `config.toml` names the outputs for `--post`, for example
+`report_outputs = "slack,command"`. The outputs are built in. A config file
+cannot add code.
+
+| Output | Does |
+| --- | --- |
+| `stdout` | Prints the text form. The default without `--post`. |
+| `json` | Prints the report object (schema version 1). |
+| `slack` | Posts the text form to the notification webhook. |
+| `command` | Runs `report_command` with the JSON on stdin. No shell. 60 seconds at most. |
+
+If an output fails, `--post` exits 1. If the report itself fails (also when
+`slack` has no `notify_webhook_secret`), it prints and posts one line,
+`🚦 fleet report FAILED: <reason>`, and exits 1. The reason is cleaned and
+scrubbed of secret values that the report read. After a failed delivery the
+report does not write `last.json`, so the next report covers the same time.
+
+#### Investigator
+
+The investigator is optional and off by default. When a run failed and the
+rules find no cause beyond the last transcript line, the report can ask
+Claude in a separate box. At most 5 failures per report go there. Each gets
+3 minutes.
+
+The investigator profile must be safe. The report refuses it, and `doctor`
+check 22 fails, unless all of this is true:
+
+- One `[[mount]]`, `mode = "ro"`, of an empty folder that you made for this.
+  The folder is not the same as, inside, or around a mount of any other
+  profile. It cannot be under `~/.local` or another denied path.
+- `[network]`: `strict` mode, presets `["anthropic"]`, no `allow`.
+- No `[mcp.servers]`. `[models]` has its defaults.
+- `agents = ["claude"]`, `web_tools = false`, `skip_permissions = false`.
+- `[secrets]` holds only the Claude token that agentbox adds itself.
+- Every other profile loads. A profile that does not load fails the check
+  ("cannot verify against profile X"), because the report cannot compare its
+  mounts.
+
+Example `~/.config/agentbox/profiles/investigator.toml`:
+
+```toml
+[box]
+agents = ["claude"]
+web_tools = false
+skip_permissions = false
+
+[[mount]]
+host = "~/agentbox-investigator"
+mode = "ro"
+
+[network]
+mode = "strict"
+presets = ["anthropic"]
+```
+
+Set it up:
+
+```sh
+mkdir ~/agentbox-investigator                  # keep it empty
+agentbox validate ~/.config/agentbox/profiles/investigator.toml
+echo 'report_investigator = "investigator"' >> ~/.config/agentbox/config.toml
+agentbox doctor investigator                   # check 22-report must PASS
+```
+
+`agentbox setup` stores the shared Claude token that the box uses.
+
+For each failure the report builds an evidence bundle on the host: the job
+file without `env`, the job's runs in the window, the last 400 lines of the
+transcript, the last 100 lines of `launchd.err`, and the run `meta.json`
+without `env`. Your home folder path becomes `~`. Every part is scrubbed of
+the webhook URL and of each secret value that the failing job's profile
+delivers. If the report cannot read those values, it does not investigate
+that failure ("investigation skipped: secrets unreadable"). Scrubbing finds
+pieces of 16 characters or more of a value, its hex form, or its base64
+form. A shorter secret, or one printed in another form, is not found.
+
+The prompt marks the bundle as untrusted data from another box, not as
+instructions. The box runs `agentbox run investigator --agent claude`. It
+sees only the empty folder and the Anthropic API. The investigator sees only
+agentbox state, not the job's own project files, so "Cause not in evidence"
+is a valid answer. The answer is the last line of its transcript, cleaned
+and cut at 200 characters, and it appears as `investigator: <line>`. On a
+timeout or an error the rule cause stays, with `(investigation failed:
+<reason>)`. A prompt injection in the evidence can change the answer line,
+and nothing else.
+
 ## doctor
 
 `agentbox doctor [profile]` runs the full self-test. If the box does not
@@ -1032,6 +1279,7 @@ it. `setup` and `update` run the full suite on a scratch profile.
 | 19 | Open-mode denials (IP, private ranges, host); IPv6 when available. |
 | 20 | Gateway: token required, tool policy, no upstream access for the agent, all upstreams connected, OAuth store private. |
 | 21 | Router: admin routes refused, no `api_base` override (SKIP without router). |
+| 22 | Fleet report (`22-report`, host-level, once per `doctor` call): the investigator profile passes the safety check; the report job is loaded. SKIP without `report_investigator` and without an installed report job. |
 
 `14 codex-apps-live` is always SKIP: check `/apps` in a Codex session by
 hand. Doctor results can be faked by an agent process that stays running in

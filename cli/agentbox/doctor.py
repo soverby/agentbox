@@ -23,10 +23,12 @@ from . import (
     doctor_mcp,
     doctor_router,
     egress,
+    fleet,
     launch,
     mcpgw,
     network,
     paths,
+    schedule,
     secretstore,
 )
 from .denied import allow_matches
@@ -615,3 +617,35 @@ def mcp_checks(b: boxmod.Box, allowlist: list[str]) -> list[Result]:
 def _num(check: str) -> int:
     head = check.split()[0].split("-")[0]
     return int(head) if head.isdigit() else 999
+
+
+def check_22() -> Result:
+    """Fleet report (PLAN §2.8). Host-level: not tied to a profile, run once
+    per `doctor` call. When `report_investigator` is set, its profile passes
+    the safety check; when the report job is installed, it is loaded (or in
+    the crontab)."""
+    name = "22-report"
+    try:
+        cfg = paths.load_config()
+    except paths.ConfigError as e:
+        return Result("FAIL", name, f"config.toml: {e}")
+    inv, job = cfg.report_investigator, schedule.report_installed()
+    if inv is None and job is None:
+        return Result("SKIP", name, "no report_investigator and no report job installed")
+    bad: list[str] = []
+    good: list[str] = []
+    if inv is not None:
+        problems = fleet.investigator_problems(inv)
+        if problems:
+            bad.append(f"investigator profile {inv}: " + "; ".join(problems))
+        else:
+            good.append(f"investigator profile {inv} passes the safety check")
+    if job in ("loaded", "in crontab"):
+        good.append(f"report job {job}")
+    elif job == "not loaded":
+        bad.append(
+            "report job is installed but not loaded (run `agentbox schedule report --install`)"
+        )
+    elif job is not None:
+        bad.append(f"report job state unknown ({job})")
+    return Result("FAIL" if bad else "PASS", name, "; ".join(bad or good))

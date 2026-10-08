@@ -66,12 +66,14 @@ def _run(argv: list[str], *, input: str | None = None, env: dict | None = None):
         raise SecretError(f"{argv[0]}: command not found") from None
 
 
-def scrub(text: str, value: str | None) -> str:
+def scrub(text: str, value: str | None, cap: int | None = 300) -> str:
     """Error text without the value, and without any piece (>= 16 chars) of
-    the value, its hex, or its base64 (stored form)."""
+    the value, its hex, or its base64 (stored form). Only the last `cap`
+    characters are kept; `cap` None keeps all (the fleet report scrubs bulk
+    evidence)."""
     text = text.strip()
     if not value:
-        return text[-300:]
+        return text if cap is None else text[-cap:]
     forms = [value, value.encode().hex(), base64.b64encode(value.encode()).decode()]
     grams = {f[i : i + SCRUB_MIN] for f in forms for i in range(len(f) - SCRUB_MIN + 1)}
     mark = [False] * len(text)
@@ -91,7 +93,7 @@ def scrub(text: str, value: str | None) -> str:
     res = "".join(out)
     if len(value) < SCRUB_MIN:
         res = res.replace(value, "<redacted>")
-    return res[-300:]
+    return res if cap is None else res[-cap:]
 
 
 KEYCHAIN_ONLY_MAC = (

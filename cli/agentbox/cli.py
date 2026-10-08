@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import threading
 import tomllib
+import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -28,6 +30,7 @@ from . import (
     denied,
     docker,
     egress,
+    fleet,
     hostscan,
     images,
     launch,
@@ -38,6 +41,7 @@ from . import (
     notify,
     paths,
     presets,
+    report_outputs,
     schedule,
     secretstore,
     term,
@@ -498,7 +502,7 @@ def cmd_doctor(args) -> int:
             (b.state / boxmod.PIN_FILE).unlink(missing_ok=True)  # stale: box is down
             boxmod.up(b)
         try:
-            ok = print_results(doc.full(b))
+            ok = print_results([*doc.full(b), doc.check_22()])  # 22 is host-level: once per call
         finally:
             if started:  # stop it again unless pinned or another session uses it
                 why = stop_if_idle(b)
@@ -956,6 +960,8 @@ def cmd_schedule_add(args) -> int:
         "argv": schedule.fire_argv(prog, b.name, args.name),
         "env": schedule.job_env(extra),
         "created": schedule.now_iso(),
+        "source": str(Path(cmd_file or args.prompt_file).resolve()),
+        "source_sha256": hashlib.sha256(data).hexdigest(),
     }
     if msg := code_mount_problem(b.profile, schedule.job_code_paths(job)):
         raise CliError(msg)
@@ -1046,11 +1052,14 @@ def cmd_schedule_edit(args) -> int:
         except OSError as e:
             raise CliError(f"cannot read {what} file: {e}") from None
         schedule.write_private(jd / schedule.job_file(kind), data)
+        job["source"] = str(Path(new_file).resolve())
+        job["source_sha256"] = hashlib.sha256(data).hexdigest()
         print(f"{args.profile}/{args.name}: {what} replaced")
     if args.timeout is not None:
         job["timeout"] = timeout
-        schedule.write_private(jd / "job.json", (json.dumps(job, indent=1) + "\n").encode())
         print(f"{args.profile}/{args.name}: timeout {args.timeout}")
+    if new_file is not None or args.timeout is not None:
+        schedule.write_private(jd / "job.json", (json.dumps(job, indent=1) + "\n").encode())
     return 0
 
 
@@ -1102,6 +1111,14 @@ def cmd_schedule_ls(args) -> int:
             lines.append(f"  warning: notification failed: {why}")
         if sk := schedule.skip_summary(jd):
             lines.append(f"  {sk}")
+        if drift := schedule.source_drift(j):
+            src = j["source"]
+            if drift[0] == "differs":
+                opt = "--cmd-file" if j.get("kind") == "cmd" else "--prompt-file"
+                fix = f"agentbox schedule edit {j['profile']} {j['name']} {opt} {shlex.quote(src)}"
+                lines.append(f"  warning: job copy differs from {src}; run `{fix}` to update it")
+            else:
+                lines.append(f"  warning: {drift[1]} ({src})")
         print(term.clean("\n".join(lines), multiline=True))
     return 0
 
@@ -1127,7 +1144,8 @@ def cmd_schedule_run_now(args) -> int:
     _schedule_name(args.profile, args.name)
     job = schedule.load_job(args.profile, args.name)
     print(term.clean(f"running as the scheduler would: {' '.join(job['argv'])}"), flush=True)
-    rc = subprocess.run(job["argv"], env=job["env"], cwd="/", stdin=subprocess.DEVNULL).returncode
+    env = {**job["env"], schedule.TRIGGER_ENV: "run-now"}  # the fire records how it started
+    rc = subprocess.run(job["argv"], env=env, cwd="/", stdin=subprocess.DEVNULL).returncode
     if rc == schedule.RC_SKIPPED:
         print(schedule.SKIP_MSG)
         return rc
@@ -1138,6 +1156,93 @@ def cmd_schedule_run_now(args) -> int:
     if last.get("notify"):
         print(term.clean(f"notify: {last['notify']}"))
     return rc
+
+
+def reason_text(e: BaseException, scrubber: fleet.Scrubber) -> str:
+    """One line for the FAILED message, scrubbed against every value that the
+    report read (before the length cap, so a cut cannot leave a secret piece)."""
+    if isinstance(e, urllib.error.URLError):
+        text = f"network error: {e.reason}"
+    elif isinstance(e, notify.NotifyError | secretstore.SecretError | paths.ConfigError
+                    | fleet.FleetError | report_outputs.OutputError):  # fmt: skip
+        text = str(e)
+    else:
+        text = f"{type(e).__name__}: {e}"
+    return notify.clean_line(scrubber.scrub(text), notify.REASON_CAP)
+
+
+def report_failed(e: BaseException, post: bool, scrubber: fleet.Scrubber) -> int:
+    reason = reason_text(e, scrubber)
+    if not post:
+        err(f"fleet report failed: {reason}")
+        return 1
+    print(report_outputs.render_failed(reason), flush=True)
+    with contextlib.suppress(Exception):  # the line is on stdout already
+        report_outputs.post_failed(reason, paths.load_config())
+    return 1
+
+
+def cmd_schedule_report(args) -> int:
+    if args.install or args.uninstall:
+        return report_job(args)
+    if args.at is not None:
+        raise CliError("--at works only with --install")
+    if args.json and args.post:
+        raise CliError("--json cannot be combined with --post; set report_outputs for --post")
+    try:
+        since = fleet.parse_since(args.since or "24h")
+    except fleet.FleetError as e:
+        raise CliError(str(e)) from None
+    scrubber = fleet.Scrubber()
+    try:
+        cfg = paths.load_config()
+        rep = fleet.build_report(datetime.now().astimezone(), since, post=args.post,
+                                 investigate=not args.no_investigate, cfg=cfg,
+                                 scrubber=scrubber)  # fmt: skip
+        outs = cfg.report_outputs if args.post else (("json",) if args.json else ("stdout",))
+        failures = []
+        for name in outs:
+            out = report_outputs.OUTPUTS[name]
+            try:
+                out.deliver(out.render(rep), cfg)
+            except report_outputs.OutputError as e:
+                failures.append(str(e))
+        if failures:
+            raise report_outputs.OutputError("; ".join(failures))
+        if args.post:
+            fleet.save_last_report(rep)  # only after a delivery that worked
+            print(f"fleet report delivered: {', '.join(outs)}")
+    except Exception as e:  # noqa: BLE001 - a failing report still says so
+        return report_failed(e, args.post, scrubber)
+    return 0
+
+
+def report_job(args) -> int:
+    """`schedule report --install [--at HH:MM]` / `--uninstall` (PLAN §2.8)."""
+    if args.install and args.uninstall:
+        raise CliError("--install and --uninstall cannot be combined")
+    for opt, given in (("--post", args.post), ("--json", args.json),
+                       ("--no-investigate", args.no_investigate),
+                       ("--since", args.since is not None)):  # fmt: skip
+        if given:
+            raise CliError(f"{opt} cannot be combined with --install or --uninstall")
+    if args.uninstall:
+        if args.at is not None:
+            raise CliError("--at works only with --install")
+        found = schedule.report_uninstall()
+        print("fleet report job removed" if found else "no fleet report job installed")
+        return 0
+    prog, extra = schedule.program_args()
+    job = schedule.report_job(fleet.report_dir(), args.at or "09:30", prog, extra)
+    schedule.check_render(job)  # before anything is installed
+    schedule.report_install(job)
+    where = job["plist"] if schedule.is_macos() else "crontab"
+    print(term.clean(f"fleet report: daily at {args.at or '09:30'} ({where})"))
+    print("test it now, without a post: agentbox schedule report")
+    cfg = paths.load_config()
+    if "slack" in cfg.report_outputs and cfg.notify_webhook_secret is None:
+        err("warning: report_outputs includes slack, but notify_webhook_secret is not set")
+    return 0
 
 
 def cmd_schedule_fire(args) -> int:
@@ -1283,8 +1388,10 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("server")
     q.set_defaults(func=cmd_mcp_logout)
 
-    p = sub.add_parser("schedule", help="scheduled headless runs: add / ls / rm / run-now / edit")
-    ssub = p.add_subparsers(dest="schedule_command", metavar="<add|ls|rm|run-now|edit>")
+    p = sub.add_parser(
+        "schedule", help="scheduled headless runs: add / ls / rm / run-now / edit / report"
+    )
+    ssub = p.add_subparsers(dest="schedule_command", metavar="<add|ls|rm|run-now|edit|report>")
     ssub.required = True
     q = ssub.add_parser("add", help="add a job: add <profile> --name N "
                         "(--agent A --prompt-file F | --cmd-file F)")  # fmt: skip
@@ -1304,6 +1411,15 @@ def build_parser() -> argparse.ArgumentParser:
     q = ssub.add_parser("ls", help="jobs, next run, last result")
     q.add_argument("profile", nargs="?")
     q.set_defaults(func=cmd_schedule_ls)
+    q = ssub.add_parser("report", help="fleet report: what was due, what ran, idle boxes")
+    q.add_argument("--since", help="window: 1h to 14d, as 24h or 3d (default 24h)")
+    q.add_argument("--json", action="store_true", help="print the report object")
+    q.add_argument("--post", action="store_true", help="deliver to the report_outputs")
+    q.add_argument("--no-investigate", action="store_true", help="skip the investigator box")
+    q.add_argument("--install", action="store_true", help="install the daily report job")
+    q.add_argument("--uninstall", action="store_true", help="remove the daily report job")
+    q.add_argument("--at", help="with --install: HH:MM local time (default 09:30)")
+    q.set_defaults(func=cmd_schedule_report)
     for cmd, fn, hlp in (
         ("rm", cmd_schedule_rm, "unload and remove a job"),
         ("run-now", cmd_schedule_run_now, "run a job now, exactly as the scheduler does"),
@@ -1357,6 +1473,7 @@ def main(argv: list[str] | None = None) -> int:
         mountstate.MountChangeError,
         secretstore.SecretError,
         schedule.ScheduleError,
+        fleet.FleetError,
         mcpcmd.McpCmdError,
         mcpoauth.OAuthError,
     ) as e:

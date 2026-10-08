@@ -24,7 +24,9 @@ separate Day and Weekday entries for the same result.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
+import hashlib
 import itertools
 import json
 import os
@@ -32,6 +34,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -65,6 +68,11 @@ RC_SKIPPED = 75  # EX_TEMPFAIL
 RC_TERMINATED = 143
 SKIP_MSG = "skipped: a run is active"
 SKIP_NOTE = "another run of this job is still active"
+# How a fire started (PLAN §2.7). `schedule run-now` sets the variable; it is
+# not in PASS_ENV, so a scheduled fire never inherits it.
+TRIGGER_ENV = "AGENTBOX_FIRE_TRIGGER"
+TRIGGERS = ("schedule", "run-now")
+SOURCE_MAX = 1024 * 1024  # largest source file the drift check reads
 
 
 class Terminated(Exception):
@@ -281,6 +289,17 @@ def launchd_calendar(expr: str) -> list[dict[str, int]]:
     return out
 
 
+def _day_matches(c: Cron, day) -> bool:
+    """Does the cron fire on this calendar day (month, then dom/dow rule)?"""
+    dow = (day.weekday() + 1) % 7
+    if c.month is not None and day.month not in c.month:
+        return False
+    dm = c.dom is None or day.day in c.dom
+    ww = c.dow is None or dow in c.dow
+    either = c.dom is not None and c.dow is not None
+    return (dm or ww) if either else (dm and ww)
+
+
 def next_fires(spec: Spec, now: datetime, n: int = 3) -> list[datetime]:
     """Next n local fire times. --every: from now (launchd counts from load)."""
     now = now.replace(second=0, microsecond=0)
@@ -290,19 +309,40 @@ def next_fires(spec: Spec, now: datetime, n: int = 3) -> list[datetime]:
     out: list[datetime] = []
     day = now.date()
     for _ in range(366 * 5):
-        dow = (day.weekday() + 1) % 7
-        if c.month is None or day.month in c.month:
-            dm = c.dom is None or day.day in c.dom
-            ww = c.dow is None or dow in c.dow
-            either = c.dom is not None and c.dow is not None
-            if (dm or ww) if either else (dm and ww):
-                for h in c.hour:
-                    for mi in c.minute:
-                        t = datetime(day.year, day.month, day.day, h, mi)
-                        if t > now:
-                            out.append(t)
-                            if len(out) == n:
-                                return out
+        if _day_matches(c, day):
+            for h in c.hour:
+                for mi in c.minute:
+                    t = datetime(day.year, day.month, day.day, h, mi)
+                    if t > now:
+                        out.append(t)
+                        if len(out) == n:
+                            return out
+        day += timedelta(days=1)
+    return out
+
+
+def fires_between(spec: Spec, start: datetime, end: datetime) -> list[datetime]:
+    """Cron fire times in [start, end), as aware local times (PLAN §2.8).
+    A cron time is a naive local wall-clock time made aware with `astimezone()`
+    (fold 0). A time that does not exist (spring-forward gap) is skipped; an
+    ambiguous one (fall-back) is returned once. `--every` has no exact times."""
+    if spec.every:
+        raise ScheduleError("an --every schedule has no exact fire times")
+    c = parse_cron(spec.cron)
+    lo, hi = start.astimezone(), end.astimezone()
+    out: list[datetime] = []
+    day = lo.date() - timedelta(days=1)
+    last = hi.date() + timedelta(days=1)
+    while day <= last:
+        if _day_matches(c, day):
+            for h in c.hour:
+                for mi in c.minute:
+                    naive = datetime(day.year, day.month, day.day, h, mi)
+                    t = naive.astimezone()
+                    if t.replace(tzinfo=None) != naive:  # in the gap: this time never happens
+                        continue
+                    if lo <= t < hi:
+                        out.append(t)
         day += timedelta(days=1)
     return out
 
@@ -324,11 +364,15 @@ def launchagents_dir() -> Path:
     return Path(v) if v else Path.home() / "Library" / "LaunchAgents"
 
 
-def label_for(profile: str, name: str) -> str:
+def launchd_prefix() -> str:
     prefix = os.environ.get("AGENTBOX_LAUNCHD_PREFIX", "com.agentbox")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,100}", prefix):
         raise ScheduleError(f"AGENTBOX_LAUNCHD_PREFIX {prefix!r} is not a valid label prefix")
-    return f"{prefix}.{profile}.{name}"
+    return prefix
+
+
+def label_for(profile: str, name: str) -> str:
+    return f"{launchd_prefix()}.{profile}.{name}"
 
 
 def write_private(f: Path, data: bytes, mode: int = 0o600) -> None:
@@ -521,8 +565,11 @@ def cron_line(job: dict) -> str:
 
 
 def crontab_remove(text: str, profile: str, name: str) -> str:
+    return crontab_remove_tag(text, tag(profile, name))
+
+
+def crontab_remove_tag(text: str, t: str) -> str:
     lines, out, skip = text.splitlines(), [], False
-    t = tag(profile, name)
     for ln in lines:
         if skip:
             skip = False
@@ -535,8 +582,11 @@ def crontab_remove(text: str, profile: str, name: str) -> str:
 
 
 def crontab_set(text: str, profile: str, name: str, line: str) -> str:
-    base = crontab_remove(text, profile, name)
-    return base + f"{tag(profile, name)}\n{line}\n"
+    return crontab_set_tag(text, tag(profile, name), line)
+
+
+def crontab_set_tag(text: str, t: str, line: str) -> str:
+    return crontab_remove_tag(text, t) + f"{t}\n{line}\n"
 
 
 def crontab_read() -> str:
@@ -593,9 +643,128 @@ def installed(job: dict) -> str:
     if is_macos():
         return "loaded" if is_loaded(job["label"]) else "not loaded"
     try:
-        return "in crontab" if tag(job["profile"], job["name"]) in crontab_read() else "no crontab"
+        t = tag(job["profile"], job["name"])  # the whole line, not a prefix of another tag
+        return (
+            "in crontab"
+            if any(x.strip() == t for x in crontab_read().splitlines())
+            else "no crontab"
+        )
     except ScheduleError:
         return "unknown"
+
+
+# ---------------------------------------------------------------- report job (PLAN §2.8)
+# One host job, `agentbox schedule report --post`. The job helpers above build
+# `<prefix>.<profile>.<name>`; this one has its own label and crontab tag.
+REPORT_NAME = "_report"
+
+
+def report_label() -> str:
+    return f"{launchd_prefix()}.{REPORT_NAME}"
+
+
+def report_tag() -> str:
+    return f"# agentbox:{REPORT_NAME}"
+
+
+def report_job(rdir: Path, at: str, prog: list[str], extra: dict[str, str]) -> dict:
+    """The dict that render_plist / cron_line read, for the daily report job."""
+    label = report_label()
+    return {
+        "label": label,
+        "plist": str(launchagents_dir() / f"{label}.plist"),
+        "argv": [*prog, "schedule", "report", "--post"],
+        "env": job_env(extra),
+        "dir": str(rdir),
+        "schedule": Spec(cron=at_to_cron(at, None)).as_json(),
+    }
+
+
+def report_install(job: dict) -> None:
+    if is_macos():
+        plist = Path(job["plist"])
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        write_private(plist, plistlib.dumps(render_plist(job)), 0o644)
+        load(plist, job["label"])
+    else:
+        crontab_write(crontab_set_tag(crontab_read(), report_tag(), cron_line(job)))
+
+
+def report_installed() -> str | None:
+    """None: no report job is installed. "loaded" / "not loaded" (macOS: the
+    plist exists; loaded or not) / "in crontab" (Linux) / "unknown"."""
+    if is_macos():
+        if not (launchagents_dir() / f"{report_label()}.plist").exists():
+            return None
+        return "loaded" if is_loaded(report_label()) else "not loaded"
+    try:
+        return "in crontab" if report_tag() in crontab_read().splitlines() else None
+    except ScheduleError:
+        return "unknown"
+
+
+def report_uninstall() -> bool:
+    """Remove the report job. False when none was installed."""
+    found = False
+    if is_macos():
+        plist = launchagents_dir() / f"{report_label()}.plist"
+        found = plist.exists() or is_loaded(report_label())
+        unload(report_label())
+        with contextlib.suppress(FileNotFoundError):
+            plist.unlink()
+    else:
+        text = crontab_read()
+        new = crontab_remove_tag(text, report_tag())
+        found = new != text
+        if found:
+            crontab_write(new)
+    return found
+
+
+# ---------------------------------------------------------------- job copy drift (PLAN §2.7)
+def read_source(src: str) -> tuple[str, bytes | None, float | None]:
+    """Read a job's source file for the drift check, safely: the path is not
+    followed through a final symlink, a FIFO or device cannot block the open,
+    and only a regular file of at most SOURCE_MAX bytes is read.
+    Returns (state, bytes, mtime), state "ok", "gone", or "not_plain"."""
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        return ("gone" if e.errno in (errno.ENOENT, errno.ENOTDIR) else "not_plain"), None, None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > SOURCE_MAX:
+            return "not_plain", None, None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            data = fh.read(SOURCE_MAX + 1)
+        if len(data) > SOURCE_MAX:
+            return "not_plain", None, None
+        return "ok", data, st.st_mtime
+    except OSError:
+        return "not_plain", None, None
+    finally:
+        os.close(fd)
+
+
+def source_drift(job: dict) -> tuple[str, str] | None:
+    """None: no `source` in job.json, or the job copy equals it. Else
+    ("gone" | "not_plain" | "differs", text). The file is read only to hash it."""
+    src = job.get("source")
+    if not src:
+        return None
+    state, data, mtime = read_source(src)
+    if state == "gone":
+        return "gone", "source gone"
+    if state == "not_plain" or data is None or mtime is None:
+        return "not_plain", "source is not a plain file"
+    try:
+        copy = hashlib.sha256((Path(job["dir"]) / job_file(job_kind(job))).read_bytes()).hexdigest()
+    except (OSError, ScheduleError):
+        copy = None
+    if copy == hashlib.sha256(data).hexdigest():
+        return None
+    when = datetime.fromtimestamp(mtime).astimezone().strftime("%m-%d %H:%M")
+    return "differs", f"job copy differs from {src} (since {when})"
 
 
 # ---------------------------------------------------------------- fire
@@ -720,6 +889,19 @@ def notify_record(rec: dict, profile: str, name: str, rc: int, **kw) -> None:
         log(profile, name, f"notify: {result}")
 
 
+def fire_trigger() -> tuple[str, str | None]:
+    """(trigger to record, error). The trigger is "schedule" unless
+    `schedule run-now` set AGENTBOX_FIRE_TRIGGER=run-now. Any other value is
+    refused (the fire exits 78 with the error) and recorded as "schedule"."""
+    v = os.environ.get(TRIGGER_ENV)
+    if v is None:
+        return "schedule", None
+    if v in TRIGGERS:
+        return v, None
+    one_of = ", ".join(TRIGGERS)
+    return "schedule", f"{TRIGGER_ENV}={v[:40]!r} is not one of {one_of}; the fire is refused"
+
+
 def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
          poll: float = DOCKER_POLL) -> int:  # fmt: skip
     """One scheduled run. runner(profile, agent, prompt_path, model, timeout) ->
@@ -734,7 +916,9 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
         rotate(jd / f)
     kind = job_kind(job)
     agent = job["agent"] if kind == "agent" else None
-    base = {"profile": profile, "name": name, "kind": kind, "agent": agent, "start": now_iso()}
+    trigger, trigger_error = fire_trigger()
+    base = {"profile": profile, "name": name, "kind": kind, "agent": agent, "trigger": trigger,
+            "start": now_iso()}  # fmt: skip
     t0 = time.monotonic()
     with (jd / "fire.lock").open("a") as lk:
         try:
@@ -757,7 +941,10 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
         rc, rd, msg, status, note = RC_PREFLIGHT, None, None, None, None
         outcome = "not_run"  # what notify says; see notify.status_head
         try:
-            if not ensure_docker(profile, name, wait, poll):
+            if trigger_error:  # refused: a preflight failure, no run
+                msg = note = trigger_error
+                log(profile, name, msg)
+            elif not ensure_docker(profile, name, wait, poll):
                 rc = RC_DOCKER_DOWN
                 msg = (
                     f"Docker did not come up within {wait:.0f} s; the job did not run. Start "

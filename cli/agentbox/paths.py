@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 from .network import DEFAULT_BASE, NetworkError, parse_base
-from .profile import CLAUDE_TOKEN, secret_name_problem
+from .profile import CLAUDE_TOKEN, PROFILE_NAME_RE, secret_name_problem
 
 
 class ConfigError(Exception):
@@ -67,7 +68,11 @@ BACKENDS = ("keychain", "op", "env")
 PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 OP_VAULT_RE = re.compile(r"[^/\s\"\\]+")
 CONFIG_KEYS = ("subnet_base", "secret_backend", "secret_prefix", "op_vault", "runs_keep",
-               "notify_webhook_secret")  # fmt: skip
+               "notify_webhook_secret", "report_outputs", "report_command",
+               "report_investigator")  # fmt: skip
+# Built-in fleet report outputs (PLAN §2.8). report_outputs.py asserts that its
+# registry has exactly these names; this module never imports it.
+REPORT_OUTPUTS = ("stdout", "json", "slack", "command")
 
 
 @dataclass(frozen=True)
@@ -84,6 +89,11 @@ class Config:
     # NAME of the shared secret that holds the Slack webhook URL for scheduled-run
     # notifications (PLAN §2.7). None = no notifications. Host-only: never delivered.
     notify_webhook_secret: str | None = None
+    # Fleet report (PLAN §2.8). Outputs used by `schedule report --post`; the argv
+    # of the `command` output (absolute argv[0]); the investigator profile name.
+    report_outputs: tuple[str, ...] = ("slack",)
+    report_command: tuple[str, ...] | None = None
+    report_investigator: str | None = None
 
 
 def config_file() -> Path:
@@ -129,8 +139,44 @@ def load_config() -> Config:
         raise ConfigError(f"{f}: notify_webhook_secret: {msg}")
     if notify == CLAUDE_TOKEN:  # the other owned names are reserved, so refused above
         raise ConfigError(f"{f}: notify_webhook_secret cannot be {CLAUDE_TOKEN} (agentbox owns it)")
+    outputs = _report_outputs(f, data.get("report_outputs", "slack"))
+    command = _report_command(f, data.get("report_command"))
+    if "command" in outputs and command is None:
+        raise ConfigError(f'{f}: report_outputs has "command", which needs report_command')
+    invest = data.get("report_investigator")
+    if invest is not None and not PROFILE_NAME_RE.fullmatch(invest):
+        raise ConfigError(
+            f"{f}: report_investigator must be a profile name ({PROFILE_NAME_RE.pattern})"
+        )
     return Config(subnet_base=base, secret_backend=backend, secret_prefix=prefix, op_vault=vault,
-                  runs_keep=int(keep), notify_webhook_secret=notify)  # fmt: skip
+                  runs_keep=int(keep), notify_webhook_secret=notify, report_outputs=outputs,
+                  report_command=command, report_investigator=invest)  # fmt: skip
+
+
+def _report_outputs(f: Path, text: str) -> tuple[str, ...]:
+    names = tuple(x.strip() for x in text.split(","))
+    bad = [n for n in names if n not in REPORT_OUTPUTS]
+    if bad:
+        raise ConfigError(
+            f"{f}: report_outputs: unknown output {bad[0]!r} (one of {', '.join(REPORT_OUTPUTS)})"
+        )
+    if len(set(names)) != len(names):
+        raise ConfigError(f"{f}: report_outputs: an output is listed twice")
+    return names
+
+
+def _report_command(f: Path, text: str | None) -> tuple[str, ...] | None:
+    if text is None:
+        return None
+    try:
+        argv = tuple(shlex.split(text))
+    except ValueError as e:
+        raise ConfigError(f"{f}: report_command: {e}") from None
+    if not argv:
+        raise ConfigError(f"{f}: report_command is empty")
+    if not os.path.isabs(argv[0]):
+        raise ConfigError(f"{f}: report_command: the first word must be an absolute path")
+    return argv
 
 
 def write_config(values: dict[str, str]) -> Path:

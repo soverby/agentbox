@@ -146,3 +146,97 @@ def test_check_10_failures(tmp_path, monkeypatch):
     for s in ("RW=True but mode ro", "undeclared mount /Users/me/.ssh", "in-box mount point /x",
               "ro mount /w/b accepted a write"):  # fmt: skip
         assert s in r.detail
+
+
+# ---------------------------------------------------------------- check 22 (PLAN §2.8)
+def cfg22(tmp_path, monkeypatch, text="", installed=None):
+    from agentbox import schedule
+
+    monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text(text)
+    monkeypatch.setattr(schedule, "report_installed", lambda: installed)
+
+
+def test_check_22_skips_with_the_plan_text(tmp_path, monkeypatch):
+    cfg22(tmp_path, monkeypatch)
+    r = doctor.check_22()
+    assert (r.status, r.check) == ("SKIP", "22-report")
+    assert r.detail == "no report_investigator and no report job installed"
+    assert r.line() == "SKIP 22-report: no report_investigator and no report job installed"
+
+
+def test_check_22_investigator_safety_check(tmp_path, monkeypatch):
+    from agentbox import fleet
+
+    cfg22(tmp_path, monkeypatch, 'report_investigator = "inv"\n')
+    monkeypatch.setattr(fleet, "investigator_problems", lambda name: [])
+    r = doctor.check_22()
+    assert r.status == "PASS" and "inv passes the safety check" in r.detail
+    monkeypatch.setattr(
+        fleet,
+        "investigator_problems",
+        lambda name: ["the mount /x is not empty", "[mcp.servers] must be empty"],
+    )
+    r = doctor.check_22()
+    assert r.status == "FAIL" and r.check == "22-report"
+    assert (
+        "investigator profile inv: the mount /x is not empty; [mcp.servers] must be empty"
+        in r.detail
+    )
+
+
+@pytest.mark.parametrize(
+    "state,status,text",
+    [("loaded", "PASS", "report job loaded"), ("in crontab", "PASS", "report job in crontab"),
+     ("not loaded", "FAIL", "installed but not loaded"), ("unknown", "FAIL", "state unknown")],
+)  # fmt: skip
+def test_check_22_report_job_state(tmp_path, monkeypatch, state, status, text):
+    cfg22(tmp_path, monkeypatch, installed=state)
+    r = doctor.check_22()
+    assert r.status == status and text in r.detail
+
+
+def test_check_22_with_both(tmp_path, monkeypatch):
+    from agentbox import fleet
+
+    cfg22(tmp_path, monkeypatch, 'report_investigator = "inv"\n', installed="loaded")
+    monkeypatch.setattr(fleet, "investigator_problems", lambda name: [])
+    r = doctor.check_22()
+    assert r.status == "PASS" and "safety check" in r.detail and "report job loaded" in r.detail
+
+
+def test_check_22_bad_config_is_a_fail_not_a_crash(tmp_path, monkeypatch):
+    cfg22(tmp_path, monkeypatch, "bogus = 1\n")
+    r = doctor.check_22()
+    assert r.status == "FAIL" and "unknown key" in r.detail
+
+
+def test_check_22_sorts_after_21():
+    res = [doctor.Result("PASS", "22-report"), doctor.Result("PASS", "21 router-health"),
+           doctor.Result("PASS", "3")]  # fmt: skip
+    got = sorted(res, key=lambda x: (doctor._num(x.check), x.check))
+    assert [x.check for x in got] == ["3", "21 router-health", "22-report"]
+
+
+def test_doctor_command_runs_check_22_once(tmp_path, monkeypatch, capsys):
+    from agentbox import cli
+
+    calls = {"22": 0}
+    b = make_box(tmp_path, [{"host": "/w/a", "mode": "rw"}])
+    monkeypatch.setattr(boxmod, "load", lambda name: b)
+    monkeypatch.setattr(boxmod, "is_running", lambda box: True)
+    monkeypatch.setattr(doctor, "full", lambda box, scratch=False: [doctor.Result("PASS", "1")])
+
+    def c22():
+        calls["22"] += 1
+        return doctor.Result(
+            "SKIP", "22-report", "no report_investigator and no report job installed"
+        )
+
+    monkeypatch.setattr(doctor, "check_22", c22)
+    assert cli.main(["doctor", "demo"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert calls["22"] == 1 and out[-1].startswith("SKIP 22-report")
+    # a failing 22 makes doctor exit 1
+    monkeypatch.setattr(doctor, "check_22", lambda: doctor.Result("FAIL", "22-report", "x"))
+    assert cli.main(["doctor", "demo"]) == 1

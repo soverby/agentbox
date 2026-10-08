@@ -151,8 +151,11 @@ def subnets() -> list[tuple[str, str]]:
     ]
 
 
-def running_projects(prefix: str = "agentbox-") -> dict[str, list[str]]:
-    """Compose project -> running service names, for projects with `prefix`."""
+def running_projects(
+    prefix: str = "agentbox-", timeout: float | None = None
+) -> dict[str, list[str]]:
+    """Compose project -> running service names, for projects with `prefix`.
+    A `timeout` that runs out raises DockerError."""
     out = run(
         [
             "docker",
@@ -161,7 +164,8 @@ def running_projects(prefix: str = "agentbox-") -> dict[str, list[str]]:
             "label=com.docker.compose.project",
             "--format",
             '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}',
-        ]
+        ],
+        timeout=timeout,
     ).stdout
     res: dict[str, list[str]] = {}
     for line in out.splitlines():

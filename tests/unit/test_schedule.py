@@ -1,5 +1,6 @@
 """P7 scheduling: cron/at/every -> launchd, next fires, plist, crontab, _fire."""
 
+import hashlib
 import json
 import os
 import plistlib
@@ -1185,7 +1186,7 @@ def test_notify_unset_changes_nothing(roots, monkeypatch):
         (roots / "cfg" / "config.toml").write_text('secret_backend = "env"\n')
     assert sorted(last_of(job)) == [
         "agent", "end", "exit_code", "kind", "message", "name", "profile", "run_dir", "start",
-        "status", "transcript", "warnings",
+        "status", "transcript", "trigger", "warnings",
     ]  # fmt: skip
     assert all("notify" not in h for h in hist_of(job))
 
@@ -1336,3 +1337,271 @@ def test_unset_writes_each_file_once(roots, monkeypatch):
     assert schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight) == 0
     assert writes == ["last.json", "last.json"]  # "running" marker, then the final record
     assert len(hist_of(job)) == 1
+
+
+# ---------------------------------------------------------------- trigger (PLAN §2.7, f1)
+def fire_once(roots, monkeypatch, runner=None, spec=None):
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    job = make_job(roots, spec or schedule.Spec(every=60))
+    rc = schedule.fire("p1", "daily", runner or (lambda *a: (0, roots)), ok_preflight)
+    return job, rc
+
+
+def test_fire_records_trigger_schedule_by_default(roots, monkeypatch):
+    monkeypatch.delenv(schedule.TRIGGER_ENV, raising=False)
+    job, rc = fire_once(roots, monkeypatch)
+    assert rc == 0 and last_of(job)["trigger"] == "schedule"
+    assert hist_of(job)[-1]["trigger"] == "schedule"
+
+
+def test_fire_records_run_now_trigger(roots, monkeypatch):
+    monkeypatch.setenv(schedule.TRIGGER_ENV, "run-now")
+    job, rc = fire_once(roots, monkeypatch)
+    assert rc == 0 and last_of(job)["trigger"] == "run-now"
+    assert hist_of(job)[-1]["trigger"] == "run-now"
+
+
+@pytest.mark.parametrize("value", ["manual", "", "Schedule", "run-now ", "x" * 200])
+def test_fire_refuses_an_unknown_trigger_with_exit_78(roots, monkeypatch, value):
+    monkeypatch.setenv(schedule.TRIGGER_ENV, value)
+    ran = []
+    job, rc = fire_once(roots, monkeypatch, runner=lambda *a: ran.append(1) or (0, roots))
+    assert rc == schedule.RC_PREFLIGHT == 78 and ran == []
+    last = last_of(job)
+    assert last["status"] == "failed" and last["exit_code"] == 78
+    assert (
+        schedule.TRIGGER_ENV in last["message"]
+        and "is not one of schedule, run-now" in last["message"]
+    )
+    assert len(last["message"]) < 200  # a long value is cut
+    assert last["trigger"] == "schedule" and hist_of(job)[-1]["message"] == last["message"]
+
+
+def test_skipped_fire_records_the_trigger(roots, monkeypatch):
+    monkeypatch.setenv(schedule.TRIGGER_ENV, "run-now")
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    job = make_job(roots, schedule.Spec(every=60))
+    import fcntl
+
+    with (Path(job["dir"]) / "fire.lock").open("a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        assert schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight) == 75
+    assert hist_of(job)[-1]["status"] == "skipped" and hist_of(job)[-1]["trigger"] == "run-now"
+
+
+def test_trigger_variable_is_not_passed_to_scheduled_jobs(roots, monkeypatch):
+    assert schedule.TRIGGER_ENV not in schedule.PASS_ENV
+    monkeypatch.setenv(schedule.TRIGGER_ENV, "run-now")
+    assert schedule.TRIGGER_ENV not in schedule.job_env()
+    make_job(roots, schedule.Spec(every=60))
+    assert schedule.TRIGGER_ENV not in json.loads(
+        (schedule.job_dir("p1", "daily") / "job.json").read_text())["env"]  # fmt: skip
+
+
+def test_run_now_sets_the_trigger_in_the_fire_environment(roots, cli_env, monkeypatch, capsys):
+    seen = {}
+
+    def fake_run(argv, env=None, **kw):
+        seen["argv"], seen["env"] = argv, env
+        return _cp(0)
+
+    monkeypatch.setattr(schedule, "launchctl", lambda *a: _cp(1 if a[0] == "print" else 0))
+    pf = str(roots / "prompt.txt")
+    assert cli.main(["schedule", "add", "p1", "--name", "m", "--agent", "claude",
+                     "--prompt-file", pf, "--every", "1h"]) == 0  # fmt: skip
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setenv(schedule.TRIGGER_ENV, "schedule")  # the caller's value does not matter
+    assert cli.main(["schedule", "run-now", "p1", "m"]) == 0
+    job = json.loads((schedule.job_dir("p1", "m") / "job.json").read_text())
+    assert seen["env"] == {**job["env"], schedule.TRIGGER_ENV: "run-now"}
+    assert schedule.TRIGGER_ENV not in job["env"]  # job.json never holds it
+    assert seen["argv"] == job["argv"]
+
+
+# ---------------------------------------------------------------- source and drift (PLAN §2.7, f1)
+def sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def test_add_stores_source_and_hash_for_prompt_and_command_jobs(roots, cmd_env):
+    assert cli.main(["schedule", "add", "p1", "--name", "a", "--agent", "claude",
+                     "--prompt-file", str(roots / "prompt.txt"), "--every", "1h"]) == 0  # fmt: skip
+    job = json.loads((schedule.job_dir("p1", "a") / "job.json").read_text())
+    assert job["source"] == str((roots / "prompt.txt").resolve())
+    assert job["source_sha256"] == sha(b"do the thing\n")
+    assert add_cmd(roots, "--every", "1h", profile="p1") == 0
+    job = json.loads((schedule.job_dir("p1", "fx") / "job.json").read_text())
+    assert job["source"] == str((roots / "fx.sh").resolve())
+    assert job["source_sha256"] == sha((roots / "fx.sh").read_bytes())
+
+
+def test_add_resolves_a_relative_source_path(roots, cmd_env, monkeypatch):
+    monkeypatch.chdir(roots)
+    assert cli.main(["schedule", "add", "p1", "--name", "r", "--cmd-file", "fx.sh",
+                     "--every", "1h"]) == 0  # fmt: skip
+    job = json.loads((schedule.job_dir("p1", "r") / "job.json").read_text())
+    assert job["source"] == str((roots / "fx.sh").resolve()) and os.path.isabs(job["source"])
+
+
+def test_edit_updates_source_and_hash_but_timeout_alone_does_not(roots, cmd_env):
+    assert add_cmd(roots, "--every", "1h") == 0
+    jf = schedule.job_dir("p1", "fx") / "job.json"
+    before = json.loads(jf.read_text())
+    new = roots / "fx2.sh"
+    new.write_text("echo v2\n")
+    assert cli.main(["schedule", "edit", "p1", "fx", "--timeout", "5m"]) == 0
+    after = json.loads(jf.read_text())
+    assert after["source"] == before["source"] and after["timeout"] == 300
+    assert cli.main(["schedule", "edit", "p1", "fx", "--cmd-file", str(new)]) == 0
+    after = json.loads(jf.read_text())
+    assert after["source"] == str(new.resolve()) and after["source_sha256"] == sha(b"echo v2\n")
+    assert after["created"] == before["created"] and after["timeout"] == 300  # nothing else moves
+    assert (jf.parent / "command.sh").read_text() == "echo v2\n"
+
+
+def test_edit_of_an_old_job_without_source_adds_it(roots, cmd_env):
+    make_job(roots, schedule.Spec(every=60), kind="cmd")
+    assert "source" not in json.loads((schedule.job_dir("p1", "daily") / "job.json").read_text())
+    new = roots / "n.sh"
+    new.write_text("true\n")
+    assert cli.main(["schedule", "edit", "p1", "daily", "--cmd-file", str(new)]) == 0
+    job = json.loads((schedule.job_dir("p1", "daily") / "job.json").read_text())
+    assert job["source"] == str(new.resolve()) and job["source_sha256"] == sha(b"true\n")
+
+
+def drift_job(roots, source, content="v1\n", **kw):
+    job = make_job(roots, schedule.Spec(every=60), kind="cmd", **kw)
+    (Path(job["dir"]) / "command.sh").write_text(content)
+    job["source"] = str(source)
+    return job
+
+
+def test_source_drift_states(roots):
+    src = roots / "brief.sh"
+    src.write_text("v1\n")
+    job = drift_job(roots, src)
+    assert schedule.source_drift(job) is None  # same bytes
+    src.write_text("v2\n")
+    kind, text = schedule.source_drift(job)
+    assert kind == "differs" and text.startswith(f"job copy differs from {src} (since ")
+    src.unlink()
+    assert schedule.source_drift(job) == ("gone", "source gone")
+    assert schedule.source_drift({**job, "source": str(roots / "nodir" / "x")})[0] == "gone"
+    job.pop("source")
+    assert schedule.source_drift(job) is None  # a job from before f1
+
+
+def test_source_drift_refuses_anything_but_a_plain_file(roots):
+    plain = roots / "real.sh"
+    plain.write_text("v1\n")
+    link = roots / "link.sh"
+    link.symlink_to(plain)
+    job = drift_job(roots, link)
+    assert schedule.source_drift(job) == ("not_plain", "source is not a plain file")  # symlink
+    fifo = roots / "fifo.sh"
+    os.mkfifo(fifo)
+    t0 = time.monotonic()
+    job = drift_job(roots, fifo)
+    assert schedule.source_drift(job) == ("not_plain", "source is not a plain file")
+    assert time.monotonic() - t0 < 5  # the open does not block on a FIFO
+    job = drift_job(roots, roots)  # a directory
+    assert schedule.source_drift(job)[0] == "not_plain"
+    big = roots / "big.sh"
+    big.write_bytes(b"x" * (schedule.SOURCE_MAX + 1))
+    assert schedule.source_drift(drift_job(roots, big)) == (
+        "not_plain",
+        "source is not a plain file",
+    )
+    ok = roots / "edge.sh"
+    ok.write_bytes(b"y" * schedule.SOURCE_MAX)  # exactly 1 MiB is still read
+    assert schedule.source_drift(drift_job(roots, ok, content="other"))[0] == "differs"
+
+
+def test_source_drift_is_read_only_and_leaks_no_content(roots):
+    src = roots / "s.sh"
+    src.write_text("SECRET_BODY\n")
+    job = drift_job(roots, src, content="other\n")
+    before = src.stat().st_mtime_ns
+    kind, text = schedule.source_drift(job)
+    assert "SECRET_BODY" not in text and src.stat().st_mtime_ns == before
+    assert src.read_text() == "SECRET_BODY\n"
+
+
+def test_ls_warns_about_drift(roots, cmd_env, capsys):
+    src = roots / "fx.sh"
+    assert add_cmd(roots, "--every", "1h") == 0
+    capsys.readouterr()
+    assert cli.main(["schedule", "ls"]) == 0
+    assert "warning: job copy" not in capsys.readouterr().out  # same bytes
+    src.write_text("echo changed\n")
+    assert cli.main(["schedule", "ls"]) == 0
+    out = capsys.readouterr().out
+    fix = f"agentbox schedule edit p1 fx --cmd-file {src.resolve()}"
+    assert f"warning: job copy differs from {src.resolve()}; run `{fix}` to update it" in out
+    assert "echo changed" not in out
+    src.unlink()
+    assert cli.main(["schedule", "ls"]) == 0
+    assert f"warning: source gone ({src.resolve()})" in capsys.readouterr().out
+    os.mkfifo(src)
+    assert cli.main(["schedule", "ls"]) == 0
+    assert "warning: source is not a plain file" in capsys.readouterr().out
+
+
+def test_ls_drift_for_an_agent_job_names_prompt_file(roots, cli_env, capsys, monkeypatch):
+    monkeypatch.setattr(schedule, "launchctl", lambda *a: _cp(1 if a[0] == "print" else 0))
+    assert cli.main(["schedule", "add", "p1", "--name", "a", "--agent", "claude",
+                     "--prompt-file", str(roots / "prompt.txt"), "--every", "1h"]) == 0  # fmt: skip
+    (roots / "prompt.txt").write_text("changed\n")
+    capsys.readouterr()
+    assert cli.main(["schedule", "ls"]) == 0
+    assert "agentbox schedule edit p1 a --prompt-file" in capsys.readouterr().out
+
+
+def test_ls_has_no_drift_line_for_a_job_without_source(roots, cmd_env, capsys):
+    make_job(roots, schedule.Spec(every=60), kind="cmd")
+    assert cli.main(["schedule", "ls"]) == 0
+    assert "warning" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------- report job helpers (PLAN §2.8)
+def test_report_label_and_tag_are_their_own(roots, monkeypatch):
+    assert schedule.report_label() == "com.agentbox-unit._report"
+    assert schedule.report_tag() == "# agentbox:_report"
+    assert schedule.label_for("p1", "daily") == "com.agentbox-unit.p1.daily"
+    monkeypatch.setenv("AGENTBOX_LAUNCHD_PREFIX", "bad prefix")
+    with pytest.raises(ScheduleError, match="not a valid label prefix"):
+        schedule.report_label()
+
+
+def test_crontab_tag_helpers_keep_other_entries():
+    base = "0 1 * * * echo mine\n"
+    t1 = schedule.crontab_set(base, "p1", "daily", "0 7 * * * job")
+    t2 = schedule.crontab_set_tag(t1, schedule.report_tag(), "30 9 * * * report")
+    assert t2 == (base + "# agentbox:p1:daily\n0 7 * * * job\n"
+                  "# agentbox:_report\n30 9 * * * report\n")  # fmt: skip
+    t3 = schedule.crontab_set_tag(t2, schedule.report_tag(), "45 9 * * * report")
+    assert t3.count("# agentbox:_report") == 1 and "45 9" in t3 and "30 9 * * * report" not in t3
+    assert schedule.crontab_remove_tag(t3, schedule.report_tag()) == t1
+    assert schedule.crontab_remove(t1, "p1", "daily") == base
+
+
+def test_fires_between_does_not_change_next_fires():
+    spec = schedule.Spec(cron="0 7 * * 1-5")
+    now = datetime(2026, 9, 23, 7, 0, 30)
+    assert schedule.next_fires(spec, now) == [datetime(2026, 9, 24, 7, 0),
+                                             datetime(2026, 9, 25, 7, 0),
+                                             datetime(2026, 9, 28, 7, 0)]  # fmt: skip
+
+
+def test_linux_installed_matches_the_whole_tag_line(roots, monkeypatch):
+    monkeypatch.setattr(schedule, "is_macos", lambda: False)
+    job = make_job(roots, schedule.Spec(every=3600), profile="p", name="a")
+    text = "0 1 * * * echo mine\n# agentbox:p:ab\n0 * * * * other\n"
+    monkeypatch.setattr(schedule, "crontab_read", lambda: text)
+    assert schedule.installed(job) == "no crontab"  # `p:a` is only a prefix of `p:ab`
+    text += "# agentbox:p:a\n0 * * * * mine\n"
+    assert schedule.installed(job) == "in crontab"
+    text = "# agentbox:p:ab\n0 * * * * x\n  # agentbox:p:a  \n0 * * * * y\n"
+    assert schedule.installed(job) == "in crontab"  # same as crontab_remove: strip, then equal

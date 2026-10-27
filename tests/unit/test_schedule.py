@@ -736,7 +736,18 @@ def test_fire_cmd_job(roots, monkeypatch):
     assert seen == {"run": (None, "command.sh", "hello\n", None, 7200), "pre": (None, None)}
     last = json.loads((Path(job["dir"]) / "last.json").read_text())
     assert last["kind"] == "cmd" and last["agent"] is None and last["exit_code"] == 124
-    assert "killed after the timeout" in last["message"]
+    assert last["status"] == "failed" and last["message"] is None  # the CLI did not kill it
+
+
+def test_fire_message_says_timeout_only_when_the_cli_killed_the_run(roots):
+    job = make_job(roots, schedule.Spec(every=60), kind="cmd")
+    last = Path(job["dir"]) / "last.json"
+    own = transcript_run(roots, "the script quit\n", name="own")
+    assert schedule.fire("p1", "daily", lambda *a: (124, own), ok_preflight) == 124
+    assert json.loads(last.read_text())["message"] is None
+    killed = transcript_run(roots, "work\n", name="cut", killed="timeout after 3600 s")
+    assert schedule.fire("p1", "daily", lambda *a: (124, killed), ok_preflight) == 124
+    assert "killed after the timeout" in json.loads(last.read_text())["message"]
 
 
 def test_fire_unknown_kind_is_a_hard_error(roots):

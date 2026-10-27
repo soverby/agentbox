@@ -1018,7 +1018,7 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
                 status, outcome = "terminated", "terminated"
             log(profile, name, msg)
         limit = job.get("timeout", DEFAULT_TIMEOUT)
-        if rc == 124 and msg is None:
+        if outcome == "timeout" and msg is None:  # not a script's own exit 124
             msg = f"killed after the timeout ({fmt_every(limit)})"
         rec.update(
             status=status or ("ok" if rc == 0 else "failed"),

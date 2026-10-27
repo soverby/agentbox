@@ -69,7 +69,7 @@ PREFIX_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 OP_VAULT_RE = re.compile(r"[^/\s\"\\]+")
 CONFIG_KEYS = ("subnet_base", "secret_backend", "secret_prefix", "op_vault", "runs_keep",
                "notify_webhook_secret", "report_outputs", "report_command",
-               "report_investigator")  # fmt: skip
+               "report_investigator", "fire_command")  # fmt: skip
 # Built-in fleet report outputs (PLAN §2.8). report_outputs.py asserts that its
 # registry has exactly these names; this module never imports it.
 REPORT_OUTPUTS = ("stdout", "json", "slack", "command")
@@ -94,6 +94,9 @@ class Config:
     report_outputs: tuple[str, ...] = ("slack",)
     report_command: tuple[str, ...] | None = None
     report_investigator: str | None = None
+    # Fire hook (PLAN §2.7): argv of a host command that gets each fire's outcome
+    # as JSON on stdin (absolute argv[0]). None = off.
+    fire_command: tuple[str, ...] | None = None
 
 
 def config_file() -> Path:
@@ -140,7 +143,8 @@ def load_config() -> Config:
     if notify == CLAUDE_TOKEN:  # the other owned names are reserved, so refused above
         raise ConfigError(f"{f}: notify_webhook_secret cannot be {CLAUDE_TOKEN} (agentbox owns it)")
     outputs = _report_outputs(f, data.get("report_outputs", "slack"))
-    command = _report_command(f, data.get("report_command"))
+    command = _command_argv(f, "report_command", data.get("report_command"))
+    hook = _command_argv(f, "fire_command", data.get("fire_command"))
     if "command" in outputs and command is None:
         raise ConfigError(f'{f}: report_outputs has "command", which needs report_command')
     invest = data.get("report_investigator")
@@ -150,7 +154,8 @@ def load_config() -> Config:
         )
     return Config(subnet_base=base, secret_backend=backend, secret_prefix=prefix, op_vault=vault,
                   runs_keep=int(keep), notify_webhook_secret=notify, report_outputs=outputs,
-                  report_command=command, report_investigator=invest)  # fmt: skip
+                  report_command=command, report_investigator=invest,
+                  fire_command=hook)  # fmt: skip
 
 
 def _report_outputs(f: Path, text: str) -> tuple[str, ...]:
@@ -165,17 +170,17 @@ def _report_outputs(f: Path, text: str) -> tuple[str, ...]:
     return names
 
 
-def _report_command(f: Path, text: str | None) -> tuple[str, ...] | None:
+def _command_argv(f: Path, key: str, text: str | None) -> tuple[str, ...] | None:
     if text is None:
         return None
     try:
         argv = tuple(shlex.split(text))
     except ValueError as e:
-        raise ConfigError(f"{f}: report_command: {e}") from None
+        raise ConfigError(f"{f}: {key}: {e}") from None
     if not argv:
-        raise ConfigError(f"{f}: report_command is empty")
+        raise ConfigError(f"{f}: {key} is empty")
     if not os.path.isabs(argv[0]):
-        raise ConfigError(f"{f}: report_command: the first word must be an absolute path")
+        raise ConfigError(f"{f}: {key}: the first word must be an absolute path")
     return argv
 
 

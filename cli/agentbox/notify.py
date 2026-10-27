@@ -107,6 +107,17 @@ def status_head(outcome: str, rc: int, seconds: float, timeout: str | None) -> s
     raise ValueError(f"unknown outcome {outcome!r}")
 
 
+def detail_text(outcome: str, transcript, note: str | None) -> str:
+    """The detail of a notice (also the fire hook's `detail`, PLAN §2.7): the
+    last transcript line when a run happened (`transcript` is its path), else
+    `note` (the fire's own message). A timeout needs no `note`: the status
+    says it. Cleaned, not Slack-escaped."""
+    detail = last_line(transcript) if transcript else ""
+    if not detail and note and outcome != "timeout":
+        detail = clean_line(note)
+    return detail
+
+
 def build_message(
     profile: str,
     name: str,
@@ -118,13 +129,9 @@ def build_message(
     transcript,
     note: str | None,
 ) -> str:
-    """`agentbox <profile>/<job>: <status> (exit N, <time>) — <detail>`.
-    detail: the last transcript line when a run happened (`transcript` is its
-    path), else `note` (the fire's own message). A timeout needs no `note`:
-    the status says it."""
-    detail = last_line(transcript) if transcript else ""
-    if not detail and note and outcome != "timeout":
-        detail = clean_line(note)
+    """`agentbox <profile>/<job>: <status> (exit N, <time>) — <detail>`
+    (see detail_text)."""
+    detail = detail_text(outcome, transcript, note)
     head = f"agentbox {profile}/{name}: {status_head(outcome, rc, seconds, timeout)}"
     return f"{head} — {slack_escape(detail)}" if detail else head
 
@@ -196,10 +203,12 @@ def reason(e: BaseException, url: str | None) -> str:
 
 
 def wanted() -> bool:
-    """False only when config.toml loads and notify_webhook_secret is unset.
-    A config that does not load counts as wanted: notify_fire reports it."""
+    """False only when config.toml loads and both notify_webhook_secret and
+    fire_command are unset (the fire then writes its record once). A config
+    that does not load counts as wanted: notify_fire reports it."""
     try:
-        return paths.load_config().notify_webhook_secret is not None
+        cfg = paths.load_config()
+        return cfg.notify_webhook_secret is not None or cfg.fire_command is not None
     except Exception:  # noqa: BLE001
         return True
 

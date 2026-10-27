@@ -557,3 +557,34 @@ def test_transcript_read_is_a_bounded_tail(tmp_path, monkeypatch):
     monkeypatch.setattr(notify, "open", lambda *a, **k: Counting(real_open(*a, **k)), raising=False)
     assert notify.last_line(f) == "the end"
     assert read and sum(read) <= notify.TAIL_BYTES
+
+
+# ---------------------------------------------------------------- fire hook gate (PLAN §2.7)
+def test_wanted_is_true_when_either_setting_is_set(host):
+    assert notify.wanted() is False  # no config.toml
+    (host / "cfg" / "config.toml").write_text('secret_backend = "env"\n')
+    assert notify.wanted() is False
+    configure(host)
+    assert notify.wanted() is True  # the webhook secret alone
+    (host / "cfg" / "config.toml").write_text('fire_command = "/opt/odin/hook"\n')
+    assert notify.wanted() is True  # the hook alone
+    (host / "cfg" / "config.toml").write_text("bogus = 1\n")
+    assert notify.wanted() is True  # a config that does not load
+
+
+def test_hook_alone_does_not_start_notifications(host, monkeypatch):
+    (host / "cfg" / "config.toml").write_text('fire_command = "/opt/odin/hook"\n')
+    monkeypatch.setattr(notify, "post", forbid)
+    monkeypatch.setattr(notify, "read_webhook", forbid)
+    assert fire_notice() is None
+
+
+def test_detail_text_is_what_the_message_appends(tmp_path):
+    t = write_tr(tmp_path, "x\n<b> & done\n")
+    d = notify.detail_text("ok", t, "note")
+    assert d == "<b> & done"  # cleaned, not Slack-escaped
+    assert msg(transcript=t).endswith(" — " + notify.slack_escape(d))
+    assert notify.detail_text("failed", None, "  a\tnote\x1b[1m ") == "a note"
+    assert notify.detail_text("timeout", None, "note") == ""
+    assert notify.detail_text("ok", None, None) == ""
+    assert msg(outcome="timeout", note="note", rc=124, timeout="1h").endswith("(exit 124)")

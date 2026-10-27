@@ -148,6 +148,7 @@ All values are TOML strings. An unknown key is an error.
 | `notify_webhook_secret` | none | Name of a shared secret that holds a Slack `https://` webhook URL. Scheduled runs post their status there (read [Notifications](#notifications)). Unset: no posts. |
 | `report_outputs` | `"slack"` | Comma list of outputs for `schedule report --post`: `stdout`, `json`, `slack`, `command`. Any other name is an error. `command` needs `report_command`. |
 | `report_command` | none | The program for the `command` output. A command line, split like a shell would split it, but run without a shell. The first word must be an absolute path. |
+| `fire_command` | none | The program that receives each scheduled fire's result as JSON on stdin (read [Fire hook](#fire-hook)). A command line, split like a shell would split it, but run without a shell. The first word must be an absolute path. Unset: no hook. |
 | `report_investigator` | none | Name of a profile that explains failed runs in the fleet report (read [Investigator](#investigator)). Unset: off. |
 
 ## Profiles
@@ -1021,6 +1022,76 @@ most 5 seconds for the post.
 
 Limit: if `job.json` is missing or damaged, or has an unknown `kind`, the
 fire stops before it has a result and posts nothing.
+
+### Fire hook
+
+An outside tool can read each fire's result. Set `fire_command` in
+`~/.config/agentbox/config.toml`:
+
+```toml
+fire_command = "/Users/me/bin/odin-fire-hook"
+```
+
+At the end of every fire that notifications cover, the host runs the command
+with the result as JSON on stdin. It runs for `ok` fires too: the command
+decides what matters. It covers the same fires as [Notifications](#notifications)
+(agent and command jobs, `schedule run-now`, skipped fires, fires that never
+start). A manual `agentbox run` runs no hook. If `job.json` is missing or
+damaged, the fire stops before it has a result and runs no hook.
+
+The payload is one line of JSON, then a newline. It has these keys. A key
+without a value is `null`; `warnings` is `[]`.
+
+| Key | Content |
+| --- | --- |
+| `version` | `1`. |
+| `outcome` | `ok`, `failed`, `timeout`, `terminated`, `start_failed`, `not_run`, or `skipped` (the same words as the notification status). |
+| `profile`, `name`, `kind`, `agent` | The job. `agent` is `null` for a command job. |
+| `trigger` | `schedule` or `run-now`. |
+| `start`, `end` | ISO 8601 times with the offset. |
+| `seconds` | Run time of the fire. |
+| `status`, `exit_code`, `message` | As in `last.json`. |
+| `warnings` | Preflight warnings, a list. |
+| `run_dir`, `transcript` | Paths of the run record. `null` when no run happened. |
+| `detail` | The last non-empty transcript line, or the message of the fire (the text of the notification, before Slack escaping). |
+
+The payload also has `notify`, `left_up`, `stopped`, and `host_config_changes`
+when `last.json` has them.
+
+The command runs without a shell, in `/`, in its own session. It has the
+environment of the fire, plus `AGENTBOX_FIRE_HOOK=1`. The payload is on stdin
+only, never in a command-line argument. agentbox adds no secret to the
+environment or the payload. `detail` and `message` are not scrubbed: a secret
+that the box prints as its last line reaches the command. The command may
+run for 30 seconds (5 seconds when the fire was terminated). Then the CLI
+sends SIGKILL to its process group. The CLI also stops any process that the
+command leaves running.
+
+A consumer reads the payload from stdin and treats `detail` and `message` as
+data. They can hold text that the agent in the box chose:
+
+```sh
+#!/bin/sh
+# /Users/me/bin/odin-fire-hook
+payload=$(cat)
+outcome=$(printf '%s' "$payload" | jq -r .outcome)
+[ "$outcome" = ok ] && exit 0
+printf '%s' "$payload" | jq -r '"\(.profile)/\(.name): \(.outcome): \(.detail)"' \
+  >> "$HOME/fire-failures.log"
+```
+
+A failed hook (cannot start, non-zero exit, over the limit, killed by a
+signal) never changes the exit code of the fire. The CLI writes one line to
+the job log, sets `hook` in `last.json` and `history.jsonl` (`ok` or
+`error: <reason>`, with at most 200 characters of the last line the command
+wrote to stderr), and `schedule ls` shows a warning. `schedule run-now` prints
+`hook: <result>` after `notify:`. The CLI writes the final result to
+`last.json` before the hook runs. The hook runs after the notification post.
+
+A hook must not start a fire. `schedule run-now` and `schedule _fire` refuse
+(exit 78) when `AGENTBOX_FIRE_HOOK` is set. A hook that starts the job with
+`launchctl kickstart` or cron avoids the check. The job lock then makes each
+such fire a skip. That loop is the owner's own.
 
 Job files are in `<state>/schedules/<name>/`: `job.json`, `prompt.md` (or
 `command.sh` for a command job), `last.json`, and the logs `launchd.out` and `launchd.err` (rotated at

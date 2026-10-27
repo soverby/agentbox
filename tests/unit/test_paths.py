@@ -110,3 +110,48 @@ def test_write_config_round_trips_the_report_keys(monkeypatch, tmp_path):
     assert c.report_outputs == ("stdout", "slack") and c.report_investigator == "inv"
     with pytest.raises(paths.ConfigError):  # validated before it is kept
         paths.write_config({"report_outputs": "nope"})
+
+
+# ---------------------------------------------------------------- fire_command (PLAN §2.7)
+def test_fire_command_default_and_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path))
+    assert paths.load_config().fire_command is None
+    assert "fire_command" in paths.CONFIG_KEYS
+
+
+def test_fire_command_valid(monkeypatch, tmp_path):
+    c = cfg_with(tmp_path, monkeypatch, 'fire_command = "/opt/odin/hook --flag \\"two words\\""\n')
+    assert c.fire_command == ("/opt/odin/hook", "--flag", "two words")
+    assert c.report_command is None  # the two commands are independent
+
+
+@pytest.mark.parametrize(
+    "text,msg",
+    [
+        ('fire_command = "hook.sh"\n', "fire_command: the first word must be an absolute path"),
+        ('fire_command = "./hook.sh"\n', "absolute path"),
+        ('fire_command = ""\n', "fire_command is empty"),
+        ('fire_command = "   "\n', "fire_command is empty"),
+        ('fire_command = "/bin/x \\"unclosed"\n', "fire_command: "),
+        ("fire_command = 5\n", "fire_command must be a string"),
+    ],
+)
+def test_fire_command_invalid(monkeypatch, tmp_path, text, msg):
+    with pytest.raises(paths.ConfigError, match=msg):
+        cfg_with(tmp_path, monkeypatch, text)
+
+
+def test_report_command_errors_still_name_their_key(monkeypatch, tmp_path):
+    with pytest.raises(paths.ConfigError, match="report_command: the first word"):
+        cfg_with(tmp_path, monkeypatch, 'report_command = "hook.sh"\n')
+
+
+def test_write_config_round_trips_fire_command(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path))
+    vals = {"secret_backend": "keychain", "fire_command": "/opt/odin/hook --x 'a b'"}
+    f = paths.write_config(vals)
+    assert f.stat().st_mode & 0o777 == 0o600
+    assert paths.read_config_values() == vals
+    assert paths.load_config().fire_command == ("/opt/odin/hook", "--x", "a b")
+    with pytest.raises(paths.ConfigError):  # validated before it is kept
+        paths.write_config({"fire_command": "relative/hook"})

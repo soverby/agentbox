@@ -30,6 +30,7 @@ from . import (
     denied,
     docker,
     egress,
+    firehook,
     fleet,
     hostscan,
     images,
@@ -1109,6 +1110,9 @@ def cmd_schedule_ls(args) -> int:
         if str(last.get("notify", "")).startswith("error"):
             why = last["notify"].removeprefix("error: ")
             lines.append(f"  warning: notification failed: {why}")
+        if str(last.get("hook", "")).startswith("error"):
+            why = last["hook"].removeprefix("error: ")
+            lines.append(f"  warning: fire hook failed: {why}")
         if sk := schedule.skip_summary(jd):
             lines.append(f"  {sk}")
         if drift := schedule.source_drift(j):
@@ -1140,7 +1144,18 @@ def cmd_schedule_rm(args) -> int:
     return 0
 
 
+def _in_fire_hook() -> bool:
+    """True inside a fire hook (PLAN §2.7): `run-now` and `_fire` refuse, so a
+    hook cannot chain fires. Prints the one-line refusal."""
+    if firehook.HOOK_ENV not in os.environ:
+        return False
+    err(f"refused: {firehook.HOOK_ENV} is set; a fire hook cannot start a fire")
+    return True
+
+
 def cmd_schedule_run_now(args) -> int:
+    if _in_fire_hook():
+        return schedule.RC_PREFLIGHT
     _schedule_name(args.profile, args.name)
     job = schedule.load_job(args.profile, args.name)
     print(term.clean(f"running as the scheduler would: {' '.join(job['argv'])}"), flush=True)
@@ -1155,6 +1170,8 @@ def cmd_schedule_run_now(args) -> int:
         print(term.clean(f"message: {last['message']}"))
     if last.get("notify"):
         print(term.clean(f"notify: {last['notify']}"))
+    if last.get("hook"):
+        print(term.clean(f"hook: {last['hook']}"))
     return rc
 
 
@@ -1245,16 +1262,21 @@ def report_job(args) -> int:
     return 0
 
 
+def on_fire_signal(signum, frame):
+    for s in (signal.SIGTERM, signal.SIGINT):  # one unwind; cleanup is not interrupted
+        signal.signal(s, signal.SIG_IGN)
+    if firehook.defer_signal(signum):  # Popen of the hook is running: run() raises it
+        return
+    raise Terminated(signum)
+
+
 def cmd_schedule_fire(args) -> int:
+    if _in_fire_hook():  # before the lock: no outcome, no notify, no hook
+        return schedule.RC_PREFLIGHT
     _schedule_name(args.profile, args.name)
 
-    def on_signal(signum, frame):
-        for s in (signal.SIGTERM, signal.SIGINT):  # one unwind; cleanup is not interrupted
-            signal.signal(s, signal.SIG_IGN)
-        raise Terminated(signum)
-
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_fire_signal)
+    signal.signal(signal.SIGINT, on_fire_signal)
     return schedule.fire(args.profile, args.name, sched_runner, sched_preflight)
 
 

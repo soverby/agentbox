@@ -1605,3 +1605,575 @@ def test_linux_installed_matches_the_whole_tag_line(roots, monkeypatch):
     assert schedule.installed(job) == "in crontab"
     text = "# agentbox:p:ab\n0 * * * * x\n  # agentbox:p:a  \n0 * * * * y\n"
     assert schedule.installed(job) == "in crontab"  # same as crontab_remove: strip, then equal
+
+
+# ---------------------------------------------------------------- fire hook (PLAN §2.7)
+PAYLOAD_KEYS = {
+    "profile", "name", "kind", "agent", "trigger", "start", "end", "status", "exit_code",
+    "message", "warnings", "run_dir", "transcript", "version", "outcome", "seconds", "detail",
+}  # fmt: skip
+
+
+@pytest.fixture
+def hooked(roots, monkeypatch):
+    """`install(body, notify=False)` writes an sh hook and sets fire_command (and
+    optionally the notify secret, with notify.post recording into `posts`).
+    The hook may write into @OUT@. Returns (install, out_dir, posts)."""
+    from agentbox import notify
+
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    out = roots / "hookout"
+    out.mkdir()
+    posts: list = []
+    monkeypatch.setattr(notify, "post", lambda url, text, timeout: posts.append((url, text)))
+    (roots / "store.json").write_text(json.dumps({"AGENTBOX__SHARED_SLACK_WEBHOOK_URL": HOOK}))
+
+    def install(body, notify=False):
+        script = roots / "hook.sh"
+        script.write_text("#!/bin/sh\n" + body.replace("@OUT@", str(out)))
+        script.chmod(0o700)
+        text = f'secret_backend = "env"\nfire_command = "{script}"\n'
+        if notify:
+            text += 'notify_webhook_secret = "SLACK_WEBHOOK_URL"\n'
+        (roots / "cfg").mkdir(exist_ok=True)
+        (roots / "cfg" / "config.toml").write_text(text)
+        return script
+
+    return install, out, posts
+
+
+def alive(pid: int) -> bool:
+    import subprocess
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    stat_ = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return bool(stat_.stdout.strip()) and not stat_.stdout.strip().startswith("Z")
+
+
+def gone_soon(pid: int, wait: float = 3.0) -> bool:
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        if not alive(pid):
+            return True
+        time.sleep(0.05)
+    return not alive(pid)
+
+
+def test_hook_payload_for_a_normal_fire(hooked):
+    install, out, _ = hooked
+    install("cat > @OUT@/stdin\n")
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "fetching\n== all checks passed\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    raw = (out / "stdin").read_bytes()
+    assert raw.endswith(b"\n") and not raw.endswith(b"\n\n")
+    p = json.loads(raw)
+    assert set(p) == PAYLOAD_KEYS  # no notify, no hook key: neither was set when it was built
+    assert p["version"] == 1 and p["outcome"] == "ok" and p["detail"] == "== all checks passed"
+    assert p["profile"] == "p1" and p["name"] == "daily" and p["kind"] == "agent"
+    assert p["agent"] == "claude" and p["trigger"] == "schedule" and p["status"] == "ok"
+    assert p["exit_code"] == 0 and p["warnings"] == [] and p["message"] is None
+    assert p["run_dir"] == str(rd) and p["transcript"] == str(rd / "transcript.log")
+    assert isinstance(p["seconds"], int | float) and p["seconds"] >= 0
+    assert last_of(job)["hook"] == "ok" and hist_of(job)[-1]["hook"] == "ok"
+
+
+@pytest.mark.parametrize(
+    "how,outcome,rc,detail",
+    [
+        ("fail", "failed", 3, "boom: bad thing"),
+        ("start", "start_failed", 125, "run failed: cannot start"),
+        ("term", "terminated", 143, "run failed: terminated by signal 15"),
+        ("preflight", "not_run", 78, "no credential"),
+    ],
+)
+def test_hook_outcome_words_and_detail(hooked, how, outcome, rc, detail):
+    install, out, _ = hooked
+    install("cat > @OUT@/stdin\n")
+    roots = out.parent
+    make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "boom: bad thing\n")
+    pre = ok_preflight
+
+    def runner(*a):
+        if how == "fail":
+            return 3, rd
+        if how == "start":
+            raise cli.RunFailed("cannot start", None)
+        raise cli.RunFailed("terminated by signal 15", None, schedule.RC_TERMINATED)
+
+    if how == "preflight":
+
+        def pre(*a):
+            return "no credential", []
+
+    assert schedule.fire("p1", "daily", runner, pre) == rc
+    p = json.loads((out / "stdin").read_text())
+    assert set(p) == PAYLOAD_KEYS
+    assert p["outcome"] == outcome and p["exit_code"] == rc and p["detail"] == detail
+
+
+def test_hook_payload_for_a_skipped_fire(hooked):
+    import fcntl
+
+    install, out, _ = hooked
+    install("cat > @OUT@/stdin\n")
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    jd = Path(job["dir"])
+    with (jd / "fire.lock").open("a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert schedule.fire("p1", "daily", lambda *a: 1 / 0, ok_preflight) == schedule.RC_SKIPPED
+    p = json.loads((out / "stdin").read_text())
+    assert set(p) == PAYLOAD_KEYS  # the missing keys are null, warnings is []
+    assert p["outcome"] == "skipped" and p["status"] == "skipped" and p["version"] == 1
+    assert p["exit_code"] == schedule.RC_SKIPPED and p["seconds"] == 0
+    assert p["message"] == schedule.SKIP_MSG and p["detail"] == schedule.SKIP_NOTE
+    assert p["run_dir"] is None and p["transcript"] is None and p["warnings"] == []
+    skipped = json.loads((jd / "skipped.json").read_text())
+    assert skipped["hook"] == "ok" and "run_dir" not in skipped  # skipped.json is not widened
+    assert hist_of(job)[-1]["hook"] == "ok"
+
+
+def test_hook_payload_keeps_notify_and_the_optional_keys(hooked):
+    install, out, posts = hooked
+    install("cat > @OUT@/stdin\n", notify=True)
+    roots = out.parent
+    make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "done\n", left_up="the box has a shell", stopped="1 process",
+                        host_config_changes=["~/.zshrc"])  # fmt: skip
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    p = json.loads((out / "stdin").read_text())
+    assert p["notify"] == "ok" and posts  # the notify result is in the payload
+    assert p["left_up"].startswith("left up: ") and p["stopped"].startswith("stopped: ")
+    assert p["host_config_changes"] == ["~/.zshrc"]
+    assert set(p) == PAYLOAD_KEYS | {"notify", "left_up", "stopped", "host_config_changes"}
+
+
+def test_hook_env_is_the_fire_env_plus_the_marker(hooked, monkeypatch):
+    from agentbox import firehook
+
+    install, out, _ = hooked
+    install("cat > /dev/null\n")
+    roots = out.parent
+    make_job(roots, schedule.Spec(every=60))
+    # a fire holds only job_env (+ trigger): put that in place of the test's own env
+    fire_env = schedule.job_env()
+    for k in list(os.environ):
+        monkeypatch.delenv(k)
+    for k, v in {**fire_env, schedule.TRIGGER_ENV: "run-now"}.items():
+        monkeypatch.setenv(k, v)
+    want = {**os.environ, firehook.HOOK_ENV: "1"}
+    seen = {}
+    real = firehook.subprocess.Popen
+
+    def spy(argv, **kw):
+        seen.update(kw, argv=argv)
+        return real(argv, **kw)
+
+    monkeypatch.setattr(firehook.subprocess, "Popen", spy)
+    rd = transcript_run(roots, "x\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    assert seen["env"] == want and seen["env"][schedule.TRIGGER_ENV] == "run-now"
+    assert not any("SECRET" in v for v in seen["env"].values())
+    assert seen["cwd"] == "/" and seen["start_new_session"] is True
+    assert seen["stdout"] == firehook.subprocess.DEVNULL and "shell" not in seen
+
+
+def test_hook_process_sees_the_marker_and_no_extra_keys(hooked, monkeypatch):
+    install, out, _ = hooked
+    install("env > @OUT@/env\npwd > @OUT@/cwd\ncat > /dev/null\n")
+    roots = out.parent
+    make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+    before = dict(os.environ)
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    got = dict(x.split("=", 1) for x in (out / "env").read_text().splitlines() if "=" in x)
+    assert got["AGENTBOX_FIRE_HOOK"] == "1"
+    shell_noise = {"PWD", "OLDPWD", "SHLVL", "_", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
+    assert set(got) - set(before) - {"AGENTBOX_FIRE_HOOK"} <= shell_noise
+    assert all(got[k] == v for k, v in before.items() if k in got and k not in shell_noise)
+    assert (out / "cwd").read_text().strip() == "/"
+
+
+def test_hook_payload_text_never_reaches_argv(hooked):
+    install, out, _ = hooked
+    install('printf "%s\\n" "$#" "$0" "$@" > @OUT@/argv\ncat > @OUT@/stdin\n')
+    roots = out.parent
+    make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "UNIQUE-DETAIL-MARKER\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    argv = (out / "argv").read_text().splitlines()
+    assert argv[0] == "0" and argv[1] == str(roots / "hook.sh") and len(argv) == 2
+    assert "UNIQUE-DETAIL-MARKER" in (out / "stdin").read_text()
+
+
+@pytest.mark.parametrize("rc", [0, 3])
+def test_failing_hook_changes_nothing_else(hooked, capsys, rc):
+    install, out, _ = hooked
+    install("cat > /dev/null\necho 'boom: \x1b[31mred\x07 thing' >&2\nexit 3\n")
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+    assert schedule.fire("p1", "daily", lambda *a: (rc, rd), ok_preflight) == rc
+    want = "error: exit code 3: boom: red thing"
+    assert last_of(job)["hook"] == want and hist_of(job)[-1]["hook"] == want
+    assert last_of(job)["exit_code"] == rc
+    assert f"schedule p1/daily: hook: {want}" in capsys.readouterr().err
+
+
+def test_ls_and_run_now_show_a_failed_hook(hooked, cli_env, capsys, monkeypatch):
+    install, out, _ = hooked
+    install("cat > /dev/null\necho nope >&2\nexit 3\n")
+    roots = out.parent
+    (roots / "cfg" / "config.toml").write_text(
+        (roots / "cfg" / "config.toml").read_text() + 'secret_prefix = "agentbox"\n'
+    )
+    job = make_job(roots, schedule.Spec(every=60))
+    assert schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight) == 0
+    capsys.readouterr()
+    assert cli.main(["schedule", "ls", "p1"]) == 0
+    assert "  warning: fire hook failed: exit code 3: nope" in capsys.readouterr().out
+
+    # run-now prints `hook:` after `notify:`; the child (the fire) is faked
+    def fake_child(argv, **kw):
+        rec = {"transcript": "t", "notify": "ok", "hook": "error: exit code 3"}
+        schedule.write_private(Path(job["dir"]) / "last.json", json.dumps(rec).encode())
+        return _cp(1)
+
+    with monkeypatch.context() as m:
+        m.setattr(cli.subprocess, "run", fake_child)
+        assert cli.main(["schedule", "run-now", "p1", "daily"]) == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-2:] == ["notify: ok", "hook: error: exit code 3"]
+    # a good hook shows nothing in ls
+    install("cat > /dev/null\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight) == 0
+    assert cli.main(["schedule", "ls", "p1"]) == 0
+    assert "fire hook" not in capsys.readouterr().out
+
+
+def test_hung_hook_is_killed_at_the_limit(hooked, monkeypatch, capsys):
+    from agentbox import firehook
+
+    install, out, _ = hooked
+    install("echo $$ > @OUT@/pid\nsleep 1000 &\necho $! > @OUT@/child\ncat > /dev/null\nwait\n")
+    monkeypatch.setattr(firehook, "HOOK_LIMIT", 3.0)
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+    t0 = time.monotonic()
+    assert schedule.fire("p1", "daily", lambda *a: (3, rd), ok_preflight) == 3
+    assert time.monotonic() - t0 < 10
+    assert last_of(job)["hook"] == "error: ran over the 3 s limit"
+    assert "hook: error: ran over the 3 s limit" in capsys.readouterr().err
+    for name in ("pid", "child"):  # the whole group is gone
+        assert gone_soon(int((out / name).read_text()))
+
+
+def test_terminated_outcome_gets_the_short_limit(hooked, monkeypatch):
+    from agentbox import firehook
+
+    install, out, _ = hooked
+    install("sleep 1000\n")
+    monkeypatch.setattr(firehook, "TERMINATED_LIMIT", 1.0)
+    monkeypatch.setattr(firehook, "HOOK_LIMIT", 120.0)
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+
+    def runner(*a):
+        raise cli.RunFailed("terminated by signal 15", None, schedule.RC_TERMINATED)
+
+    t0 = time.monotonic()
+    assert schedule.fire("p1", "daily", runner, ok_preflight) == 143
+    assert time.monotonic() - t0 < 6
+    assert last_of(job)["hook"] == "error: ran over the 1 s limit"
+
+
+def test_background_process_holding_stderr_cannot_hold_the_fire(hooked):
+    install, out, _ = hooked
+    install("cat > /dev/null\nsleep 1000 &\necho $! > @OUT@/child\nexit 0\n")
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+    t0 = time.monotonic()
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    assert time.monotonic() - t0 < 4  # about 1 s for the stderr EOF wait
+    assert last_of(job)["hook"] == "ok"
+    assert gone_soon(int((out / "child").read_text()))  # and it left no process
+
+
+def test_signal_during_the_hook_kills_the_group_and_the_fire_goes_on(hooked):
+    import signal
+
+    install, out, _ = hooked
+    install("echo $$ > @OUT@/pid\nsleep 1000 &\necho $! > @OUT@/child\nwait\n")
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+
+    def on_alarm(signum, frame):
+        raise schedule.Terminated(15)
+
+    def send_when_running():  # the hook is up once it has written its child pid
+        end = time.monotonic() + 20
+        while not (out / "child").exists() and time.monotonic() < end:
+            time.sleep(0.02)
+        os.kill(os.getpid(), signal.SIGALRM)
+
+    old = signal.signal(signal.SIGALRM, on_alarm)
+    t = threading.Thread(target=send_when_running, daemon=True)
+    t.start()
+    try:
+        assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    finally:
+        t.join(25)
+        signal.signal(signal.SIGALRM, old)
+    assert last_of(job)["hook"] == "error: terminated by signal 15"
+    assert last_of(job)["status"] == "ok" and hist_of(job)[-1]["exit_code"] == 0
+    for name in ("pid", "child"):
+        assert gone_soon(int((out / name).read_text()))
+
+
+def test_hook_that_dies_by_a_signal_and_stderr_handling(hooked):
+    install, out, _ = hooked
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+    install("kill -9 $$\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    assert last_of(job)["hook"] == "error: terminated by signal 9"
+    # 300 KiB of stderr, then the last line; the reason keeps 200 characters of it
+    install("cat > /dev/null\nyes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx | head -c 300000 >&2\n"
+            "echo >&2\nprintf 'z%.0s' $(seq 1 400) >&2\nexit 2\n")  # fmt: skip
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    hook = last_of(job)["hook"]
+    assert hook.startswith("error: exit code 2: z") and hook.endswith("…")
+    assert len(hook.removeprefix("error: exit code 2: ")) <= 200
+
+
+def test_hook_that_cannot_start_is_an_error_not_a_crash(hooked):
+    install, out, _ = hooked
+    script = install("true\n")
+    script.unlink()
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    assert last_of(job)["hook"].startswith("error: cannot start: ")
+
+
+def test_signal_during_a_failed_hook_start_is_reported_and_cleared(hooked, monkeypatch):
+    from agentbox import firehook
+
+    install, out, _ = hooked
+    install("true\n")
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+
+    real = firehook.subprocess.Popen
+
+    def popen(*a, **kw):  # the hook's start: the signal lands, then exec fails
+        if not kw.get("start_new_session"):
+            return real(*a, **kw)
+        assert firehook.defer_signal(15)
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(firehook.subprocess, "Popen", popen)
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    assert last_of(job)["hook"] == "error: terminated by signal 15"
+    assert firehook._pending is None and firehook._in_popen is False
+
+
+def test_hook_ordering_final_outcome_on_disk_before_the_hook(hooked, monkeypatch):
+    from agentbox import notify
+
+    install, out, _ = hooked
+    install(
+        'cp "$AGENTBOX_STATE_HOME/p1/schedules/daily/last.json" @OUT@/during\n'
+        'ls "$AGENTBOX_STATE_HOME/p1/schedules/daily" > @OUT@/files\n'
+        "[ -e @OUT@/posted ] && echo yes > @OUT@/saw_post\ncat > /dev/null\n",
+        notify=True,
+    )
+    monkeypatch.setattr(notify, "post", lambda *a: (out / "posted").write_text("1"))
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "done\n")
+    assert schedule.fire("p1", "daily", lambda *a: (3, rd), ok_preflight) == 3
+    during = json.loads((out / "during").read_text())
+    assert during["status"] == "failed" and during["exit_code"] == 3 and during["end"]
+    assert (out / "saw_post").exists()  # the hook runs after the notify post
+    assert "hook" not in during and "pid" not in during and "notify" not in during
+    assert "history.jsonl" not in (out / "files").read_text()  # one line, written after
+    final = last_of(job)
+    assert final == {**during, "notify": "ok", "hook": "ok"}
+    assert hist_of(job) == [final] and final["notify"] == "ok" and final["hook"] == "ok"
+
+
+def test_hook_alone_writes_last_json_twice_and_one_history_line(hooked, monkeypatch):
+    install, out, posts = hooked
+    install("cat > /dev/null\n")
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    writes = []
+    real = schedule.write_private
+
+    def spy(f, data, mode=0o600):
+        writes.append(Path(f).name)
+        real(f, data, mode)
+
+    monkeypatch.setattr(schedule, "write_private", spy)
+    assert schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight) == 0
+    assert writes == ["last.json"] * 3  # running marker, pre-write, final record
+    assert posts == [] and "notify" not in last_of(job)  # notify is off
+    assert [h["hook"] for h in hist_of(job)] == ["ok"]
+
+
+def test_hook_unset_starts_no_process_and_adds_no_field(hooked, monkeypatch):
+    from agentbox import firehook
+
+    install, out, posts = hooked
+    install("true\n", notify=True)
+    cfg = out.parent / "cfg" / "config.toml"
+    cfg.write_text("".join(x for x in cfg.read_text().splitlines(True) if "fire_command" not in x))
+    monkeypatch.setattr(firehook, "run", lambda *a, **k: 1 / 0)
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    rd = transcript_run(roots, "x\n")
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    assert len(posts) == 1
+    assert "hook" not in last_of(job) and all("hook" not in h for h in hist_of(job))
+
+
+def test_hook_and_notify_both_unset_writes_once(roots, monkeypatch):
+    """Existing behavior stays: no pre-write, no hook process."""
+    from agentbox import firehook
+
+    fake_bin(roots / "bin", "docker", "exit 0\n")
+    monkeypatch.setenv("PATH", f"{roots / 'bin'}:/usr/bin:/bin")
+    monkeypatch.setattr(firehook, "run", lambda *a, **k: 1 / 0)
+    job = make_job(roots, schedule.Spec(every=60))
+    writes = []
+    real = schedule.write_private
+
+    def spy(f, data, mode=0o600):
+        writes.append(Path(f).name)
+        real(f, data, mode)
+
+    monkeypatch.setattr(schedule, "write_private", spy)
+    assert schedule.fire("p1", "daily", lambda *a: (0, roots), ok_preflight) == 0
+    assert writes == ["last.json", "last.json"]
+    assert "hook" not in last_of(job) and len(hist_of(job)) == 1
+
+
+def test_run_now_and_fire_refuse_inside_a_hook(hooked, monkeypatch, capsys):
+    install, out, _ = hooked
+    install("echo ran > @OUT@/ran\n")
+    roots = out.parent
+    job = make_job(roots, schedule.Spec(every=60))
+    jd = Path(job["dir"])
+    monkeypatch.setenv("AGENTBOX_FIRE_HOOK", "1")
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: 1 / 0)
+    monkeypatch.setattr(schedule, "fire", lambda *a, **k: 1 / 0)
+    capsys.readouterr()
+    assert cli.main(["schedule", "run-now", "p1", "daily"]) == 78
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and "AGENTBOX_FIRE_HOOK" in err
+    assert cli.main(["schedule", "_fire", "p1", "daily"]) == 78
+    assert capsys.readouterr().err.count("\n") == 1
+    # refused before the lock: no outcome, no notify, no hook
+    assert not (jd / "fire.lock").exists()
+    for f in ("last.json", "history.jsonl", "skipped.json"):
+        assert not (jd / f).exists()
+    assert not (out / "ran").exists()
+
+
+def test_the_marker_is_not_passed_to_scheduled_fires():
+    assert "AGENTBOX_FIRE_HOOK" not in schedule.PASS_ENV
+    assert "AGENTBOX_FIRE_HOOK" not in schedule.job_env()
+
+
+def test_terminated_while_reading_the_detail_is_a_hook_error_not_an_escape(hooked, monkeypatch):
+    from agentbox import notify
+
+    install, out, _ = hooked
+    install("echo ran > @OUT@/ran\n")
+    job = make_job(out.parent, schedule.Spec(every=60))
+    rd = transcript_run(out.parent, "x\n")
+
+    def boom(*a, **k):
+        raise schedule.Terminated(15)
+
+    monkeypatch.setattr(notify, "detail_text", boom)
+    assert schedule.fire("p1", "daily", lambda *a: (3, rd), ok_preflight) == 3
+    assert last_of(job)["hook"] == "error: terminated by signal 15"
+    assert hist_of(job)[-1]["hook"] == "error: terminated by signal 15"
+    assert not (out / "ran").exists()
+
+
+def test_terminated_while_reading_the_config_is_a_hook_error_not_silence(hooked, monkeypatch):
+    from types import SimpleNamespace
+
+    from agentbox import firehook
+
+    install, out, _ = hooked
+    install("echo ran > @OUT@/ran\n")
+    job = make_job(out.parent, schedule.Spec(every=60))
+    rd = transcript_run(out.parent, "x\n")
+
+    def boom():
+        raise schedule.Terminated(2)
+
+    # only the hook's own config read fails: notify.wanted() reads it first
+    monkeypatch.setattr(firehook, "paths", SimpleNamespace(load_config=boom))
+    assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    assert last_of(job)["hook"] == "error: terminated by signal 2"
+    assert not (out / "ran").exists()
+    # a config that merely fails to load stays silent for the hook (notify reports it)
+    monkeypatch.setattr(
+        firehook, "paths", SimpleNamespace(load_config=lambda: (_ for _ in ()).throw(ValueError()))
+    )
+    assert firehook.fire_hook({}, outcome="ok", seconds=0, transcript=None, note=None) is None
+
+
+def test_signal_during_popen_is_deferred_and_the_group_is_killed(hooked, monkeypatch):
+    """SIGTERM while Popen forks and execs: the CLI handler records it, run() raises
+    it once `p` is set, so the hook is killed instead of running with no limit."""
+    import signal
+
+    from agentbox import firehook
+
+    install, out, _ = hooked
+    script = install("sleep 1000\n")
+    job = make_job(out.parent, schedule.Spec(every=60))
+    rd = transcript_run(out.parent, "x\n")
+    real, started = firehook.subprocess.Popen, []
+
+    def popen_then_signal(argv, **kw):
+        p = real(argv, **kw)
+        if argv and argv[0] == str(script):
+            started.append(p.pid)
+            os.kill(os.getpid(), signal.SIGTERM)  # lands while the Popen window is open
+            time.sleep(0.2)  # let the handler run before Popen returns
+        return p
+
+    old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    for s in old:
+        signal.signal(s, cli.on_fire_signal)
+    monkeypatch.setattr(firehook.subprocess, "Popen", popen_then_signal)
+    try:
+        assert schedule.fire("p1", "daily", lambda *a: (0, rd), ok_preflight) == 0
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+    assert last_of(job)["hook"] == "error: terminated by signal 15"
+    assert started and gone_soon(started[0])
+    assert firehook._in_popen is False and firehook._pending is None
+    # outside the window the handler still raises
+    assert firehook.defer_signal(15) is False

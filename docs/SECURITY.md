@@ -334,6 +334,22 @@ Enforced in: `cli/agentbox/compose.py` (services, networks, fixed IPs),
   this property is host code. Doctor 11 shows that the agent holds only its
   own declared secrets.
 
+### Fire hook (host side)
+
+Not a box property. When the owner sets `fire_command` in `config.toml`, the
+host runs that program at the end of each scheduled fire, with the fire's
+result as JSON on stdin. No profile, job, or box can set it. Without the
+setting, no process starts. agentbox adds no secret to the hook's environment
+or payload. The `detail` and `message` keys are untrusted box output, and the
+CLI does not scrub them of secret values: a secret that the box prints as its
+last line reaches the hook, so the consumer must treat them as data. The hook
+has no shell, a time limit, and its own session. A failure never changes the
+exit code of the fire. `schedule run-now` and `schedule _fire` refuse to run
+when `AGENTBOX_FIRE_HOOK` is set, so a hook cannot chain fires. Enforced in
+`cli/agentbox/firehook.py` and `cli/agentbox/cli.py` (`_in_fire_hook`, the
+refusal in `run-now` and `_fire`). Proved by unit tests; there is no doctor check,
+because this property is host code.
+
 ### Doctor on every session
 
 Each `up` and each session start runs checks 1, 2, 6, and 9. If one fails,

@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import notify, paths
+from . import firehook, notify, paths
 
 EXPAND_CAP = 500
 DEFAULT_TIMEOUT = 7200
@@ -889,6 +889,21 @@ def notify_record(rec: dict, profile: str, name: str, rc: int, **kw) -> None:
         log(profile, name, f"notify: {result}")
 
 
+def hook_record(rec: dict, profile: str, name: str, *, outcome: str, seconds: float,
+                transcript, note: str | None, **_) -> None:  # fmt: skip
+    """End-of-fire hook (PLAN §2.7). Runs `fire_command` with `rec` as it is now
+    (before the "hook" key), sets rec["hook"], logs a failure. No hook set: rec
+    is not touched, no process. Never raises, never changes rc."""
+    result = firehook.fire_hook(
+        rec, outcome=outcome, seconds=seconds, transcript=transcript, note=note
+    )
+    if result is None:
+        return
+    rec["hook"] = result
+    if result != "ok":
+        log(profile, name, f"hook: {result}")
+
+
 def fire_trigger() -> tuple[str, str | None]:
     """(trigger to record, error). The trigger is "schedule" unless
     `schedule run-now` set AGENTBOX_FIRE_TRIGGER=run-now. Any other value is
@@ -928,10 +943,12 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
             skip = {**base, "status": "skipped", "end": now_iso(), "exit_code": RC_SKIPPED,
                     "message": SKIP_MSG}  # fmt: skip
             skipped = jd / "skipped.json"
-            if notify.wanted():  # the true outcome is on disk before the post
+            if notify.wanted():  # the true outcome is on disk before the post and the hook
                 write_private(skipped, (json.dumps(skip, indent=1) + "\n").encode())
-                notify_record(skip, profile, name, RC_SKIPPED, outcome="skipped", seconds=0,
-                              timeout=None, transcript=None, note=SKIP_NOTE)  # fmt: skip
+                kw = {"outcome": "skipped", "seconds": 0, "timeout": None, "transcript": None,
+                      "note": SKIP_NOTE}  # fmt: skip
+                notify_record(skip, profile, name, RC_SKIPPED, **kw)
+                hook_record(skip, profile, name, **kw)
             record(jd, skip, last=False)
             write_private(skipped, (json.dumps(skip, indent=1) + "\n").encode())
             return RC_SKIPPED
@@ -1014,10 +1031,11 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
         rec.pop("pid", None)
         if notify.wanted():
             record(jd, rec, history=False)  # the true outcome is on disk before the post
-            notify_record(rec, profile, name, rc, outcome=outcome,
-                          seconds=time.monotonic() - t0,
-                          timeout=fmt_every(limit) if limit else None,
-                          transcript=Path(rd) / "transcript.log" if rd else None,
-                          note=note or msg)  # fmt: skip
+            kw = {"outcome": outcome, "seconds": time.monotonic() - t0,
+                  "timeout": fmt_every(limit) if limit else None,
+                  "transcript": Path(rd) / "transcript.log" if rd else None,
+                  "note": note or msg}  # fmt: skip
+            notify_record(rec, profile, name, rc, **kw)
+            hook_record(rec, profile, name, **kw)
         record(jd, rec)
         return rc

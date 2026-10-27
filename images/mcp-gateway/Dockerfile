@@ -10,8 +10,8 @@ FROM ${UV_IMAGE} AS uv
 # Same version + sha256 as images/agent/versions.env (a unit test checks that
 # they match), for `npx` / `node` stdio servers. linux-x64 tarball: amd64 only.
 FROM ${PYTHON_IMAGE} AS node
-ARG NODE_VERSION=24.21.0
-ARG NODE_SHA256=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
+ARG NODE_VERSION=24.22.1
+ARG NODE_SHA256=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates xz-utils \
@@ -51,7 +51,7 @@ RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} + \
  && chmod 0755 /var/tmp /run/lock \
  && bad=$(find /usr/local /opt \( ! -uid 0 -o -perm /022 \) ! -type l -print | head -5) \
  && { [ -z "${bad}" ] || { echo "FATAL: non-root-owned or writable: ${bad}" >&2; exit 1; }; } \
- && [ "$(node --version)" = "v24.21.0" ] && npx --version >/dev/null
+ && [ "$(node --version)" = "v24.22.1" ] && npx --version >/dev/null
 ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     HOME=/tmp UV_CACHE_DIR=/tmp/uv-cache UV_PYTHON_PREFERENCE=only-system \

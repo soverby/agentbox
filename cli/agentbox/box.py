@@ -235,7 +235,9 @@ def git_setup(box: Box, agent_secrets: list[str] | None = None) -> None:
         if v is not None:
             cmds.append(["git", "config", "--global", key, v])
     for c in cmds:
-        r = exec_in(box, c, timeout=30)
+        # cwd = the box home, not the first mount: a `.git` file there that points
+        # outside the box makes every git call fail, `--global` too.
+        r = exec_in(box, c, timeout=30, workdir=compose.HOME)
         if r.returncode != 0:
             raise BoxError(f"git setup failed: {' '.join(c[:4])}: {r.stderr.strip()}")
     if "GH_TOKEN" in (agent_secrets or []):
@@ -268,7 +270,8 @@ def claude_setup(box: Box) -> None:
 def gh_setup_git(box: Box) -> None:
     """`gh auth setup-git` through with-secrets: git uses gh (and so GH_TOKEN,
     read at each git call) as credential helper for github.com."""
-    r = exec_in(box, ["gh", "auth", "setup-git", "--hostname", "github.com"], timeout=60)
+    r = exec_in(box, ["gh", "auth", "setup-git", "--hostname", "github.com"], timeout=60,
+                workdir=compose.HOME)  # fmt: skip
     if r.returncode != 0:
         raise BoxError(f"`gh auth setup-git` failed in the box: {r.stderr.strip()[-300:]}")
 

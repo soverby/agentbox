@@ -273,6 +273,24 @@ def test_up_without_gh_token_skips_setup_git(env, monkeypatch, capsys):
     assert not any(c[0] == "gh" for c in execs)
 
 
+def test_git_setup_runs_in_the_box_home_not_the_first_mount(env, monkeypatch):
+    """A `.git` file in the first mount that points outside the box must not
+    break `up`: every git call runs in the box home."""
+    b = boxmod.Box("p1", parse_profile({"mount": [{"host": "/w/p"}]}, "p1"),
+                   paths.state_dir("p1"), paths.load_config())  # fmt: skip
+    dirs = []
+    monkeypatch.setattr(boxmod, "host_git", lambda k: "x")
+
+    def fake_exec(b, c, **k):
+        dirs.append((c[0], k.get("workdir")))
+        return subprocess.CompletedProcess(c, 0)
+
+    monkeypatch.setattr(boxmod, "exec_in", fake_exec)
+    boxmod.git_setup(b, ["GH_TOKEN"])
+    assert {d for _, d in dirs} == {"/home/agent"}
+    assert {c for c, _ in dirs} == {"git", "gh"}
+
+
 def test_missing_secret_messages(env, capsys):
     p = parse_profile(__import__("tomllib").loads(PROFILE), "p1")
     d = delivery.collect(p, paths.load_config(), None, {"agent"}, fetch=lambda r: None)

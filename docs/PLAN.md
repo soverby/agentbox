@@ -722,6 +722,64 @@ third-party router.
   history line, no `notify` field, and makes no HTTP call. The post runs in
   a thread with a hard deadline, so on SIGTERM (5 s deadline) it cannot hang
   the shutdown.
+- Fire hook (host setting `fire_command` in `config.toml`; unset = off, no
+  warning). For external triage tools. Same parse rule as
+  `report_command` (§2.8): `shlex.split`, the first word must be an
+  absolute path; a bad value is a config error (as for every key, every
+  command then fails until it is fixed). It runs at the end of every fire
+  that notifications cover (same outcomes, same exclusions: a missing or
+  damaged `job.json` runs no hook; manual `agentbox run` runs no hook), for
+  `ok` too: the consumer filters. agentbox has no knowledge of the
+  consumer: no project field, no mapping.
+- Process: no shell, `cwd` `/`, own session (`start_new_session`). Its
+  environment is the fire's own: `job_env()` (PATH, HOME, the `PASS_ENV`
+  overrides, PYTHONPATH when present), `AGENTBOX_FIRE_TRIGGER` on
+  `run-now`, plus `AGENTBOX_FIRE_HOOK=1`. No secret is in it (the fire
+  never holds secret values in its environment, §2.4). stdin: the payload
+  as UTF-8 JSON, one trailing newline, then closed. stdout goes to
+  `/dev/null`; stderr is read with a 64 KiB cap, for the failure reason
+  only. Limit 30 s (5 s when the outcome is `terminated`). At the limit,
+  or when a signal interrupts the fire during the hook, the CLI sends
+  SIGKILL to the hook's process group (`os.killpg`). The result is the
+  child's exit status. After the child exits, the CLI waits at most 1 s
+  for stderr EOF, then kills the group: a hook must not leave background
+  processes, and a grandchild that holds the stderr pipe cannot hold the
+  fire.
+- Recursion guard: `AGENTBOX_FIRE_HOOK` is not in `PASS_ENV`. `schedule
+  run-now` and `schedule _fire` both refuse (one line, exit 78) when it is
+  set in their own environment; `_fire` refuses before it takes the lock:
+  no outcome, no notify, no hook (the same class as a damaged `job.json`).
+  So a hook that calls `agentbox schedule run-now` cannot chain fires.
+  Residual: a hook that starts the job through `launchctl kickstart` or
+  cron gets the plist environment, without the variable; the lock makes
+  each such fire a skip, and that loop is the owner's own.
+- Payload: the record that `last.json` holds at that moment (for a skipped
+  fire, `skipped.json`), every key, including `notify`, `warnings`,
+  `left_up`, `stopped`, and `host_config_changes` when present, plus
+  `version` (1), `outcome` (the notify word: `ok`, `failed`, `timeout`,
+  `terminated`, `start_failed`, `not_run`, `skipped`), `seconds`, and
+  `detail`. The payload always has the keys `profile`, `name`, `kind`,
+  `agent`, `trigger`, `start`, `end`, `status`, `exit_code`, `message`,
+  `warnings`, `run_dir`, `transcript` (the hook fills the missing ones for
+  a skipped fire; `skipped.json` itself does not change); a key without a
+  value is `null` (`warnings`: `[]`).
+  `detail` is the notify detail (`notify.build_message`) before Slack
+  escaping. `detail` and `message` can hold untrusted box output: the
+  consumer must treat them as data. They are not scrubbed of secret values
+  (as the notify detail): a secret that the box prints as its last line
+  reaches the consumer.
+- A hook failure (spawn error, non-zero exit, limit, signal) never changes
+  the exit code and never raises. Result in `last.json` (or `skipped.json`)
+  and the `history.jsonl` line as `hook`: `"ok"` or `"error: <reason>"`
+  (reason: the exit code, the limit, or `terminated by signal N`, plus at
+  most 200 characters of the last stderr line, control characters
+  removed). A failure logs one line to the job log; `schedule ls` shows it
+  as a warning, and `run-now` prints `hook: <result>` after `notify:`.
+  Order: the final outcome is on disk before the hook runs (as for notify;
+  the pre-write runs when `notify_webhook_secret` or `fire_command` is set);
+  the hook runs after the notify post; then the one rewrite and the one
+  history line carry both fields. With the hook unset: no `hook` field, no
+  process.
 - The box does not need to run between jobs.
 - Each fire records how it started, as `trigger` in `last.json` and
   `history.jsonl`: `"schedule"` (launchd or cron) or `"run-now"`.
@@ -1199,6 +1257,7 @@ P6; P7 needs P3.
 - c1: command jobs (`run --cmd-file`, `schedule add --cmd-file`), §2.3 and §2.7. No isolation change.
 - n1: scheduled-run Slack notifications from the host (`notify_webhook_secret`, host-only shared secret), §1, §2.4, and §2.7. No box change; new outbound HTTPS from the host only.
 - f1: fleet report (`schedule report`, §2.8): due fires from the live schedules, rule causes, idle boxes, job copy drift, output plugins, optional investigator box. §2.7: `trigger` in fire rows, `source` in `job.json`. Host-side and read-only; the investigator is a normal box with one empty ro folder (user-made, outside the denylist) and the anthropic preset only; doctor 22 checks it.
+- h1: fire hook (`fire_command`, §2.7): a host command gets each fire's outcome as JSON on stdin, for external triage. Host-side, owner-configured, no box change, no new network path; agentbox adds no secret to the payload (`detail` and `message` are unscrubbed box output, §2.7).
 
 ## 9. Usability balance (architect, post-review)
 

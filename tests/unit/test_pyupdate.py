@@ -1890,7 +1890,11 @@ def test_applied_prunes_after_the_derived_builds_and_records_it(world, monkeypat
     assert rec["result"] == "applied"
     pr = rec["prune"]
     assert pr["end"] == world.at and len(pr["images"]) == 2 and pr["freed_bytes"] == 4 * GB
-    assert pr["after"]["images"] == 3 * GB and pr["error"] is None and pr["kept_busy"] == []
+    assert (
+        pr["after"] == {"disk_used": 23 * GB, "disk_size": 100 * GB}
+        and pr["error"] is None
+        and pr["kept_busy"] == []
+    )
     assert last(world) == rec and history(world) == [rec]
     assert not prune_file(world).exists()  # a patch prune is in the record, not in prune.json
     assert world.posts == [
@@ -1898,7 +1902,7 @@ def test_applied_prunes_after_the_derived_builds_and_records_it(world, monkeypat
         "Commit and release the pins."
     ]
     out = capsys.readouterr().out
-    assert "pruned 2 images, freed 4.0 GB (images 3.0 GB, build cache 0.0 GB now)" in out
+    assert "pruned 2 images, freed 4.0 GB (Docker disk 23.0 GB used of 100.0 GB)" in out
     assert out.index("pruned 2 images") < out.index("applied; new image")
     assert "images that nothing uses" not in out and "docker image rm" not in out
 
@@ -1962,7 +1966,7 @@ def test_a_failed_update_does_not_prune(world, monkeypatch):
     rec = run_patch(world, rels("3.14.9"), build=build)
     assert rec["result"] == "failed" and rec["prune"] is None
     assert rm_ran(world) == [] and BUILDER not in world.runs
-    assert not any(r[:3] == ["docker", "system", "df"] for r in world.runs)
+    assert not any("--entrypoint" in r for r in world.runs)  # no measurement either
 
 
 def test_a_failed_doctor_does_not_prune_either(world, monkeypatch):

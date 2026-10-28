@@ -295,7 +295,7 @@ def valid_prune(raw) -> dict | None:
             return None
     after = raw.get("after")
     if after is not None and not (
-        isinstance(after, dict) and _ints(after.get("images")) and _ints(after.get("build_cache"))
+        isinstance(after, dict) and _ints(after.get("disk_used")) and _ints(after.get("disk_size"))
     ):
         return None
     if not _ints(raw.get("freed_bytes"), allow_none=True):

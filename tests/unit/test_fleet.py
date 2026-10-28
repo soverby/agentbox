@@ -1831,6 +1831,12 @@ def test_report_has_the_newest_prune_that_ended_in_the_window(world):
                               "error"}  # fmt: skip
 
 
+def test_report_keeps_the_disk_fields_of_a_prune(world):
+    after = {"disk_used": 12 * 10**9, "disk_size": 62 * 10**9}
+    put_prune(world, prune_rec("2026-10-08 05:00", after=after))
+    assert run_report(world).prune["after"] == after
+
+
 def test_report_without_a_prune_has_none_and_no_json_key(world):
     rep = run_report(world)
     assert rep.prune is None and "prune" not in rep.as_dict()
@@ -1862,7 +1868,8 @@ def test_the_newest_prune_outside_the_window_hides_an_older_one_inside(world):
 @pytest.mark.parametrize(
     "bad",
     [{"end": "yesterday"}, {"removed": "x"}, {"freed_bytes": -1}, {"freed_bytes": "1"},
-     {"after": {"images": 1}}, {"error": 5}, {"images": [1]}],
+     {"after": {"disk_used": 1}}, {"after": {"images": 1, "build_cache": 2}}, {"error": 5},
+     {"images": [1]}],
 )  # fmt: skip
 def test_a_malformed_prune_is_ignored(world, bad):
     put_prune(world, {**prune_rec("2026-10-08 05:00"), **bad})

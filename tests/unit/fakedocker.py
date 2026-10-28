@@ -1,8 +1,8 @@
 """A fake Docker daemon for the image-prune tests (PLAN §2.10): tags, ids,
-containers, `docker image rm` with its output lines, `docker system df`. It
+containers, `docker image rm` with its output lines, and the `df` container
+that measures the Docker disk. It
 answers through `docker.run`, so no test touches a real daemon."""
 
-import json
 import subprocess
 
 GB = 10**9
@@ -28,6 +28,8 @@ class FakeDocker:
         self.cache_after_prune = 0
         self.fail: dict[str, tuple[int, str]] = {}  # command key -> (rc, stderr)
         self.busy_ids: set[str] = set()  # `image rm` of these ids hits a conflict
+        self.other = 20 * GB  # disk used by everything that is not an image or the cache
+        self.disk_size = 100 * GB
         self.df_text: str | None = None  # replaces the df output
 
     def image(self, n: int, refs: list[str], day: int | None = None, size: int = GB) -> str:
@@ -61,7 +63,7 @@ class FakeDocker:
             return "container inspect"
         if args[:3] == ["docker", "builder", "prune"]:
             return "builder prune"
-        if args[:3] == ["docker", "system", "df"]:
+        if args[:2] == ["docker", "run"] and "--entrypoint" in args and "df" in args:
             return "df"
         return " ".join(args[:3])
 
@@ -98,14 +100,8 @@ class FakeDocker:
         if key == "df":
             if self.df_text is not None:
                 return self.result(args, out=self.df_text)
-            rows = [
-                {"Type": "Images", "Size": f"{self.images_bytes() / GB:.3f}GB",
-                 "Reclaimable": "1GB (5%)"},
-                {"Type": "Containers", "Size": "7.565MB", "Reclaimable": "0B (0%)"},
-                {"Type": "Build Cache", "Size": "15.36GB",
-                 "Reclaimable": f"{self.cache / GB:.3f}GB"},
-            ]  # fmt: skip
-            return self.result(args, out="".join(json.dumps(r) + "\n" for r in rows))
+            used = self.other + self.images_bytes() + self.cache
+            return self.result(args, out=f"       Used   1B-blocks\n{used} {self.disk_size}\n")
         return self.result(args)
 
     def rm(self, args, refs):

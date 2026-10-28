@@ -1282,16 +1282,18 @@ build cache filled it (64 GB) and another stack's Postgres did not start
   agentbox's private cache was 134.5 MB): the images were.
 - Volumes: not removed (a stopped box's home volume can hold the only
   copy of its data). The prune reports nothing about them.
-- Freed space: `docker system df --format '{{json .}}'` before and after;
-  freed = the drop in (`Images` `Size` + `Build Cache` `Reclaimable`).
-  `Build Cache` `Size` counts layers shared with images a second time, so
-  it is not used; `Reclaimable` of the cache is its unshared part. An
-  image removed now whose cache record is kept (used in the last 24 h)
-  moves from `Images` to the cache reclaimable part and counts 0 until a
-  later prune frees it. Other projects' builds are not under the lock,
-  so freed is clamped at 0. Sizes are the first token of the field, decimal
-  units `B`, `kB`, `MB`, `GB`, `TB`. A failed `df` call: freed is unknown
-  (`null`), the prune still runs.
+- Freed space: the used bytes of the Docker disk, before and after:
+  `docker run --rm --pull never --network none --cap-drop ALL --security-opt
+  no-new-privileges --entrypoint df agentbox/agent:latest -B1
+  --output=used,size /` (the overlay root of a container reports the
+  filesystem that holds the images and the cache: the Docker Desktop VM
+  disk, or `/var/lib/docker` on Linux). freed = used before − used after,
+  clamped at 0 (other projects are not under the lock). `docker system
+  df` is not used: live on 2026-10-28, removing 19 images moved 5.7 GB
+  from `Images` to `Build Cache` `Reclaimable`, and no `builder prune`
+  form (`until`, `--all`, `--max-used-space`) removed it, so its sum
+  does not tell what the disk got back. A failed measurement: freed is
+  unknown (`null`), the prune still runs.
 - When: under the update lock (§2.9), so no fire or `up` builds or starts
   a box during the prune.
   - After every successful apply: full `update` (also when all pins
@@ -1311,19 +1313,19 @@ build cache filled it (64 GB) and another stack's Postgres did not start
   line in the output and an `error` field in the record.
 - Record: `prune` in the `--python-patch` result record (`last.json`,
   `history.jsonl`): `end`, `removed` (tags), `images` (ids removed),
-  `kept_busy`, `freed_bytes` (or `null`), `after` (`{"images": bytes,
-  "build_cache": bytes}`, cache = `Reclaimable`, or `null`), `error`.
+  `kept_busy`, `freed_bytes` (or `null`), `after` (`{"disk_used": bytes,
+  "disk_size": bytes}` or `null`), `error`.
   A prune from full `update`, `--python-line`, or `update --prune`
   writes the same object to `_update/prune.json` (0600), not to
   `last.json` or `history.jsonl` (their readers know only the patch
   results).
-- Output: `pruned N images, freed X.Y GB (images A GB, build cache B GB
-  now)`.
+- Output: `pruned N images, freed X.Y GB (Docker disk A GB used of
+  B GB)`.
 - Slack: the applied post (§2.9) adds `; freed X.Y GB` when freed is at
   least 0.1 GB. A prune alone posts nothing.
 - Fleet report (§2.8): when the newest prune (the `prune` of `last.json`
   or `prune.json`, by `end`) ends inside the window, the text form adds one line `Docker disk:
-  pruned N images, freed X.Y GB at HH:MM; images A GB, build cache B GB`
+  pruned N images, freed X.Y GB at HH:MM; A GB used of B GB`
   (or `Docker disk: prune failed at HH:MM: <reason>`); the JSON form
   adds `prune` with `end` and the record fields. It is not a problem
   line and does not change the summary counts.
@@ -1439,7 +1441,7 @@ rounds, then escalate. Coordinator signs off.
 | P7 | Scheduling | launchd job fires `agentbox run`; transcript and exit code recorded; Docker Desktop auto-start works; failure logged; `schedule ls` shows last result |
 | P8 | SECURITY.md, USAGE.md (quick start first), security review pass | Independent review finds no BLOCKER; a new user reaches a first Claude session with the quick start alone |
 | p1 | Python line and patch updates (§2.9) | Unit: line filter of the python.org list; `value_problem` for the three keys; probe JSON parsing (`[]` = absent); result classification and post dedupe; partial rollback keeps other `versions.env` lines; update lock and the fire/`up` interlock; the scratch doctor starts its box while the lock is held. Live (marked): the lock check fails a cp-less lock by name offline and passes a current lock; one real `--python-patch` run applies a patch, posts to Slack, and doctor 22 sees the job |
-| p2 | Image pruning (§2.10) | Unit: managed-tag filter; keep rules (current, one previous, derived of both, sidecars, any container); `docker image rm` without `-f` and a refusal is `kept_busy`; `df` size parsing; prune runs after each apply and on every patch run, not after a `failed` result; the rollback removes only the candidate tag (computed after the build) and the previous hash tag stays; a failed `ps -a` removes nothing; freed = drop in images + cache reclaimable; `prune.json`; record, applied post suffix, fleet report line. Live (marked): `update --prune --dry-run` lists the superseded tags; `update --prune` removes them, keeps every box image, and reports freed space |
+| p2 | Image pruning (§2.10) | Unit: managed-tag filter; keep rules (current, one previous, derived of both, sidecars, any container); `docker image rm` without `-f` and a refusal is `kept_busy`; disk measurement (`df` output parsing, failure = `null`); prune runs after each apply and on every patch run, not after a `failed` result; the rollback removes only the candidate tag (computed after the build) and the previous hash tag stays; a failed `ps -a` removes nothing; freed = drop in Docker disk used bytes; `prune.json`; record, applied post suffix, fleet report line. Live (marked): `update --prune --dry-run` lists the superseded tags; `update --prune` removes them, keeps every box image, and reports freed space |
 
 P1 and P2 can build in parallel; P3 needs P1+P2; P4–P6 need P3; P6b needs
 P6; P7 needs P3.

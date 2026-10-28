@@ -1157,7 +1157,7 @@ When an image prune ended in the window, the text and Slack forms add one more l
 after the problem lines. It is not a problem and changes no count:
 
 ```text
-Docker disk: pruned 3 images, freed 4.2 GB at 05:00; images 12.3 GB, build cache 0.5 GB
+Docker disk: pruned 3 images, freed 4.2 GB at 05:00; 12.3 GB used of 62.7 GB
 Docker disk: prune failed at 05:00: docker ps -a failed (1): <reason>
 ```
 
@@ -1558,18 +1558,21 @@ What the prune removes:
 If `docker ps -a` or `docker image ls` fails, the prune stops with an error
 and removes nothing.
 
-The output is `pruned 3 images, freed 4.2 GB (images 12.3 GB, build cache
-0.5 GB now)`. Freed space is the drop in the size of the images plus the
-reclaimable build cache. It counts 0 for an image whose cache is kept
-(used in the last 24 hours) until a later prune. `freed unknown` means that
-`docker system df` failed.
+The output is `pruned 3 images, freed 4.2 GB (Docker disk 12.3 GB used of
+62.7 GB)`. Freed space is the drop in the used bytes of the Docker disk. The
+prune measures it with `df` in a throwaway container of the agent image (no
+network, no capabilities), before and after. `freed unknown` means that a
+measurement failed. Other projects write to the same disk, so the number can
+be too low, never below 0. Docker can keep the space of a removed image as
+build cache for 24 hours. Then that image counts 0 until a later prune.
+`--dry-run` measures nothing.
 
 The result is in the `prune` field of the record for a `--python-patch` run
 (`last.json` and `history.jsonl`). The other prunes write it to
 `~/.local/state/agentbox/_update/prune.json` (mode 0600). The fields are
 `end`, `removed` (tags), `images` (ids), `kept_busy` (ids that Docker kept),
-`freed_bytes` (or `null`), `after` (`images` and `build_cache` in bytes), and
-`error`. The [fleet report](#fleet-report) shows the newest prune as a
+`freed_bytes` (or `null`), `after` (`disk_used` and `disk_size` in bytes, or
+`null`), and `error`. The [fleet report](#fleet-report) shows the newest prune as a
 `Docker disk:` line.
 
 `agentbox update --prune` takes the update lock and exits 75 when an update

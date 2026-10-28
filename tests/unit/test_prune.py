@@ -1,5 +1,5 @@
 """Image pruning (PLAN §2.10): the managed-tag filter, the keep rules, removal
-without -f, `df` sizes and freed space, the abort rules, `prune.json`, and the
+without -f, the `df` disk measurement and freed space, the abort rules, `prune.json`, and the
 output lines. A fake Docker answers every call; nothing touches a real daemon."""
 
 import json
@@ -362,48 +362,72 @@ def test_a_failed_builder_prune_is_an_error_after_the_images_went(d):
     assert rec["images"] == [sha(3)] and "buildkit is down" in rec["error"]
 
 
+DF_CMD = ["docker", "run", "--rm", "--pull", "never", "--network", "none", "--cap-drop", "ALL",
+          "--security-opt", "no-new-privileges", "--entrypoint", "df", "agentbox/agent:latest",
+          "-B1", "--output=used,size", "/"]  # fmt: skip
+
+
+def df_calls(d):
+    return [c for c in d.calls if "--entrypoint" in c]
+
+
+def test_df_runs_in_a_locked_down_container_before_and_after_the_removal(d):
+    agent(d, 1, 10, current=True, latest=True)
+    agent(d, 2, 9)
+    agent(d, 3, 8)
+    run(d)
+    assert df_calls(d) == [DF_CMD, DF_CMD]
+    steps = [
+        c[1:3]
+        for c in d.calls
+        if c in (DF_CMD,) or c[1:3] in (["image", "rm"], ["builder", "prune"])
+    ]
+    assert steps == [["run", "--rm"], ["image", "rm"], ["builder", "prune"], ["run", "--rm"]]
+    assert not any(c[1:3] == ["system", "df"] for c in d.calls)  # `docker system df` is not used
+
+
 @pytest.mark.parametrize(
-    "text,n",
+    "text,want",
     [
-        ("0B", 0),
-        ("512B", 512),
-        ("134.5kB", 134_500),
-        ("134.5KB", 134_500),
-        ("7.565MB", 7_565_000),
-        ("23.31GB", 23_310_000_000),
-        ("1.5TB", 1_500_000_000_000),
-        ("7.353GB (31%)", 7_353_000_000),  # first token only
-        ("  2GB", 2 * GB),
+        ("       Used   1B-blocks\n29903990784 62671097856\n", (29903990784, 62671097856)),
+        ("Used 1B-blocks\n0 5\n", (0, 5)),
+        ("\n  Used  1B-blocks \n 7   9 \n\n", (7, 9)),
     ],
-)
-def test_parse_size_is_decimal_and_reads_the_first_token(text, n):
-    assert prune.parse_size(text) == n
+)  # fmt: skip
+def test_parse_df(text, want):
+    assert prune.parse_df(text) == {"disk_used": want[0], "disk_size": want[1]}
 
 
-@pytest.mark.parametrize("text", ["", "GB", "12", "1.5GiB", "x MB", "-3GB"])
-def test_parse_size_refuses_what_it_cannot_read(text):
+@pytest.mark.parametrize(
+    "text",
+    ["", "Used 1B-blocks\n", "5 9\n", "Used 1B-blocks\n1 2 3\n", "Used 1B-blocks\nx 9\n",
+     "Used 1B-blocks\n-1 9\n", "Used 1B-blocks\n1.5GB 9\n", "Used 1B-blocks\n1 0\n",
+     "Used 1B-blocks\n1 2\n3 4\n"],
+)  # fmt: skip
+def test_parse_df_refuses_what_it_cannot_read(text):
     with pytest.raises(ValueError):
-        prune.parse_size(text)
+        prune.parse_df(text)
 
 
-def test_freed_is_the_drop_in_images_size_plus_cache_reclaimable(d):
+def test_freed_is_the_drop_in_disk_used_bytes(d):
     agent(d, 1, 10, current=True, latest=True, size=2 * GB)
     agent(d, 2, 9, size=2 * GB)
     agent(d, 3, 8, size=3 * GB)
     agent(d, 4, 7, size=1 * GB)
     d.cache, d.cache_after_prune = 500_000_000, 100_000_000
     rec = run(d)
-    # images 8 GB -> 4 GB; cache reclaimable 0.5 GB -> 0.1 GB
+    # used: 20 + 8 images + 0.5 cache GB -> 20 + 4 + 0.1
     assert rec["freed_bytes"] == 4 * GB + 400_000_000
-    assert rec["after"] == {"images": 4 * GB, "build_cache": 100_000_000}
+    assert rec["after"] == {"disk_used": 24 * GB + 100_000_000, "disk_size": 100 * GB}
 
 
-def test_build_cache_size_is_not_used_only_reclaimable(d):
+def test_an_image_whose_space_moves_to_the_cache_counts_zero(d):
+    """Disk used is what the disk got back: no `Images` to `Build Cache` move shows as freed."""
     agent(d, 1, 10, current=True, latest=True)
-    run(d)
-    dfs = [c for c in d.calls if c[1:3] == ["system", "df"]]
-    assert dfs and dfs[0] == ["docker", "system", "df", "--format", "{{json .}}"]
-    assert run(d)["freed_bytes"] == 0  # the 15.36GB cache `Size` of the fake is ignored
+    agent(d, 2, 9)
+    agent(d, 3, 8, size=5 * GB)
+    d.cache, d.cache_after_prune = 0, 5 * GB  # the layers stay as cache
+    assert run(d)["freed_bytes"] == 0
 
 
 def test_freed_is_clamped_at_zero(d, monkeypatch):
@@ -413,10 +437,10 @@ def test_freed_is_clamped_at_zero(d, monkeypatch):
     real = d.run
     n = []
 
-    def grow(args, **kw):  # another project builds during the prune: df grows
-        if args[1:3] == ["system", "df"]:
+    def grow(args, **kw):  # another project writes 9 GB during the prune
+        if "--entrypoint" in args:
             n.append(1)
-            d.cache = 0 if len(n) == 1 else 9 * GB
+            d.other += 0 if len(n) == 1 else 9 * GB
         return real(args, **kw)
 
     monkeypatch.setattr(docker, "run", grow)
@@ -435,8 +459,40 @@ def test_a_failed_df_gives_freed_null_and_the_prune_still_runs(d):
     assert ["docker", "builder", "prune", "--force", "--filter", "until=24h"] in d.calls
 
 
-@pytest.mark.parametrize("text", ["not json\n", "{}\n", '{"Type": "Images", "Size": "1GB"}\n',
-                                  '{"Type":"Images","Size":"?","Reclaimable":"0B"}\n'])  # fmt: skip
+def test_one_failed_measurement_gives_freed_null(d, monkeypatch):
+    agent(d, 1, 10, current=True, latest=True)
+    agent(d, 2, 9)
+    agent(d, 3, 8)
+    real = d.run
+    n = []
+
+    def second_fails(args, **kw):
+        if "--entrypoint" in args:
+            n.append(1)
+            if len(n) == 2:
+                return d.result(args, 125, "", "no space left")
+        return real(args, **kw)
+
+    monkeypatch.setattr(docker, "run", second_fails)
+    rec = run(d)
+    assert rec["freed_bytes"] is None and rec["after"] is None and rec["images"] == [sha(3)]
+
+
+def test_a_docker_exception_in_df_gives_freed_null(d, monkeypatch):
+    agent(d, 1, 10, current=True, latest=True)
+    real = d.run
+
+    def boom(args, **kw):
+        if "--entrypoint" in args:
+            raise docker.DockerError("docker: command not found")
+        return real(args, **kw)
+
+    monkeypatch.setattr(docker, "run", boom)
+    rec = run(d)
+    assert rec["freed_bytes"] is None and rec["error"] is None
+
+
+@pytest.mark.parametrize("text", ["not df\n", "", "Used 1B-blocks\nx y\n", "Used 1B-blocks\n1 0\n"])
 def test_unreadable_df_output_is_unknown_not_a_crash(d, text):
     agent(d, 1, 10, current=True, latest=True)
     d.df_text = text
@@ -445,6 +501,14 @@ def test_unreadable_df_output_is_unknown_not_a_crash(d, text):
 
 
 # ---------------------------------------------------------------- dry run
+def test_dry_run_measures_nothing(d):
+    agent(d, 1, 10, current=True, latest=True)
+    agent(d, 2, 9)
+    agent(d, 3, 8)
+    rec = run(d, dry_run=True)
+    assert df_calls(d) == [] and rec["freed_bytes"] is None and rec["after"] is None
+
+
 def test_dry_run_lists_the_tags_and_removes_nothing(d):
     agent(d, 1, 10, current=True, latest=True)
     agent(d, 2, 9)
@@ -509,9 +573,9 @@ def rec_of(**kw):
 
 def test_output_line():
     rec = rec_of(images=["a", "b", "c"], freed_bytes=4_250_000_000,
-                 after={"images": 12_300_000_000, "build_cache": 500_000_000})  # fmt: skip
+                 after={"disk_used": 12_300_000_000, "disk_size": 62_700_000_000})  # fmt: skip
     assert prune.lines(rec) == [
-        "pruned 3 images, freed 4.3 GB (images 12.3 GB, build cache 0.5 GB now)"
+        "pruned 3 images, freed 4.3 GB (Docker disk 12.3 GB used of 62.7 GB)"
     ]
     assert prune.lines(rec_of(images=["a"], freed_bytes=0)) == ["pruned 1 image, freed 0.0 GB"]
     assert prune.lines(rec_of()) == ["pruned 0 images, freed unknown"]
@@ -546,9 +610,9 @@ def test_dry_run_output_lists_every_tag():
 
 def test_fleet_line():
     ok = rec_of(images=["a", "b", "c"], freed_bytes=4_250_000_000,
-                after={"images": 12_300_000_000, "build_cache": 500_000_000})  # fmt: skip
+                after={"disk_used": 12_300_000_000, "disk_size": 62_700_000_000})  # fmt: skip
     assert prune.fleet_line(ok, "05:00") == (
-        "Docker disk: pruned 3 images, freed 4.3 GB at 05:00; images 12.3 GB, build cache 0.5 GB"
+        "Docker disk: pruned 3 images, freed 4.3 GB at 05:00; 12.3 GB used of 62.7 GB"
     )
     assert prune.fleet_line(rec_of(error="docker ps -a failed (1): down"), "05:00") == (
         "Docker disk: prune failed at 05:00: docker ps -a failed (1): down"

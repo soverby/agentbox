@@ -376,7 +376,7 @@ PRUNE = {
     "images": ["sha256:" + "aa" * 32, "sha256:" + "bb" * 32],
     "kept_busy": [],
     "freed_bytes": 4_250_000_000,
-    "after": {"images": 12_300_000_000, "build_cache": 500_000_000},
+    "after": {"disk_used": 12_300_000_000, "disk_size": 62_700_000_000},
     "error": None,
 }
 
@@ -387,8 +387,7 @@ def test_docker_disk_line_follows_the_summary_and_is_not_a_problem():
     r.prune = PRUNE
     text = report_outputs.render_text(r)
     assert text == (
-        plain + "\nDocker disk: pruned 2 images, freed 4.3 GB at 05:00; "
-        "images 12.3 GB, build cache 0.5 GB"
+        plain + "\nDocker disk: pruned 2 images, freed 4.3 GB at 05:00; 12.3 GB used of 62.7 GB"
     )
     assert report_outputs.render_text(r, slack=True) == text
     assert report_outputs.problem_lines(r) == []  # not a problem line

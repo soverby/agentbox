@@ -27,8 +27,6 @@ RM_LIMIT = 300.0
 BUILDER_LIMIT = 600.0
 DF_LIMIT = 120.0
 ERROR_CAP = 200
-UNITS = {"B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12}  # decimal, as docker prints
-DF_SIZE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)")
 GB_MIN = 100_000_000  # the applied post names freed space from 0.1 GB
 PRUNE_FILE = "prune.json"
 KEYS = ("end", "removed", "images", "kept_busy", "freed_bytes", "after", "error")
@@ -171,34 +169,35 @@ def plan(repo: Path, profs: list[tuple[str, list[str]]]) -> dict[str, list[str]]
     return {i: sorted(set(t)) for i, t in drop.items()}
 
 
-# ---------------------------------------------------------------- sizes
-def parse_size(text: str) -> int:
-    """Bytes of the first token of a `docker system df` size (`7.353GB (31%)`)."""
-    m = DF_SIZE.match(text.strip())
-    unit = UNITS.get(m.group(2).upper()) if m else None
-    if m is None or unit is None:
-        raise ValueError(f"cannot read the size {text!r}")
-    return int(Decimal(m.group(1)) * unit)
+# ---------------------------------------------------------------- disk use
+def disk_args() -> list[str]:
+    """`df` in a throwaway container of the current agent image. The overlay root
+    of a container reports the filesystem that holds the images and the cache."""
+    from . import pyupdate  # late: pyupdate imports this module
+
+    return ["docker", "run", "--rm", "--pull", "never", *pyupdate.CONTAINER_SAFE,
+            "--entrypoint", "df", images.AGENT_LATEST,
+            "-B1", "--output=used,size", "/"]  # fmt: skip
+
+
+def parse_df(text: str) -> dict[str, int]:
+    """`{"disk_used": bytes, "disk_size": bytes}` from `df -B1 --output=used,size /`:
+    a header line and one row of two integers."""
+    rows = [x.split() for x in text.splitlines() if x.strip()]
+    if len(rows) != 2 or len(rows[1]) != 2 or not all(t.isdecimal() for t in rows[1]):
+        raise ValueError(f"cannot read the df output {text!r}")
+    used, size = int(rows[1][0]), int(rows[1][1])
+    if size == 0:
+        raise ValueError("df reports a disk of size 0")
+    return {"disk_used": used, "disk_size": size}
 
 
 def disk_use() -> dict[str, int] | None:
-    """{"images": Images Size, "build_cache": Build Cache Reclaimable} in bytes,
-    or None when `docker system df` fails or prints something else."""
+    """Used and total bytes of the Docker disk, or None when the measurement fails."""
     try:
-        r = docker.run(["docker", "system", "df", "--format", "{{json .}}"], check=False,
-                       timeout=DF_LIMIT)  # fmt: skip
-        if r.returncode != 0:
-            return None
-        rows = {}
-        for line in r.stdout.splitlines():
-            if line.strip():
-                row = json.loads(line)
-                rows[row["Type"]] = row
-        return {
-            "images": parse_size(rows["Images"]["Size"]),
-            "build_cache": parse_size(rows["Build Cache"]["Reclaimable"]),
-        }
-    except (docker.DockerError, ValueError, KeyError, TypeError, AttributeError):
+        r = docker.run(disk_args(), check=False, timeout=DF_LIMIT)
+        return parse_df(r.stdout) if r.returncode == 0 else None
+    except (docker.DockerError, ValueError):
         return None
 
 
@@ -284,8 +283,7 @@ def run(repo: Path, profs: list[tuple[str, list[str]]], *, dry_run: bool = False
         after = disk_use()
         rec["after"] = after
         if before is not None and after is not None:
-            drop_bytes = sum(before.values()) - sum(after.values())
-            rec["freed_bytes"] = max(0, drop_bytes)
+            rec["freed_bytes"] = max(0, before["disk_used"] - after["disk_used"])
     except Exception as e:  # noqa: BLE001 - a prune must not fail the update
         errors.append(f"{type(e).__name__}: {e}"[:ERROR_CAP])
     rec["end"] = schedule.now_iso()
@@ -319,12 +317,12 @@ def freed_text(rec: dict) -> str:
     return "freed unknown" if n is None else f"freed {gb(n)} GB"
 
 
-def now_text(rec: dict) -> str:
-    """`images A GB, build cache B GB now`, or "" when df failed."""
+def disk_text(rec: dict) -> str:
+    """`A GB used of B GB`, or "" when the measurement failed."""
     after = rec.get("after")
     if not after:
         return ""
-    return f"images {gb(after['images'])} GB, build cache {gb(after['build_cache'])} GB now"
+    return f"{gb(after['disk_used'])} GB used of {gb(after['disk_size'])} GB"
 
 
 def lines(rec: dict) -> list[str]:
@@ -337,7 +335,7 @@ def lines(rec: dict) -> list[str]:
         out += [f"  {t}" for t in tags]
     elif not rec["error"] or rec["images"] or rec["removed"]:
         n = len(rec["images"])
-        extra = f" ({now_text(rec)})" if now_text(rec) else ""
+        extra = f" (Docker disk {disk_text(rec)})" if disk_text(rec) else ""
         out.append(f"pruned {n} image{'s' if n != 1 else ''}, {freed_text(rec)}{extra}")
     if rec["error"]:
         out.append(f"prune failed: {rec['error']}")
@@ -349,9 +347,9 @@ def fleet_line(rec: dict, at: str) -> str:
     if rec.get("error"):
         return f"Docker disk: prune failed at {at}: {rec['error']}"
     n = len(rec["images"])
-    now = now_text(rec)
+    disk = disk_text(rec)
     return (f"Docker disk: pruned {n} image{'s' if n != 1 else ''}, {freed_text(rec)} at {at}"
-            + (f"; {now.removesuffix(' now')}" if now else ""))  # fmt: skip
+            + (f"; {disk}" if disk else ""))  # fmt: skip
 
 
 def post_suffix(freed: int | None) -> str:

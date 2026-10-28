@@ -54,6 +54,12 @@ def world(tmp_path, monkeypatch):
     ):
         (repo / f).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / f, repo / f)
+    # The tests assume this baseline, not whatever the live pins are today.
+    env = repo / "images/agent/versions.env"
+    env.write_text(upd.write_env(env.read_text(), {
+        "PYTHON_LINE": "3.14", "PYTHON_VERSION": "3.14.8", "PYTHON_LINE_EOL": "2030-10",
+        "UV_VERSION": "0.13.6",
+    }))  # fmt: skip
     monkeypatch.setenv("AGENTBOX_REPO", str(repo))
     (cfg / "profiles").mkdir(parents=True)
     sysbin = tmp_path / "sysbin"  # job_env needs a `docker` on PATH
@@ -1669,7 +1675,7 @@ def test_versions_env_has_the_python_pins_with_sources():
     text = (ROOT / "images/agent/versions.env").read_text()
     env = upd.read_env(text)
     assert env["PYTHON_LINE"] == "3.14" and env["PYTHON_LINE_EOL"] == "2030-10"
-    assert env["PYTHON_VERSION"] == "3.14.8"  # not bumped here: the first daily run applies it
+    assert env["PYTHON_VERSION"].startswith(env["PYTHON_LINE"] + ".")  # the daily job moves it
     for k in ("PYTHON_LINE", "PYTHON_LINE_EOL", "PYTHON_VERSION"):
         assert upd.value_problem(k, env[k], env) is None
         prev = text.splitlines()[text.splitlines().index(f"{k}={env[k]}") - 1]

@@ -361,6 +361,7 @@ def test_apply_rollback_keeps_other_edits_to_versions_env(repo, monkeypatch):
     calls = []
     fake_docker(monkeypatch, calls)
     env_f = repo / "images/agent/versions.env"
+    original = update.read_env(env_f.read_text())["PYTHON_VERSION"]
     before = env_f.read_text()
 
     def build():
@@ -374,7 +375,7 @@ def test_apply_rollback_keeps_other_edits_to_versions_env(repo, monkeypatch):
     assert ok is False
     after = update.read_env(env_f.read_text())
     assert after["CODEX_VERSION"] == update.read_env(before)["CODEX_VERSION"]  # restored
-    assert after["PYTHON_VERSION"] == "3.14.8"  # restored
+    assert after["PYTHON_VERSION"] == original  # restored
     assert after["PI_VERSION"] == "9" + update.read_env(before)["PI_VERSION"]  # the edit stays
     assert info["step"] == "build" and "injected build failure" in info["error"]
     assert calls == [["docker", "tag", "sha256:prev", "agentbox/agent:latest"]]

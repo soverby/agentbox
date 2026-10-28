@@ -6,9 +6,8 @@ ollama) with controlled filesystem, network, secrets, and MCP access.
 - Requirements: `PROJECT.md`. Design and phase plan: `docs/PLAN.md`. Read both
   before any change. The plan is the source of truth; change the plan first,
   then the code.
-- Status: 1.1.2 released (P0–P8, P6b, fleet report, fire hook). Paths not
-  tested live: see "Tested paths" in `docs/releases/v1.0.0.md`, `v1.1.0.md`,
-  and `v1.1.1.md`.
+- Status: 1.2.0 released (P0–P8, P6b, fleet report, fire hook, Python patch
+  updates). Paths not tested live: see "Tested paths" in `docs/releases/`.
 
 ## Security invariants (never weaken without a plan change)
 

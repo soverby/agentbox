@@ -297,6 +297,7 @@ in that directory.
 | `agentbox update` | Bump the agent image pins in `versions.env` to current releases (values validated), rebuild, run full `doctor`; keep the previous image tag if doctor fails. Python stays in its line (§2.9). Sidecar image digests and the gateway lockfile change by hand (listed in SECURITY.md). |
 | `agentbox update --python-patch [--install [--at HH:MM] \| --uninstall]` | Python patch update only, for the daily host job (§2.9). |
 | `agentbox update --python-line X.Y` | Move Python to another line, with the lock check (§2.9). |
+| `agentbox update --prune [--dry-run]` | Remove superseded agentbox images and old build cache (§2.10). Every update also does this. |
 | `agentbox doctor [profile]` | Full isolation self-test (§4). |
 
 Agent launch flags set by the CLI (the box is the external sandbox):
@@ -1145,9 +1146,8 @@ automatic and a line change is deliberate.
   After a successful update it builds the derived image of every profile
   that has `packages` (`images.ensure_pkgs` for each profile), so no scheduled
   fire pays that build inside its timeout. A derived build failure is a
-  warning in the result, not a rollback. It then lists agent and derived
-  images that `:latest`, the current derived tags, and running containers
-  do not use, and prints the `docker image rm` line; it removes nothing.
+  warning in the result, not a rollback. It then prunes superseded images
+  and old build cache (§2.10).
   Exit 0 for `current`, `applied`, `not_installable`, `lookup_failed`; 1
   for `failed`.
 - Daily job: `agentbox update --python-patch --install [--at HH:MM]`
@@ -1226,12 +1226,118 @@ automatic and a line change is deliberate.
 - Not covered: the gateway image Python (3.13, FastMCP pin, §2.6) and the
   `uv` that profiles use for their own projects.
 
+### 2.10 Image pruning
+
+Each image change leaves the old agentbox images tagged: a new agent hash,
+new derived (`agent-pkgs`) tags, new sidecar hashes. Docker Desktop has one
+VM disk for all containers on the host. On 2026-10-28 agentbox images and
+build cache filled it (64 GB) and another stack's Postgres did not start
+(containerized-006). So agentbox removes what it superseded.
+
+- Managed tags: only tags in the formats agentbox makes.
+  `agentbox/agent:<12 hex>`, `agentbox/agent:base-<12 hex>`,
+  `agentbox/agent-pkgs:<12 hex>`, and `agentbox/<sidecar>:<12 hex>` for
+  each name in `images.SIDECARS`. Other tags (`latest`, `p2test`, other
+  repositories) are never removed. A `<none>` image is not touched by
+  this step.
+- Generations. The prune groups managed tags by image id. It keeps an
+  image id when any of these is true:
+  - Current: the id of `agentbox/agent:latest` and of
+    `agentbox/agent:<current hash>` (each that exists); for each profile
+    with `packages`, `pkgs_tag(id, packages)` for each of those ids; for
+    each sidecar, `sidecar_tag(repo, name)`.
+  - Previous (one): the newest agent image id (by `Created`) that is not
+    current; for each profile with `packages`,
+    `pkgs_tag(previous agent id, packages)`; for each sidecar, the newest
+    image id that is not current. This is the rollback target.
+  - In use: the image of any container, running or stopped
+    (`docker ps -a`). A failed `docker ps -a` or `docker image ls` stops
+    the prune with an error and removes nothing (Docker protects only
+    the last tag of an image in use).
+  Every managed tag of every other image id is removed.
+- A failed candidate is never "previous": `update.apply` (all update
+  paths) computes the candidate tag `agentbox/agent:<agent_hash(repo)>`
+  right after `build()` returns, while the new inputs are on disk (a
+  failure before the build has no candidate). Its rollback, after it
+  re-tags `latest`, runs `docker image rm <candidate tag>` (no `-f`; a
+  refusal or a missing tag is ignored), except when the candidate id
+  equals the previous `latest` id. The previous hash tag stays. So the
+  newest non-current agent image is always the last good one.
+- Removal: `docker image rm <tag>` (never `-f`), one call per image id
+  with all its managed tags. `removed` = the tags of the `Untagged:`
+  lines; `images` = the ids with a `Deleted:` line for the image id.
+  `kept_busy` (ids): rc 1 with `conflict` in stderr (a container made
+  after the list), or no `Deleted:` line for the id (a non-managed tag
+  keeps the image). Not an error. Any other non-zero rc is an `error`
+  (the prune goes on with the next id).
+- Build cache: after the image removal,
+  `docker builder prune --force --filter until=24h`. BuildKit cache
+  records share storage with image layers and a shared record is not
+  pruned, so the cache frees space only after its images are gone (and,
+  for a record used in the last 24 h, at a later run). The cache is
+  shared by all projects on the host: this also removes other projects'
+  cache that has not been used for 24 h. That costs them a slower next
+  build, never data. The cache was not the cause of containerized-006
+  (Docker Desktop already caps it at 20 GB, `builder.gc.defaultKeepStorage`;
+  agentbox's private cache was 134.5 MB): the images were.
+- Volumes: not removed (a stopped box's home volume can hold the only
+  copy of its data). The prune reports nothing about them.
+- Freed space: `docker system df --format '{{json .}}'` before and after;
+  freed = the drop in (`Images` `Size` + `Build Cache` `Reclaimable`).
+  `Build Cache` `Size` counts layers shared with images a second time, so
+  it is not used; `Reclaimable` of the cache is its unshared part. An
+  image removed now whose cache record is kept (used in the last 24 h)
+  moves from `Images` to the cache reclaimable part and counts 0 until a
+  later prune frees it. Other projects' builds are not under the lock,
+  so freed is clamped at 0. Sizes are the first token of the field, decimal
+  units `B`, `kB`, `MB`, `GB`, `TB`. A failed `df` call: freed is unknown
+  (`null`), the prune still runs.
+- When: under the update lock (§2.9), so no fire or `up` builds or starts
+  a box during the prune.
+  - After every successful apply: full `update`, `--python-patch`
+    (`applied`), `--python-line`. After the derived builds.
+  - On every `--python-patch` run whose result is `current`,
+    `not_installable`, or `lookup_failed`, when Docker is up. So the
+    daily job also removes what `up` and other builds left (new sidecar
+    hashes, old derived tags).
+  - `agentbox update --prune`: the prune alone, under the update lock;
+    exit 75 when an update holds the lock; exit 1 when the prune has an
+    `error`, else 0. `--prune --dry-run` prints the tags it would remove,
+    removes nothing, and does not take the lock.
+  A `failed` result (any update path) does not prune: a failed run
+  changes nothing more than its rollback.
+- A prune failure never changes the update result or exit code. It is a
+  line in the output and an `error` field in the record.
+- Record: `prune` in the `--python-patch` result record (`last.json`,
+  `history.jsonl`): `end`, `removed` (tags), `images` (ids removed),
+  `kept_busy`, `freed_bytes` (or `null`), `after` (`{"images": bytes,
+  "build_cache": bytes}`, cache = `Reclaimable`, or `null`), `error`.
+  A prune from full `update`, `--python-line`, or `update --prune`
+  writes the same object to `_update/prune.json` (0600), not to
+  `last.json` or `history.jsonl` (their readers know only the patch
+  results).
+- Output: `pruned N images, freed X.Y GB (images A GB, build cache B GB
+  now)`.
+- Slack: the applied post (§2.9) adds `; freed X.Y GB` when freed is at
+  least 0.1 GB. A prune alone posts nothing.
+- Fleet report (§2.8): when the newest prune (the `prune` of `last.json`
+  or `prune.json`, by `end`) ends inside the window, the text form adds one line `Docker disk:
+  pruned N images, freed X.Y GB at HH:MM; images A GB, build cache B GB`
+  (or `Docker disk: prune failed at HH:MM: <reason>`); the JSON form
+  adds `prune` with `end` and the record fields. It is not a problem
+  line and does not change the summary counts.
+- No doctor check: this is not an isolation property.
+- Limit: images that `up` builds between two daily runs are not pruned
+  until the next run (one agent and derived generation is about 2.4 GB).
+  At the 2026-10 rate (23 GB in 35 days) one run a day is enough.
+
 ## 3. Repository layout
 
 ```text
 cli/agentbox/          host CLI (stdlib), pyproject.toml
                        fleet.py (§2.8 report facts), report_outputs.py (§2.8 outputs)
                        firehook.py (§2.7 fire hook), pyupdate.py and updatelock.py (§2.9)
+                       prune.py (§2.10 image pruning)
 images/agent/          Dockerfile, entrypoint, with-secrets, managed-mcp.json, versions.env
 images/egress/         squid.conf template
 images/mcp-gateway/    gateway service, entrypoint
@@ -1332,6 +1438,7 @@ rounds, then escalate. Coordinator signs off.
 | P7 | Scheduling | launchd job fires `agentbox run`; transcript and exit code recorded; Docker Desktop auto-start works; failure logged; `schedule ls` shows last result |
 | P8 | SECURITY.md, USAGE.md (quick start first), security review pass | Independent review finds no BLOCKER; a new user reaches a first Claude session with the quick start alone |
 | p1 | Python line and patch updates (§2.9) | Unit: line filter of the python.org list; `value_problem` for the three keys; probe JSON parsing (`[]` = absent); result classification and post dedupe; partial rollback keeps other `versions.env` lines; update lock and the fire/`up` interlock; the scratch doctor starts its box while the lock is held. Live (marked): the lock check fails a cp-less lock by name offline and passes a current lock; one real `--python-patch` run applies a patch, posts to Slack, and doctor 22 sees the job |
+| p2 | Image pruning (§2.10) | Unit: managed-tag filter; keep rules (current, one previous, derived of both, sidecars, any container); `docker image rm` without `-f` and a refusal is `kept_busy`; `df` size parsing; prune runs after each apply and on every patch run, not after a `failed` result; the rollback removes only the candidate tag (computed after the build) and the previous hash tag stays; a failed `ps -a` removes nothing; freed = drop in images + cache reclaimable; `prune.json`; record, applied post suffix, fleet report line. Live (marked): `update --prune --dry-run` lists the superseded tags; `update --prune` removes them, keeps every box image, and reports freed space |
 
 P1 and P2 can build in parallel; P3 needs P1+P2; P4–P6 need P3; P6b needs
 P6; P7 needs P3.
@@ -1408,6 +1515,7 @@ P6; P7 needs P3.
 - f1: fleet report (`schedule report`, §2.8): due fires from the live schedules, rule causes, idle boxes, job copy drift, output plugins, optional investigator box. §2.7: `trigger` in fire rows, `source` in `job.json`. Host-side and read-only; the investigator is a normal box with one empty ro folder (user-made, outside the denylist) and the anthropic preset only; doctor 22 checks it.
 - h1: fire hook (`fire_command`, §2.7): a host command gets each fire's outcome as JSON on stdin, for external triage. Host-side, owner-configured, no box change, no new network path; agentbox adds no secret to the payload (`detail` and `message` are unscrubbed box output, §2.7).
 - p1: Python line and patch updates (§2.9, §2.1, §2.3): `PYTHON_LINE`, daily `update --python-patch` host job with Slack posts, uv coupling, `--python-line` with an offline lock check. After the 1.1.1 regression (3.15). Host-side; no box isolation change.
+- p2: image pruning (§2.10, §2.3, §2.8, §2.9): every update and the daily patch job remove superseded agentbox images (keep current and one previous, and any image a container uses) and build cache unused for 24 h; `update --prune`; freed space in the record, the applied post and the fleet report. After the 2026-10-28 full Docker disk (containerized-006). Host-side; no box isolation change.
 
 ## 9. Usability balance (architect, post-review)
 

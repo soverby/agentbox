@@ -475,11 +475,23 @@ agentbox does not solve these risks. It documents them.
 | Gateway and gate base | `python:3.13-slim` digest | `images/mcp-gateway/Dockerfile`, `images/ollama-gate/Dockerfile` |
 | vLLM on Modal | Image digest and Hugging Face revision | `modal/serve_vllm.py` |
 
-`agentbox update` is the only command that changes the agent image pins. It
+`agentbox update` is the only command that changes the agent image pins (its
+daily `--python-patch` form changes only the Python pins). It
 looks up the latest releases, checks the form of each value (version,
 64-digit SHA-256, or `name:tag@sha256:` digest), writes `versions.env`,
 rebuilds, and runs the full doctor on a scratch profile. If any step fails,
 it restores the old pins and the previous image (`cli/agentbox/update.py`).
+The daily Python patch job (`agentbox update --python-patch --install`, host
+side) edits the working tree of the checkout and does not commit. It holds an
+exclusive update lock, so no box starts and no scheduled run starts while it
+builds. Its `uv` probe runs in a container with no network. The lock check of
+`--python-line` runs `uv sync --frozen --no-build --dry-run` in a plain
+container: no network, the project folder mounted read-only, no secrets, no
+Compose project, no proxy, and a 120 s limit. It runs no project code and
+writes nothing. These are host-code properties with unit tests
+(`tests/unit/test_pyupdate.py`), not box properties, so they have no doctor
+check; doctor 22 checks that the job is loaded.
+
 Key fingerprints change only by hand, after a check against the vendor
 documentation. These pins also change only by hand: `SQUID_IMAGE`,
 `LITELLM_IMAGE`, the `python:3.13-slim` `PYTHON_IMAGE` of the gate and

@@ -260,6 +260,7 @@ def test_down_clears_pin(roots, monkeypatch):
 def test_up_pins(roots, monkeypatch):
     setup_running_box(roots, monkeypatch, {})
     monkeypatch.setattr(cli, "ensure_up", lambda b, *a, **k: None)
+    monkeypatch.setattr(cli, "image_outdated", lambda b: False)
     assert cli.main(["up", "demo"]) == 0
     assert boxmod.is_pinned(boxmod.load("demo"))
 

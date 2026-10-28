@@ -360,7 +360,8 @@ def row_cause(cls: str, row: dict, start: datetime) -> str | None:
     if cls == "failed":
         return last or msg or "no output in the transcript"
     if cls == "docker_down":
-        return "Docker did not come up"
+        # rc 69 is also a fire that waited out an update (PLAN §2.9)
+        return schedule.UPDATE_MSG if msg == schedule.UPDATE_MSG else "Docker did not come up"
     if cls == "preflight":
         return msg or "preflight check failed"
     if cls == "start_failed":

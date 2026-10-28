@@ -28,13 +28,30 @@ FAILED = "(failed"  # prefix of a lookup value that could not be fetched
 VERSION_RE = re.compile(r"[0-9A-Za-z.+~:@-]{1,80}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,127}:[A-Za-z0-9._-]{1,128}@sha256:[0-9a-f]{64}")
+# Python pins (PLAN §2.9): the line is `3.N`, the version is `<line>.N`, the end of
+# security support is `YYYY-MM`.
+PYLINE_RE = re.compile(r"3\.[0-9]{1,3}")
+PYVER_RE = re.compile(r"3\.[0-9]{1,3}\.[0-9]{1,4}")
+EOL_RE = re.compile(r"[0-9]{4}-(?:0[1-9]|1[0-2])")
 
 
-def value_problem(key: str, value: object) -> str | None:
-    """Why `value` is not a valid pin for `key` (None: valid)."""
+def value_problem(key: str, value: object, env: dict[str, str] | None = None) -> str | None:
+    """Why `value` is not a valid pin for `key` (None: valid). `env` (the other
+    pins) lets PYTHON_VERSION be checked against PYTHON_LINE."""
     if not isinstance(value, str):
         return f"not a string ({type(value).__name__})"
-    if key.endswith("_SHA256"):
+    if key == "PYTHON_LINE":
+        rx, what = PYLINE_RE, "a Python line 3.N"
+    elif key == "PYTHON_LINE_EOL":
+        rx, what = EOL_RE, "a month YYYY-MM"
+    elif key == "PYTHON_VERSION":
+        if not PYVER_RE.fullmatch(value):
+            return "invalid value, want a Python version 3.N.N"
+        line = (env or {}).get("PYTHON_LINE")
+        if line is not None and not value.startswith(line + "."):
+            return f"invalid value, want a version in PYTHON_LINE {line}"
+        return None
+    elif key.endswith("_SHA256"):
         rx, what = SHA256_RE, "64 lowercase hex digits"
     elif key.endswith("_IMAGE"):
         rx, what = IMAGE_RE, "name:tag@sha256:<64 hex>"
@@ -59,10 +76,11 @@ def read_env(text: str) -> dict[str, str]:
 def write_env(text: str, new: dict[str, str]) -> str:
     """Replace values in place, keeping comments and order. Unknown key: error."""
     have = read_env(text)
+    merged = {**have, **new}  # PYTHON_VERSION is checked against the PYTHON_LINE it lands with
     for k in new:
         if k not in have:
             raise UpdateError(f"versions.env has no {k}")
-        if value_problem(k, new[k]) or re.search(r"[\x00-\x1f\x7f-\x9f=\s]", new[k]):
+        if value_problem(k, new[k], merged) or re.search(r"[\x00-\x1f\x7f-\x9f=\s]", new[k]):
             raise UpdateError(f"refusing to write an invalid value for {k}")
     out = []
     for line in text.splitlines(keepends=True):
@@ -130,15 +148,29 @@ def node_latest(index: list, major: str) -> str:
     raise UpdateError(f"no Node.js v{major} release")
 
 
-def python_latest(releases: list) -> str:
-    finals = [
+def python_finals(releases: list) -> list[str]:
+    """Versions `3.N.N` of the final CPython releases in the python.org list."""
+    return [
         r["name"].split()[-1]
         for r in releases
         if not r.get("pre_release") and re.fullmatch(r"Python 3\.\d+\.\d+", r.get("name", ""))
     ]
+
+
+def python_latest(releases: list, line: str) -> str:
+    """The newest final `<line>.N` release (PLAN §2.9)."""
+    finals = [v for v in python_finals(releases) if v.startswith(line + ".")]
     if not finals:
-        raise UpdateError("no final CPython release found")
+        raise UpdateError(f"no final CPython {line} release found")
     return max(finals, key=vkey)
+
+
+def python_new_line(releases: list, line: str) -> str | None:
+    """`3.(N+1)` when the list has its final `.0` release, else None."""
+    if not PYLINE_RE.fullmatch(line):
+        raise UpdateError(f"PYTHON_LINE {line!r} is not a Python line 3.N")
+    nxt = f"3.{int(line.split('.')[1]) + 1}"
+    return nxt if f"{nxt}.0" in python_finals(releases) else None
 
 
 def gh_release(repo: str, asset: str, fetch=_json) -> tuple[str, str]:
@@ -153,6 +185,7 @@ def gh_release(repo: str, asset: str, fetch=_json) -> tuple[str, str]:
     raise UpdateError(f"{repo}: asset {asset} missing")
 
 
+PYTHON_RELEASES = "https://www.python.org/api/v2/downloads/release/?is_published=true"
 LOOKUP_ERRORS = (UpdateError, urllib.error.URLError, OSError, KeyError, ValueError)
 
 
@@ -180,9 +213,12 @@ def _try(out: dict[str, str], keys: tuple[str, ...], fn: Callable[[], object]) -
     out.update(zip(keys, vals, strict=True))
 
 
-def lookup(current: dict[str, str], fetch_json=_json, fetch=_get) -> dict[str, str]:
+def lookup(
+    current: dict[str, str], fetch_json=_json, fetch=_get, releases_out: list | None = None
+) -> dict[str, str]:
     """Latest value for each pin (and its paired checksum). Network I/O.
-    A source that fails marks its keys with a FAILED value; others still resolve."""
+    A source that fails marks its keys with a FAILED value; others still resolve.
+    `releases_out` gets the python.org release list (for the new-line notice)."""
     out: dict[str, str] = {}
     claude = (
         "https://downloads.claude.ai/claude-code/apt/stable/dists/stable/main/binary-amd64/Packages"
@@ -224,13 +260,17 @@ def lookup(current: dict[str, str], fetch_json=_json, fetch=_get) -> dict[str, s
         ("UV_VERSION", "UV_SHA256"),
         lambda: gh_release("astral-sh/uv", "uv-x86_64-unknown-linux-gnu.tar.gz", fetch_json),
     )
-    _try(
-        out,
-        ("PYTHON_VERSION",),
-        lambda: python_latest(
-            fetch_json("https://www.python.org/api/v2/downloads/release/?is_published=true")
-        ),
-    )
+
+    def python() -> str:
+        line = current.get("PYTHON_LINE")
+        if line is None:
+            raise UpdateError("versions.env has no PYTHON_LINE")
+        rels = fetch_json(PYTHON_RELEASES)
+        if releases_out is not None:
+            releases_out[:] = rels
+        return python_latest(rels, line)
+
+    _try(out, ("PYTHON_VERSION",), python)
 
     def ubuntu() -> str:
         img = current.get("UBUNTU_IMAGE", "ubuntu:24.04@").split("@")[0]
@@ -282,10 +322,18 @@ def apply(
     build: Callable[[], None],
     doctor: Callable[[], bool],
     relock: Callable[[], None] | None = None,
+    check: Callable[[], None] | None = None,
+    info: dict | None = None,
 ) -> bool:
-    """Write versions.env, rebuild, run doctor. On any failure restore
-    versions.env (and the adapter lockfile) and re-point agentbox/agent:latest
-    at the previous image. Returns True on success."""
+    """Write versions.env, rebuild, (check,) run doctor. On any failure restore
+    the keys this update changed (other edits to versions.env stay), the adapter
+    files it touched, and re-point agentbox/agent:latest at the previous image.
+    Returns True on success.
+
+    `check` runs after the build and before doctor and raises to fail (the
+    lock check, PLAN §2.9). `info` gets `step` (write, relock, build, check,
+    doctor: the last step started) and, on failure, `error` (one line)."""
+    info = info if info is not None else {}
     env_file = repo / "images/agent/versions.env"
     lock = repo / "images/agent/pi-mcp-adapter/package-lock.json"
     pkg = repo / "images/agent/pi-mcp-adapter/package.json"
@@ -298,24 +346,37 @@ def apply(
     if not changes:
         print("all pins are current")
         return True
+    info["changes"] = dict(changes)
+    info["step"] = "write"
     try:
         env_file.write_text(write_env(old_env, changes))
         if "PI_MCP_ADAPTER_VERSION" in changes:
+            info["step"] = "relock"
             p = json.loads(old_pkg)
             p.setdefault("dependencies", {})["pi-mcp-adapter"] = changes["PI_MCP_ADAPTER_VERSION"]
             pkg.write_text(json.dumps(p, indent=2) + "\n")
             if relock is None:
                 raise UpdateError("pi-mcp-adapter changed but no relock step")
             relock()
+        info["step"] = "build"
         build()
+        if check is not None:
+            info["step"] = "check"
+            check()
+        info["step"] = "doctor"
         if not doctor():
             raise UpdateError("doctor failed on the new image")
         return True
     except BaseException as e:  # also KeyboardInterrupt: never leave a half update
+        info["error"] = (str(e).strip() or type(e).__name__).splitlines()[0]
         print(term.clean(f"agentbox update: {e!r}; rolling back"))
-        env_file.write_text(old_env)
-        lock.write_bytes(old_lock)
-        pkg.write_bytes(old_pkg)
+        try:  # only the keys this update changed: other edits made meanwhile stay
+            env_file.write_text(write_env(env_file.read_text(), {k: cur[k] for k in changes}))
+        except (UpdateError, OSError) as re_:
+            print(term.clean(f"agentbox update: cannot restore versions.env: {re_}"))
+        if "PI_MCP_ADAPTER_VERSION" in changes:
+            lock.write_bytes(old_lock)
+            pkg.write_bytes(old_pkg)
         if prev is not None:
             docker.run(["docker", "tag", prev, images.AGENT_LATEST])
         if not isinstance(e, Exception):

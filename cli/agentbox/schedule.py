@@ -42,13 +42,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import firehook, notify, paths
+from . import firehook, notify, paths, updatelock
 
 EXPAND_CAP = 500
 DEFAULT_TIMEOUT = 7200
 LOG_ROTATE = 5 * 1024 * 1024
 DOCKER_WAIT = 120.0
 DOCKER_POLL = 3.0
+UPDATE_WAIT = 900.0  # a fire waits this long for a running update (PLAN §2.9)
+UPDATE_POLL = 10.0
+UPDATE_MSG = "update in progress"
 DOCKER_APP_BIN = "/Applications/Docker.app/Contents/Resources/bin"
 BASE_PATH = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
 # Non-secret env that the job needs to find the same roots as `add` did.
@@ -73,6 +76,13 @@ SKIP_NOTE = "another run of this job is still active"
 TRIGGER_ENV = "AGENTBOX_FIRE_TRIGGER"
 TRIGGERS = ("schedule", "run-now")
 SOURCE_MAX = 1024 * 1024  # largest source file the drift check reads
+
+
+class _NotRun(Exception):
+    """Inside `fire`: the run did not happen (the message is set)."""
+
+
+UPDATE_RETRIES = 5  # box starts per fire that may meet the update lock
 
 
 class Terminated(Exception):
@@ -653,72 +663,116 @@ def installed(job: dict) -> str:
         return "unknown"
 
 
-# ---------------------------------------------------------------- report job (PLAN §2.8)
-# One host job, `agentbox schedule report --post`. The job helpers above build
-# `<prefix>.<profile>.<name>`; this one has its own label and crontab tag.
+# ---------------------------------------------------------------- host jobs (PLAN §2.8, §2.9)
+# Two host jobs run outside the profile schedules: the daily fleet report
+# (`schedule report --post`, §2.8) and the daily Python patch update
+# (`update --python-patch`, §2.9). The job helpers above build
+# `<prefix>.<profile>.<name>`; a host job has its own label
+# `<prefix>.<name>` and crontab tag `# agentbox:<name>`.
 REPORT_NAME = "_report"
+UPDATE_NAME = "_update"
 
 
-def report_label() -> str:
-    return f"{launchd_prefix()}.{REPORT_NAME}"
+def host_label(name: str) -> str:
+    return f"{launchd_prefix()}.{name}"
 
 
-def report_tag() -> str:
-    return f"# agentbox:{REPORT_NAME}"
+def host_tag(name: str) -> str:
+    return f"# agentbox:{name}"
 
 
-def report_job(rdir: Path, at: str, prog: list[str], extra: dict[str, str]) -> dict:
-    """The dict that render_plist / cron_line read, for the daily report job."""
-    label = report_label()
+def host_job(name: str, jdir: Path, at: str, argv: list[str], prog_env: dict[str, str]) -> dict:
+    """The dict that render_plist / cron_line read, for a daily host job."""
+    label = host_label(name)
     return {
         "label": label,
         "plist": str(launchagents_dir() / f"{label}.plist"),
-        "argv": [*prog, "schedule", "report", "--post"],
-        "env": job_env(extra),
-        "dir": str(rdir),
+        "argv": argv,
+        "env": job_env(prog_env),
+        "dir": str(jdir),
         "schedule": Spec(cron=at_to_cron(at, None)).as_json(),
     }
 
 
-def report_install(job: dict) -> None:
+def host_install(job: dict, name: str) -> None:
     if is_macos():
         plist = Path(job["plist"])
         plist.parent.mkdir(parents=True, exist_ok=True)
         write_private(plist, plistlib.dumps(render_plist(job)), 0o644)
         load(plist, job["label"])
     else:
-        crontab_write(crontab_set_tag(crontab_read(), report_tag(), cron_line(job)))
+        crontab_write(crontab_set_tag(crontab_read(), host_tag(name), cron_line(job)))
 
 
-def report_installed() -> str | None:
-    """None: no report job is installed. "loaded" / "not loaded" (macOS: the
+def host_installed(name: str) -> str | None:
+    """None: the job is not installed. "loaded" / "not loaded" (macOS: the
     plist exists; loaded or not) / "in crontab" (Linux) / "unknown"."""
     if is_macos():
-        if not (launchagents_dir() / f"{report_label()}.plist").exists():
+        if not (launchagents_dir() / f"{host_label(name)}.plist").exists():
             return None
-        return "loaded" if is_loaded(report_label()) else "not loaded"
+        return "loaded" if is_loaded(host_label(name)) else "not loaded"
     try:
-        return "in crontab" if report_tag() in crontab_read().splitlines() else None
+        return "in crontab" if host_tag(name) in crontab_read().splitlines() else None
     except ScheduleError:
         return "unknown"
 
 
-def report_uninstall() -> bool:
-    """Remove the report job. False when none was installed."""
+def host_uninstall(name: str) -> bool:
+    """Remove the job. False when none was installed."""
     found = False
     if is_macos():
-        plist = launchagents_dir() / f"{report_label()}.plist"
-        found = plist.exists() or is_loaded(report_label())
-        unload(report_label())
+        plist = launchagents_dir() / f"{host_label(name)}.plist"
+        found = plist.exists() or is_loaded(host_label(name))
+        unload(host_label(name))
         with contextlib.suppress(FileNotFoundError):
             plist.unlink()
     else:
         text = crontab_read()
-        new = crontab_remove_tag(text, report_tag())
+        new = crontab_remove_tag(text, host_tag(name))
         found = new != text
         if found:
             crontab_write(new)
     return found
+
+
+def report_label() -> str:
+    return host_label(REPORT_NAME)
+
+
+def report_tag() -> str:
+    return host_tag(REPORT_NAME)
+
+
+def report_job(rdir: Path, at: str, prog: list[str], extra: dict[str, str]) -> dict:
+    return host_job(REPORT_NAME, rdir, at, [*prog, "schedule", "report", "--post"], extra)
+
+
+def report_install(job: dict) -> None:
+    host_install(job, REPORT_NAME)
+
+
+def report_installed() -> str | None:
+    return host_installed(REPORT_NAME)
+
+
+def report_uninstall() -> bool:
+    return host_uninstall(REPORT_NAME)
+
+
+def update_job(udir: Path, at: str, prog: list[str], extra: dict[str, str]) -> dict:
+    return host_job(UPDATE_NAME, udir, at, [*prog, "update", "--python-patch"], extra)
+
+
+def update_install(job: dict) -> None:
+    host_install(job, UPDATE_NAME)
+
+
+def update_installed() -> str | None:
+    return host_installed(UPDATE_NAME)
+
+
+def update_uninstall() -> bool:
+    return host_uninstall(UPDATE_NAME)
 
 
 # ---------------------------------------------------------------- job copy drift (PLAN §2.7)
@@ -847,6 +901,21 @@ def ensure_docker(profile: str, name: str, wait: float, poll: float) -> bool:
     return False
 
 
+def wait_update(profile: str, name: str, wait: float, poll: float) -> bool:
+    """True when no update holds the update lock. While one does, wait up to
+    `wait` seconds (poll every `poll`); False if it still does."""
+    if not updatelock.busy():
+        return True
+    log(profile, name, f"an update is running; waiting up to {wait:.0f} s")
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+        if not updatelock.busy():
+            log(profile, name, "the update is done")
+            return True
+    return False
+
+
 def run_meta(rd, key: str) -> str | None:
     if not rd:
         return None
@@ -918,13 +987,16 @@ def fire_trigger() -> tuple[str, str | None]:
 
 
 def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
-         poll: float = DOCKER_POLL) -> int:  # fmt: skip
+         poll: float = DOCKER_POLL, update_wait: float | None = None,
+         update_poll: float = UPDATE_POLL) -> int:  # fmt: skip
     """One scheduled run. runner(profile, agent, prompt_path, model, timeout) ->
     (rc, run_dir); an exception may carry .run_dir and .rc. preflight(profile,
     agent, model, code_paths) -> (error or None, warnings). Never interactive.
     For a command job, agent is None and prompt_path is the script."""
     if wait is None:
         wait = float(os.environ.get("AGENTBOX_DOCKER_WAIT", DOCKER_WAIT))
+    if update_wait is None:
+        update_wait = UPDATE_WAIT
     job = load_job(profile, name)
     jd = Path(job["dir"])
     for f in ("launchd.out", "launchd.err"):
@@ -935,6 +1007,25 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
     base = {"profile": profile, "name": name, "kind": kind, "agent": agent, "trigger": trigger,
             "start": now_iso()}  # fmt: skip
     t0 = time.monotonic()
+    waited = [0.0]  # one update-wait budget for the whole fire
+
+    def wait_free() -> bool:
+        t = time.monotonic()
+        ok = wait_update(profile, name, max(0.0, update_wait - waited[0]), update_poll)
+        waited[0] += time.monotonic() - t
+        return ok
+
+    def run_waiting(call):
+        """call() -> (rc, run_dir). UpdateBusy (the box start found the update lock): wait
+        again within the budget, then retry. None: still busy when the budget ran out."""
+        for _ in range(UPDATE_RETRIES):
+            try:
+                return call()
+            except updatelock.UpdateBusy:
+                if not wait_free():
+                    return None
+        return None
+
     with (jd / "fire.lock").open("a") as lk:
         try:
             fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -969,6 +1060,10 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
                 )
                 note = f"Docker did not come up within {wait:.0f} s"
                 log(profile, name, msg)
+            elif not wait_free():
+                rc = RC_DOCKER_DOWN  # 69: the job did not run; outcome stays not_run
+                msg = note = UPDATE_MSG
+                log(profile, name, msg)
             else:
                 msg, rec["warnings"] = preflight(profile, agent, job.get("model"),
                                                  job_code_paths(job))  # fmt: skip
@@ -980,7 +1075,12 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
                 else:
                     tmo = job.get("timeout", DEFAULT_TIMEOUT)
                     prompt = str(jd / job_file(kind))
-                    rc, rd = runner(profile, agent, prompt, job.get("model"), tmo)
+                    got = run_waiting(lambda: runner(profile, agent, prompt, job.get("model"), tmo))
+                    if got is None:  # an update took the lock after the preflight
+                        rc, msg, note = RC_DOCKER_DOWN, UPDATE_MSG, UPDATE_MSG
+                        log(profile, name, msg)
+                        raise _NotRun
+                    rc, rd = got
                     log(profile, name, f"run {rd} exit {rc}")
                     # 124 is a timeout only when the CLI killed the run (a script may exit 124)
                     killed = run_meta(rd, "killed") or ""
@@ -995,6 +1095,8 @@ def fire(profile: str, name: str, runner, preflight, wait: float | None = None,
                         rec["stopped"] = f"stopped: {stop}"
                     if hc := host_changes(rd):
                         rec["host_config_changes"] = hc
+        except _NotRun:
+            pass  # rc, msg and note are set; outcome stays not_run
         except Terminated as e:
             rc, status, msg, outcome = RC_TERMINATED, "terminated", str(e), "terminated"
             rd = getattr(e, "run_dir", None) or rd

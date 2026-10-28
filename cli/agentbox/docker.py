@@ -173,3 +173,26 @@ def running_projects(
         if proj.startswith(prefix):
             res.setdefault(proj, []).append(svc)
     return res
+
+
+def container_image_id(project: str, service: str = "agent") -> str | None:
+    """Image id (sha256:...) of the running container of a Compose service, or
+    None when there is none (or Docker does not answer)."""
+    r = run(
+        [
+            "docker",
+            "ps",
+            "-q",
+            "--filter",
+            f"label=com.docker.compose.project={project}",
+            "--filter",
+            f"label=com.docker.compose.service={service}",
+        ],
+        check=False,
+        timeout=30,
+    )
+    ids = r.stdout.split() if r.returncode == 0 else []
+    if not ids:
+        return None
+    r = run(["docker", "inspect", "--format", "{{.Image}}", ids[0]], check=False, timeout=30)
+    return r.stdout.strip() or None if r.returncode == 0 else None

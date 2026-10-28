@@ -26,6 +26,7 @@ from . import (
     router,
     secretstore,
     term,
+    updatelock,
 )
 from .launch import WITH_SECRETS
 from .profile import OAUTH_PREFIX, Profile, ProfileError, load_profile, oauth_secret_name
@@ -405,6 +406,7 @@ def keep_running_secrets(box: Box, doc: dict, old_doc: dict | None, dl) -> bool:
 
 
 def _up(box: Box, accept_mount_change: bool, explicit: bool = False) -> None:
+    updatelock.check()  # PLAN §2.9: no box starts while an update runs
     mountstate.check_and_record(box.state, box.profile, accept_mount_change)
     repo = paths.repo_root()
     p = box.profile

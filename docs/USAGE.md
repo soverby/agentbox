@@ -96,7 +96,7 @@ If a step fails, read [Troubleshooting](#troubleshooting).
 | `agentbox up [profile] [--accept-mount-change]` | Start the box and keep it up. |
 | `agentbox down [profile]` | Stop the box. The home volume stays. |
 | `agentbox down -v [profile]` | Full reset: also remove the home volume and the gateway OAuth volume. You must log in to Codex and Pi again (and `mcp login` again if a provider rotated its refresh token). |
-| `agentbox ls` | Profiles, running or stopped, mode, mounts. |
+| `agentbox ls` | Profiles, running or stopped, mode, mounts. A running box with an old agent image shows `image outdated`. |
 | `agentbox allow [profile] <domain>` | Add a domain to the allowlist; live reload. |
 | `agentbox denied [profile] [--since S] [--json]` | Recent denied requests. |
 | `agentbox secret set\|rm [--shared \| profile] NAME` | Store or delete a secret. |
@@ -106,7 +106,9 @@ If a step fails, read [Troubleshooting](#troubleshooting).
 | `agentbox schedule report [--since S] [--json] [--post] [--no-investigate]` | Fleet report: what was due, what ran, idle boxes (read [Fleet report](#fleet-report)). |
 | `agentbox schedule report --install [--at HH:MM]` / `--uninstall` | Install or remove the daily report job. |
 | `agentbox doctor [profile]` | Full isolation self-test. |
-| `agentbox update [--check]` | Update tool versions, rebuild, self-test. |
+| `agentbox update [--check]` | Update tool versions, rebuild, self-test. Python stays in its line. |
+| `agentbox update --python-patch [--install [--at HH:MM] \| --uninstall]` | Python patch update only. The daily host job runs it (read [Python updates](#python-updates)). |
+| `agentbox update --python-line X.Y --eol YYYY-MM [--force]` | Move Python to another line, after the lock check. |
 
 Where `[profile]` is optional, the CLI uses the profile whose mount contains
 the current directory. If no profile or more than one profile matches, the
@@ -935,7 +937,7 @@ Exit codes of a fire:
 | Code | Meaning |
 | --- | --- |
 | 0 or agent's (script's) code | The run happened. |
-| 69 | Docker did not come up within 120 seconds. |
+| 69 | Docker did not come up within 120 seconds, or an update still ran after 15 minutes (`update in progress`). |
 | 75 | Skipped: the same job was still running. |
 | 78 | Preflight failed (agent job: missing credential or agent not in profile; both kinds: unsafe mount). |
 | 124 | Killed after the timeout. |
@@ -1185,7 +1187,7 @@ the catch-up fire".
 | `ok` | The run exited 0. |
 | `timeout` | The CLI killed the run at its timeout. A script that exits 124 itself is `failed`. |
 | `failed` | Another non-zero exit. The cause is the last line of the transcript. |
-| `docker_down` | Exit 69. Docker did not come up. |
+| `docker_down` | Exit 69. Docker did not come up, or an update was running (`update in progress`). |
 | `preflight` | Exit 78, no run. The cause is the message of the fire. |
 | `start_failed` | Exit 125. The runner failed. |
 | `terminated` | A signal stopped the fire (logout, shutdown, bootout). |
@@ -1350,7 +1352,7 @@ it. `setup` and `update` run the full suite on a scratch profile.
 | 19 | Open-mode denials (IP, private ranges, host); IPv6 when available. |
 | 20 | Gateway: token required, tool policy, no upstream access for the agent, all upstreams connected, OAuth store private. |
 | 21 | Router: admin routes refused, no `api_base` override (SKIP without router). |
-| 22 | Fleet report (`22-report`, host-level, once per `doctor` call): the investigator profile passes the safety check; the report job is loaded. SKIP without `report_investigator` and without an installed report job. |
+| 22 | Fleet report and Python update job (`22-report`, host-level, once per `doctor` call): the investigator profile passes the safety check; the report job and the Python update job are loaded when installed. SKIP when none is set or installed; the text names `agentbox update --python-patch --install`. |
 
 `14 codex-apps-live` is always SKIP: check `/apps` in a Codex session by
 hand. Doctor results can be faked by an agent process that stays running in
@@ -1373,6 +1375,11 @@ digest); a lookup that fails or returns a bad value leaves that pin
 unchanged. Key fingerprints (`CLAUDE_KEY_FPR`,
 `GH_KEY_FPRS`) change only by hand.
 
+`update` keeps Python in its line (`PYTHON_LINE` in `versions.env`): it moves
+`PYTHON_VERSION` to the newest `3.N.x` release of that line, and only when
+the pinned or the latest `uv` can install it. It never changes `PYTHON_LINE`.
+Read [Python updates](#python-updates).
+
 `update` does not change these pins. Change them by hand:
 
 - `SQUID_IMAGE` in `images/egress/Dockerfile`.
@@ -1383,6 +1390,110 @@ unchanged. Key fingerprints (`CLAUDE_KEY_FPR`,
   `images/mcp-gateway/Dockerfile`.
 - `images/mcp-gateway/requirements.lock` (`images/mcp-gateway/lock.sh`).
 - `VLLM_IMAGE` and `MODEL_REVISION` in `modal/serve_vllm.py`.
+
+### Python updates
+
+A patch release of Python (3.14.8 to 3.14.9) keeps the ABI: a wheel built for
+`cp314` works on every 3.14.x. A new line (3.15) changes the ABI. A project
+whose `uv.lock` has no wheel for the new line fails to install. So patch
+releases come in automatically, and a change of line is your decision.
+
+`versions.env` holds three pins: `PYTHON_LINE` (`3.14`), `PYTHON_VERSION`
+(`3.14.8`), and `PYTHON_LINE_EOL` (`2030-10`, the end of security support for
+the line, from its PEP). The image build fails when `PYTHON_VERSION` is not
+in `PYTHON_LINE`.
+
+#### Daily patch job
+
+```sh
+agentbox update --python-patch --install            # every day at 05:00
+agentbox update --python-patch --install --at 06:15
+agentbox update --python-patch --uninstall
+agentbox update --python-patch                      # run it now
+```
+
+This writes one host job that runs `agentbox update --python-patch`. On
+macOS the launchd label is `com.agentbox._update` (the prefix follows
+`AGENTBOX_LAUNCHD_PREFIX`). On Linux the crontab entry has the tag
+`# agentbox:_update`. The job starts Docker Desktop when it is down. Its
+logs, `last.json`, and `history.jsonl` are in
+`~/.local/state/agentbox/_update/`. `agentbox doctor` checks that the job is
+loaded (check 22).
+
+The run looks up the newest final release of your line on python.org. If it
+is newer than `PYTHON_VERSION`, the run asks `uv` whether it can install that
+release (no network in the probe). If the pinned `uv` cannot, the run looks up
+the latest `uv`, checks its checksum, and asks again. Then it writes the new
+pins, builds the image, and runs the full doctor on a scratch profile. If a
+step fails, it restores only the pins that it changed and the previous image.
+After a good update it builds the derived image of every profile that has
+`packages`, so no scheduled run pays that build. It then prints the old
+images that nothing uses and the `docker image rm` line. It removes nothing.
+
+The job edits the working tree of the checkout. It does not commit. Commit
+and release the pins yourself.
+
+An update locks out boxes: while it runs, `agentbox up` (and every command
+that starts a box) says `an update is running; retry in a few minutes` and
+exits 75, and a scheduled run waits up to 15 minutes (before the preflight and again if the update starts later), then records exit 69
+with `update in progress`. A second `agentbox update` exits 75 too.
+
+A box that was running before the update keeps its old image.
+`agentbox ls` and `agentbox up` mark it with `image outdated`. Run
+`agentbox down <profile>`, then `agentbox up <profile>` to recreate it.
+Scheduled boxes stop after each run, so the next run uses the new image.
+
+Results (`last.json`, one line per run in `history.jsonl`): `current`,
+`applied`, `not_installable` (`uv` has no build yet; retried each day),
+`lookup_failed`, and `failed` (rolled back; exit 1). The other results exit 0.
+
+#### What Slack gets
+
+The job posts through the notification webhook (`notify_webhook_secret`, read
+[Notifications](#notifications)). A run that finds nothing new posts nothing.
+Without the setting, nothing is posted, and the record still has the result.
+
+| Event | Post | How often |
+| --- | --- | --- |
+| Applied | `🐍 agentbox: Python 3.14.8 -> 3.14.9 applied (uv 0.13.6 -> 0.13.7); new image <id>. Commit and release the pins.` | Every time. The uv part shows when `uv` changed. `; derived image failed: <profiles>` shows when a derived build failed. |
+| Failed | `🐍 agentbox: Python 3.14.9 update FAILED at <step>, kept 3.14.8: <reason>` | Once for each target, step, and reason (hex ids and digits do not count). A failed `--python-line` run posts it too. |
+| Not installable | `🐍 agentbox: Python 3.14.9 is out; uv has no build yet. Retrying daily.` | Once for each target. |
+| Lookup failed | `🐍 agentbox: Python check has failed for 3 days: <reason>` | Not on days 1 and 2. On day 3, then every 7th day. |
+| New line | `🐍 agentbox: Python 3.15 is out; the box stays on 3.14 (agentbox update --python-line 3.15).` | Once for each line. |
+| End of support | `🐍 agentbox: Python 3.14 security support ends 2030-10. Plan a line change (agentbox update --python-line).` | The first run of each month, in the 6 months before `PYTHON_LINE_EOL` and in that month. |
+| After end of support | `🐍 agentbox: Python 3.14 security support ended 2030-10. Change the line now (agentbox update --python-line).` | The first run of each month after the end month, while the line stays. |
+
+A post that fails is tried again on the next run. `agentbox update --check`
+prints the new-line and end-of-support lines too.
+
+#### Change the line
+
+```sh
+agentbox update --python-line 3.15 --eol 2031-10
+```
+
+`--eol` is the end of security support from the PEP of the new line. The
+command sets `PYTHON_LINE`, `PYTHON_LINE_EOL`, and the newest `3.15.x`
+(it stops with nothing written if `uv` has no build of it). It builds the
+candidate image and runs the **lock check** before the doctor.
+
+The lock check looks for `uv.lock` files at depth 0 to 2 under every host
+mount of every profile (regular files only; no symlink is followed; no
+directory that starts with a dot). It runs each lock twice, once in the
+current image and once in the candidate, in a plain container with no
+network, the project folder read-only, no secrets, and the flags
+`uv sync --frozen --no-build --dry-run`. These flags run no project code and
+write nothing. A lock fails only when the candidate fails with "marked as
+`--no-build` but has no binary distribution" (or "incompatible with the
+project's Python requirement") and the current image passes. Every other
+failure is `undecided`: the command prints it and goes on.
+
+If a lock fails, the command rolls back, prints each project and package, and
+exits 1 and posts the failure. `--force` prints the same and goes on. After the
+doctor passes, the command posts the applied line, with "line".
+
+The gateway image Python (3.13) and the `uv` that your projects use are not
+part of this.
 
 ## Troubleshooting
 
@@ -1430,10 +1541,12 @@ unchanged. Key fingerprints (`CLAUDE_KEY_FPR`,
 | `schedule ... exists; use --force` | Same job name. | Add `--force`, or choose another name. |
 | `never fires within a year` | Impossible date fields. | Fix `--cron`. |
 | `needs N launchd calendar entries (limit 500)` | Cron expression too wide. | Use fewer values or `--every`. |
-| `schedule ls` shows exit 69 | Docker did not start in 120 s. | Start Docker; `schedule run-now`. |
+| `schedule ls` shows exit 69 | Docker did not start in 120 s, or the message is `update in progress`. | Start Docker, or wait for the update; then `schedule run-now`. |
 | `schedule ls` shows exit 78 | Preflight failed. | Run the fix in `message:`. |
 | Box stays up after `run` (`left up: ...`) | Pinned box or a leftover process. | `agentbox down <p>`. |
 | `another agentbox up/down holds ... up.lock` | A parallel `up` or `down` hangs. | Wait, or stop the other command. |
+| `an update is running; retry in a few minutes` (exit 75) | `agentbox update` holds the update lock. No box starts during an update. | Wait for the update, then run the command again. |
+| `another update is running; retry in a few minutes` (exit 75) | A second `agentbox update` started. | Wait for the first one. |
 | `no free subnet index` / subnet overlap | 254 profiles, or a VPN route. | Remove old state, or set `subnet_base`. |
 
 ## Linux host notes

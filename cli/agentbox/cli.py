@@ -42,10 +42,12 @@ from . import (
     notify,
     paths,
     presets,
+    pyupdate,
     report_outputs,
     schedule,
     secretstore,
     term,
+    updatelock,
 )
 from . import box as boxmod
 from . import doctor as doc
@@ -150,6 +152,8 @@ def cmd_up(args) -> int:
         ensure_up(b, args.accept_mount_change, explicit=True)
         boxmod.pin(b)
     print(f"{b.name}: up ({b.project})")
+    if image_outdated(b):
+        print(f"{b.name}: {OUTDATED_NOTE.format(name=b.name)}")
     return 0
 
 
@@ -164,17 +168,43 @@ def cmd_down(args) -> int:
     return 0
 
 
+OUTDATED = "image outdated"
+OUTDATED_NOTE = (
+    "image outdated: the agent container runs an older image than the current one. "
+    "Recreate it with `agentbox down {name}`, then `agentbox up {name}`"
+)
+
+
+def image_outdated(b: boxmod.Box) -> bool:
+    """True when the box runs and its agent container image is not the current
+    `agentbox/agent` image (or the derived image of the profile). PLAN §2.9."""
+    try:
+        repo = paths.repo_root()
+    except paths.ConfigError:
+        return False
+    return images.outdated(repo, b.project, b.profile.box.packages)
+
+
 def cmd_ls(args) -> int:
     names = launch.list_profiles(paths.profiles_dir())
     running = docker.running_projects()
+    try:
+        repo = paths.repo_root()
+    except paths.ConfigError:
+        repo = None  # no checkout: no image comparison
     rows = []
     for n in names:
+        packages: list[str] = []
         try:
             p = load_profile(paths.profile_file(n), n)
             info = f"{p.network.mode:<6}  " + ", ".join(f"{m.host} ({m.mode})" for m in p.mounts)
+            packages = p.box.packages
         except ProfileError:
             info = "invalid profile (run `agentbox validate`)"
-        state = "running" if "agent" in running.get(compose.project_name(n), []) else "stopped"
+        project = compose.project_name(n)
+        state = "running" if "agent" in running.get(project, []) else "stopped"
+        if state == "running" and repo and images.outdated(repo, project, packages):
+            info += f"  {OUTDATED}"
         rows.append(f"{n:<20}  {state:<7}  {info}")
     print("\n".join(rows) if rows else "no profiles; create one with `agentbox init`")
     return 0
@@ -512,33 +542,149 @@ def cmd_doctor(args) -> int:
     return 0 if ok else 1
 
 
-def cmd_update(args) -> int:
-    repo = paths.repo_root()
-    env_file = repo / "images/agent/versions.env"
-    current = upd.read_env(env_file.read_text())
-    latest = upd.lookup(current)
-    print(upd.format_table(upd.table(current, latest)))
-    failed = sorted(k for k, v in latest.items() if v.startswith(upd.FAILED))
-    if failed:
-        print(f"agentbox update: {len(failed)} lookup(s) failed; those pins are left unchanged")
-    if args.check:
-        return 0
+PATCH_AT = "05:00"
 
+
+def update_options(args) -> None:
+    """Flag combinations of `update` (PLAN §2.3, §2.9)."""
+    if args.python_patch and args.python_line:
+        raise CliError("--python-patch and --python-line cannot be combined")
+    if (args.install or args.uninstall) and not args.python_patch:
+        raise CliError("--install and --uninstall need --python-patch")
+    if args.install and args.uninstall:
+        raise CliError("--install and --uninstall cannot be combined")
+    if args.at is not None and not args.install:
+        raise CliError("--at works only with --install")
+    if args.eol is not None and not args.python_line:
+        raise CliError("--eol works only with --python-line")
+    if args.python_line and args.eol is None:
+        raise CliError(
+            "--python-line needs --eol YYYY-MM (end of security support, PEP of the line)"
+        )
+    if args.force and not args.python_line:
+        raise CliError("--force works only with --python-line")
+    if args.check and (args.python_patch or args.python_line):
+        raise CliError("--check cannot be combined with --python-patch or --python-line")
+
+
+def update_job(args) -> int:
+    """`update --python-patch --install [--at HH:MM]` / `--uninstall` (PLAN §2.9)."""
+    if args.uninstall:
+        found = schedule.update_uninstall()
+        print(
+            "Python patch update job removed" if found else "no Python patch update job installed"
+        )
+        return 0
+    prog, extra = schedule.program_args()
+    at = args.at or PATCH_AT
+    job = schedule.update_job(updatelock.update_dir(), at, prog, extra)
+    schedule.check_render(job)  # before anything is installed
+    schedule.update_install(job)
+    where = job["plist"] if schedule.is_macos() else "crontab"
+    print(term.clean(f"Python patch update: daily at {at} ({where})"))
+    print("test it now: agentbox update --python-patch")
+    if paths.load_config().notify_webhook_secret is None:
+        err("warning: notify_webhook_secret is not set, so the update posts nothing to Slack")
+    return 0
+
+
+def on_update_signal(signum, frame):
+    raise KeyboardInterrupt  # apply rolls back, then the exit code is 130
+
+
+def update_build(repo: Path):
     def build() -> None:
         images.build_agent(repo)
         want = f"{images.AGENT_REPO}:{images.agent_hash(repo)}"
         if docker.image_id(want) is None:
             raise upd.UpdateError(f"build did not tag {want}")
 
+    return build
+
+
+def cmd_update(args) -> int:
+    update_options(args)
+    if args.install or args.uninstall:
+        return update_job(args)
+    repo = paths.repo_root()
+    if args.check:
+        return update_check(repo)
+    sigs = (signal.SIGTERM, signal.SIGHUP)  # a stop rolls back like Ctrl-C
+    saved = {sig: signal.signal(sig, on_update_signal) for sig in sigs}
+    try:
+        with updatelock.hold():
+            if args.python_patch:
+                return update_patch(repo)
+            if args.python_line:
+                return update_line(repo, args.python_line, args.eol, args.force)
+            return update_full(repo)
+    finally:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+
+
+def update_check(repo: Path) -> int:
+    current = upd.read_env((repo / "images/agent/versions.env").read_text())
+    releases: list = []
+    latest = upd.lookup(current, releases_out=releases)
+    print(upd.format_table(upd.table(current, latest)))
+    failed = sorted(k for k, v in latest.items() if v.startswith(upd.FAILED))
+    if failed:
+        print(f"agentbox update: {len(failed)} lookup(s) failed; those pins are left unchanged")
+    if "PYTHON_LINE" in current and "PYTHON_LINE_EOL" in current:
+        for _, text in pyupdate.notices(current, releases, datetime.now().date()):
+            print(term.clean(text))
+    return 0
+
+
+def update_full(repo: Path) -> int:
+    env_file = repo / "images/agent/versions.env"
+    current = upd.read_env(env_file.read_text())
+    latest = upd.lookup(current)
+    pyupdate.resolve_pin(current, latest)  # PYTHON_VERSION only when uv can install it
+    print(upd.format_table(upd.table(current, latest)))
+    failed = sorted(k for k, v in latest.items() if v.startswith(upd.FAILED))
+    if failed:
+        print(f"agentbox update: {len(failed)} lookup(s) failed; those pins are left unchanged")
+
     def relock() -> None:
         docker.run(["bash", str(repo / "images/agent/pi-mcp-adapter/lock.sh")], capture=False)
 
-    ok = upd.apply(repo, latest, build, scratch_doctor, relock)
+    ok = upd.apply(repo, latest, update_build(repo), scratch_doctor, relock)
     return 0 if ok else 1
 
 
-def scratch_doctor() -> bool:
-    """Full doctor on a throwaway profile with its own config/state roots."""
+def update_patch(repo: Path) -> int:
+    def docker_ready() -> bool:
+        return schedule.ensure_docker(
+            pyupdate.HOST_JOB, "python-patch", schedule.DOCKER_WAIT, schedule.DOCKER_POLL
+        )
+
+    rec = pyupdate.patch(
+        repo,
+        build=update_build(repo),
+        doctor=lambda failed: scratch_doctor(failed),
+        docker_ready=docker_ready,
+    )
+    return 1 if rec["result"] == "failed" else 0
+
+
+def update_line(repo: Path, line: str, eol: str, force: bool) -> int:
+    rec = pyupdate.change_line(
+        repo,
+        line,
+        eol,
+        build=update_build(repo),
+        doctor=lambda failed: scratch_doctor(failed),
+        force=force,
+    )
+    return 1 if rec["result"] == "failed" else 0
+
+
+def scratch_doctor(failed: list[str] | None = None) -> bool:
+    """Full doctor on a throwaway profile with its own config/state roots.
+    `failed` gets the ids of the failed checks. The update lock is held by this
+    process (the apply path), so the scratch box may start (PLAN §2.9)."""
     tag = secrets.token_hex(4)
     work = Path.home() / f".agentbox-update-{tag}"
     roots = Path(tempfile.mkdtemp(prefix="agentbox-update-"))
@@ -557,9 +703,14 @@ def scratch_doctor() -> bool:
                                     allow_dotpath=True))  # fmt: skip
         b = boxmod.load(name)
         ensure_up(b)
-        return print_results(doc.full(b, scratch=True))
+        results = doc.full(b, scratch=True)
+        if failed is not None:
+            failed.extend(r.check for r in results if r.status == "FAIL")
+        return print_results(results)
     except Exception as e:
         err(f"scratch doctor: {e}")
+        if failed is not None:
+            failed.append("scratch-box")
         return False
     finally:
         if b is not None:
@@ -856,6 +1007,8 @@ def sched_runner(profile: str, agent: str | None, prompt: str, model: str | None
         return run_headless(b, agent, Path(prompt), model, "/", made, timeout=timeout)
     except Terminated as e:
         raise RunFailed(str(e), made[0] if made else None, RC_TERMINATED) from e
+    except updatelock.UpdateBusy:
+        raise  # an update took the lock after the preflight: `fire` waits again (PLAN §2.9)
     except Exception as e:
         raise RunFailed(str(e), made[0] if made else None) from e
 
@@ -1463,6 +1616,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("update", help="bump versions.env, rebuild, doctor")
     p.add_argument("--check", action="store_true", help="only list current vs latest")
+    p.add_argument("--python-patch", action="store_true",
+                   help="Python patch update only (the daily job runs this)")  # fmt: skip
+    p.add_argument("--install", action="store_true",
+                   help="with --python-patch: install the daily job")  # fmt: skip
+    p.add_argument("--uninstall", action="store_true",
+                   help="with --python-patch: remove the daily job")  # fmt: skip
+    p.add_argument("--at", help=f"with --install: HH:MM local time (default {PATCH_AT})")
+    p.add_argument("--python-line", metavar="X.Y", help="move Python to another line (with --eol)")
+    p.add_argument("--eol", metavar="YYYY-MM", help="with --python-line: end of security support")
+    p.add_argument("--force", action="store_true",
+                   help="with --python-line: go on although the lock check fails")  # fmt: skip
     p.set_defaults(func=cmd_update)
     return parser
 
@@ -1501,6 +1665,9 @@ def main(argv: list[str] | None = None) -> int:
     ) as e:
         err(str(e))
         return 1
+    except updatelock.UpdateBusy as e:
+        err(str(e))
+        return updatelock.RC_BUSY
     except KeyboardInterrupt:
         return 130
 

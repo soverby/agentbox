@@ -619,19 +619,31 @@ def _num(check: str) -> int:
     return int(head) if head.isdigit() else 999
 
 
+UPDATE_INSTALL = "agentbox update --python-patch --install"
+
+
 def check_22() -> Result:
-    """Fleet report (PLAN §2.8). Host-level: not tied to a profile, run once
-    per `doctor` call. When `report_investigator` is set, its profile passes
-    the safety check; when the report job is installed, it is loaded (or in
-    the crontab)."""
+    """Fleet report (PLAN §2.8) and Python patch job (§2.9). Host-level: not tied
+    to a profile, run once per `doctor` call. When `report_investigator` is set,
+    its profile passes the safety check; when the report job or the `_update`
+    job is installed, it is loaded (or in the crontab)."""
     name = "22-report"
     try:
         cfg = paths.load_config()
     except paths.ConfigError as e:
         return Result("FAIL", name, f"config.toml: {e}")
-    inv, job = cfg.report_investigator, schedule.report_installed()
-    if inv is None and job is None:
-        return Result("SKIP", name, "no report_investigator and no report job installed")
+    inv, job, ujob = (
+        cfg.report_investigator,
+        schedule.report_installed(),
+        schedule.update_installed(),
+    )
+    if inv is None and job is None and ujob is None:
+        return Result(
+            "SKIP",
+            name,
+            "no report_investigator, no report job installed, "
+            f"and no Python update job installed ({UPDATE_INSTALL})",
+        )
     bad: list[str] = []
     good: list[str] = []
     if inv is not None:
@@ -640,12 +652,16 @@ def check_22() -> Result:
             bad.append(f"investigator profile {inv}: " + "; ".join(problems))
         else:
             good.append(f"investigator profile {inv} passes the safety check")
-    if job in ("loaded", "in crontab"):
-        good.append(f"report job {job}")
-    elif job == "not loaded":
-        bad.append(
-            "report job is installed but not loaded (run `agentbox schedule report --install`)"
-        )
-    elif job is not None:
-        bad.append(f"report job state unknown ({job})")
+    for label, state, fix in (
+        ("report job", job, "agentbox schedule report --install"),
+        ("Python update job", ujob, UPDATE_INSTALL),
+    ):
+        if state in ("loaded", "in crontab"):
+            good.append(f"{label} {state}")
+        elif state == "not loaded":
+            bad.append(f"{label} is installed but not loaded (run `{fix}`)")
+        elif state is not None:
+            bad.append(f"{label} state unknown ({state})")
+    if ujob is None:
+        good.append(f"no Python update job installed ({UPDATE_INSTALL})")
     return Result("FAIL" if bad else "PASS", name, "; ".join(bad or good))

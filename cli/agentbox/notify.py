@@ -235,14 +235,30 @@ def notify_fire(
     if cfg.notify_webhook_secret is None:
         return None
     limit = TERMINATED_TIMEOUT if outcome == "terminated" else NOTIFY_TIMEOUT
+
+    def text() -> str:
+        return build_message(profile, name, outcome=outcome, rc=rc, seconds=seconds,
+                             timeout=timeout, transcript=transcript, note=note)  # fmt: skip
+
+    return deliver_text(cfg, profile, text, limit)
+
+
+def deliver_text(cfg, profile: str, make_text, limit: float, scrub: bool = False) -> str:
+    """Build the text, read the webhook, post. "ok" or "error: <reason>". Never
+    raises. `scrub`: remove the webhook URL (and pieces of it) from the text
+    before the post. The secret read and the request run in a daemon thread
+    with a hard deadline, so a hung keychain prompt or DNS lookup cannot hold
+    the caller (or its SIGTERM cleanup) open. `profile` picks the secret
+    backend's service-account token (host jobs pass their own name)."""
     out: dict[str, BaseException] = {}
 
     def work() -> None:
         url = None
         try:
-            text = build_message(profile, name, outcome=outcome, rc=rc, seconds=seconds,
-                                 timeout=timeout, transcript=transcript, note=note)  # fmt: skip
+            text = make_text()
             url = read_webhook(cfg, profile)
+            if scrub:
+                text = secretstore.scrub(text, url, cap=None)
             post(url, text, limit)
         except BaseException as e:  # noqa: BLE001 - reported, never raised
             out["err"] = NotifyError(reason(e, url))

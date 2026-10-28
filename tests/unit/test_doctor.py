@@ -149,20 +149,24 @@ def test_check_10_failures(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------- check 22 (PLAN §2.8)
-def cfg22(tmp_path, monkeypatch, text="", installed=None):
+def cfg22(tmp_path, monkeypatch, text="", installed=None, update_job=None):
     from agentbox import schedule
 
     monkeypatch.setenv("AGENTBOX_CONFIG_HOME", str(tmp_path))
     (tmp_path / "config.toml").write_text(text)
     monkeypatch.setattr(schedule, "report_installed", lambda: installed)
+    monkeypatch.setattr(schedule, "update_installed", lambda: update_job)
 
 
 def test_check_22_skips_with_the_plan_text(tmp_path, monkeypatch):
     cfg22(tmp_path, monkeypatch)
     r = doctor.check_22()
     assert (r.status, r.check) == ("SKIP", "22-report")
-    assert r.detail == "no report_investigator and no report job installed"
-    assert r.line() == "SKIP 22-report: no report_investigator and no report job installed"
+    want = (
+        "no report_investigator, no report job installed, "
+        "and no Python update job installed (agentbox update --python-patch --install)"
+    )
+    assert r.detail == want and r.line() == f"SKIP 22-report: {want}"
 
 
 def test_check_22_investigator_safety_check(tmp_path, monkeypatch):
@@ -194,6 +198,36 @@ def test_check_22_report_job_state(tmp_path, monkeypatch, state, status, text):
     cfg22(tmp_path, monkeypatch, installed=state)
     r = doctor.check_22()
     assert r.status == status and text in r.detail
+
+
+@pytest.mark.parametrize(
+    "state,status,text",
+    [("loaded", "PASS", "Python update job loaded"),
+     ("in crontab", "PASS", "Python update job in crontab"),
+     ("not loaded", "FAIL", "Python update job is installed but not loaded "
+      "(run `agentbox update --python-patch --install`)"),
+     ("unknown", "FAIL", "Python update job state unknown")],
+)  # fmt: skip
+def test_check_22_update_job_state(tmp_path, monkeypatch, state, status, text):
+    cfg22(tmp_path, monkeypatch, update_job=state)
+    r = doctor.check_22()
+    assert (r.status, r.check) == (status, "22-report") and text in r.detail
+
+
+def test_check_22_update_job_missing_names_the_install_command(tmp_path, monkeypatch):
+    # nothing installed: SKIP names the command (also tested in the SKIP text above)
+    cfg22(tmp_path, monkeypatch)
+    r = doctor.check_22()
+    assert r.status == "SKIP" and "agentbox update --python-patch --install" in r.detail
+    # the report job is loaded, the update job is not installed: PASS, with the note
+    cfg22(tmp_path, monkeypatch, installed="loaded")
+    r = doctor.check_22()
+    assert r.status == "PASS" and "report job loaded" in r.detail
+    assert "no Python update job installed (agentbox update --python-patch --install)" in r.detail
+    # one bad job fails the check, whatever the other says
+    cfg22(tmp_path, monkeypatch, installed="loaded", update_job="not loaded")
+    r = doctor.check_22()
+    assert r.status == "FAIL" and "report job" not in r.detail.split(";")[0]
 
 
 def test_check_22_with_both(tmp_path, monkeypatch):
@@ -229,9 +263,7 @@ def test_doctor_command_runs_check_22_once(tmp_path, monkeypatch, capsys):
 
     def c22():
         calls["22"] += 1
-        return doctor.Result(
-            "SKIP", "22-report", "no report_investigator and no report job installed"
-        )
+        return doctor.Result("SKIP", "22-report", "nothing installed")
 
     monkeypatch.setattr(doctor, "check_22", c22)
     assert cli.main(["doctor", "demo"]) == 0

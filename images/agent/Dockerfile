@@ -75,6 +75,8 @@ ARG GH_VERSION
 ARG CODEX_VERSION
 ARG PI_VERSION
 ARG PI_MCP_ADAPTER_VERSION
+ARG PYTHON_LINE
+ARG PYTHON_LINE_EOL
 ARG PYTHON_VERSION
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
@@ -154,8 +156,11 @@ RUN cd /usr/local/lib/agentbox/pi-mcp-adapter \
 COPY pi-wrapper /usr/local/bin/pi
 RUN chmod 0755 /usr/local/bin/pi
 
-# CPython (latest final) via uv into a system location.
-RUN UV_PYTHON_INSTALL_DIR=/opt/python UV_PYTHON_BIN_DIR=/opt/python/bin \
+# CPython (newest final release of PYTHON_LINE, PLAN §2.9) via uv into a system
+# location. The build fails when PYTHON_VERSION is not in PYTHON_LINE.
+RUN case "${PYTHON_VERSION}" in "${PYTHON_LINE:?}".[0-9]*) ;; \
+      *) echo "FATAL: PYTHON_VERSION ${PYTHON_VERSION} is not in PYTHON_LINE ${PYTHON_LINE}" >&2; exit 1;; esac \
+ && UV_PYTHON_INSTALL_DIR=/opt/python UV_PYTHON_BIN_DIR=/opt/python/bin \
       uv python install --no-cache "${PYTHON_VERSION}" \
  && py=$(UV_PYTHON_INSTALL_DIR=/opt/python uv python find --no-project --system "${PYTHON_VERSION}" 2>/dev/null \
          || ls -d /opt/python/cpython-${PYTHON_VERSION}-linux-x86_64-gnu/bin/python${PYTHON_VERSION%.*}) \

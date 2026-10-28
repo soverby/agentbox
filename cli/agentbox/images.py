@@ -94,6 +94,26 @@ def ensure_agent(repo: Path) -> str:
     return AGENT_LATEST
 
 
+def expected_agent_id(repo: Path, packages: list[str]) -> str | None:
+    """Image id a box of this profile should run now: the agent image of the
+    current build inputs, or its derived image. None: that image does not exist."""
+    base = docker.image_id(f"{AGENT_REPO}:{agent_hash(repo)}")
+    if base is None or not packages:
+        return base
+    return docker.image_id(pkgs_tag(base, packages))
+
+
+def outdated(repo: Path, project: str, packages: list[str]) -> bool:
+    """True when the project's agent container runs an image other than the
+    current one (PLAN §2.9). No running agent container, or a Docker or hash
+    error: False (the marker is a hint, never a failure)."""
+    try:
+        running = docker.container_image_id(project)
+        return running is not None and running != expected_agent_id(repo, packages)
+    except (docker.DockerError, ImageError, OSError):
+        return False
+
+
 def sidecar_tag(repo: Path, name: str) -> str:
     return f"agentbox/{name}:{dir_hash(repo / SIDECARS[name])}"
 

@@ -19,7 +19,8 @@ def test_read_write_env():
 
 def test_real_versions_env_parses():
     env = update.read_env((ROOT / "images/agent/versions.env").read_text())
-    for k in ("CLAUDE_CODE_VERSION", "NODE_VERSION", "PYTHON_VERSION", "UBUNTU_IMAGE"):
+    for k in ("CLAUDE_CODE_VERSION", "NODE_VERSION", "PYTHON_VERSION", "UBUNTU_IMAGE",
+              "PYTHON_LINE", "PYTHON_LINE_EOL"):  # fmt: skip
         assert k in env
 
 
@@ -39,11 +40,12 @@ def test_node_python_gh():
     assert update.node_latest(idx, "24") == "24.22.0"
     rel = [
         {"name": "Python 3.15.0rc1", "pre_release": True},
+        {"name": "Python 3.15.0", "pre_release": False},
         {"name": "Python 3.14.7", "pre_release": False},
         {"name": "Python 3.13.9", "pre_release": False},
         {"name": "Python 3.14.10", "pre_release": False},
     ]
-    assert update.python_latest(rel) == "3.14.10"
+    assert update.python_latest(rel, "3.14") == "3.14.10"  # the line filter, not the newest
     d = {"tag_name": "v0.35.0", "assets": [{"name": "a.tar", "digest": "sha256:ab"}]}
     assert update.gh_release("o/r", "a.tar", fetch=lambda url: d) == ("0.35.0", "ab")
     with pytest.raises(update.UpdateError):
@@ -228,7 +230,11 @@ def test_lookup_rejects_injected_values(monkeypatch):
         stdout = '{"digest": "sha256:' + "c" * 64 + '\\n"}'
 
     monkeypatch.setattr(update.docker, "run", lambda *a, **k: R())
-    cur = {"NODE_VERSION": "24.1.0", "UBUNTU_IMAGE": "ubuntu:24.04@sha256:" + "0" * 64}
+    cur = {
+        "NODE_VERSION": "24.1.0",
+        "PYTHON_LINE": "3.14",
+        "UBUNTU_IMAGE": "ubuntu:24.04@sha256:" + "0" * 64,
+    }
     out = update.lookup(cur, fetch_json, fetch)
     for k in ("CODEX_VERSION", "PI_VERSION", "CLAUDE_CODE_VERSION", "NODE_VERSION",
               "NODE_SHA256", "OLLAMA_VERSION", "OLLAMA_SHA256", "UBUNTU_IMAGE"):  # fmt: skip
@@ -265,3 +271,147 @@ def test_value_problem_kinds():
     assert update.value_problem("UBUNTU_IMAGE", img) is None
     assert update.value_problem("UBUNTU_IMAGE", "ubuntu@sha256:" + "0" * 64)
     assert update.value_problem("UBUNTU_IMAGE", img + "\n")
+
+
+# ---------------------------------------------------------------- Python line (PLAN §2.9)
+def test_value_problem_python_pins():
+    for ok in ("3.14", "3.9", "3.100"):
+        assert update.value_problem("PYTHON_LINE", ok) is None
+    for bad in ("3", "3.14.1", "4.0", "3.x", "3.14\n", " 3.14", "3.", "03.14"):
+        assert update.value_problem("PYTHON_LINE", bad), bad
+    for ok in ("2030-10", "2026-01", "2099-12"):
+        assert update.value_problem("PYTHON_LINE_EOL", ok) is None
+    for bad in ("2030-13", "2030-00", "2030-1", "2030-10-01", "30-10", "2030/10", "2030-10\n"):
+        assert update.value_problem("PYTHON_LINE_EOL", bad), bad
+    assert update.value_problem("PYTHON_VERSION", "3.14.8") is None
+    for bad in ("3.14", "3.14.8rc1", "3.14.x", "3.14.8\n", "v3.14.8", "3.14.8.1"):
+        assert update.value_problem("PYTHON_VERSION", bad), bad
+    env = {"PYTHON_LINE": "3.14"}
+    assert update.value_problem("PYTHON_VERSION", "3.14.9", env) is None
+    assert "PYTHON_LINE 3.14" in update.value_problem("PYTHON_VERSION", "3.15.0", env)
+    assert update.value_problem("PYTHON_VERSION", "3.140.1", env)  # 3.14 is not a prefix of 3.140
+    assert update.value_problem("PYTHON_LINE", 3.14)  # not a string
+
+
+def test_write_env_checks_the_version_against_the_line_it_lands_with():
+    text = "PYTHON_LINE=3.14\nPYTHON_LINE_EOL=2030-10\nPYTHON_VERSION=3.14.8\n"
+    with pytest.raises(update.UpdateError, match="invalid value"):
+        update.write_env(text, {"PYTHON_VERSION": "3.15.0"})
+    new = update.write_env(
+        text, {"PYTHON_LINE": "3.15", "PYTHON_VERSION": "3.15.0", "PYTHON_LINE_EOL": "2031-10"}
+    )
+    assert new == "PYTHON_LINE=3.15\nPYTHON_LINE_EOL=2031-10\nPYTHON_VERSION=3.15.0\n"
+    with pytest.raises(update.UpdateError, match="invalid value"):
+        update.write_env(text, {"PYTHON_LINE_EOL": "2031-13"})
+
+
+RELS = [
+    {"name": "Python 3.15.0", "pre_release": False},
+    {"name": "Python 3.15.1rc1", "pre_release": True},
+    {"name": "Python 3.14.10", "pre_release": False},
+    {"name": "Python 3.14.9", "pre_release": False},
+    {"name": "Python 3.14.11", "pre_release": True},  # a pre-release is never the target
+    {"name": "Python 3.13.12", "pre_release": False},
+    {"name": "Python 3.14 documentation", "pre_release": False},
+]
+
+
+def test_python_latest_filters_to_the_line():
+    assert update.python_latest(RELS, "3.14") == "3.14.10"
+    assert update.python_latest(RELS, "3.15") == "3.15.0"
+    assert update.python_latest(RELS, "3.13") == "3.13.12"
+    for line in ("3.16", "3.1", "3.140"):  # "3.1" must not match 3.14.x
+        with pytest.raises(update.UpdateError, match="no final CPython"):
+            update.python_latest(RELS, line)
+
+
+def test_python_new_line_is_the_next_line_with_a_final_dot_zero():
+    assert update.python_new_line(RELS, "3.14") == "3.15"
+    pre = [{"name": "Python 3.15.0rc2", "pre_release": True}, *RELS[2:]]
+    assert update.python_new_line(pre, "3.14") is None
+    only_patch = [{"name": "Python 3.15.1", "pre_release": False}, *RELS[2:]]
+    assert update.python_new_line(only_patch, "3.14") is None  # needs the final 3.15.0
+    assert update.python_new_line(RELS, "3.15") is None  # 3.16.0 is not out
+    with pytest.raises(update.UpdateError):
+        update.python_new_line(RELS, "3.x")
+
+
+def test_lookup_python_follows_the_line_and_needs_it(monkeypatch):
+    def fetch_json(url):
+        if "python.org" in url:
+            return RELS
+        raise OSError("offline")
+
+    class R:
+        stdout = '{"digest": "sha256:abc"}'
+
+    monkeypatch.setattr(update.docker, "run", lambda *a, **k: R())
+    seen: list = []
+    out = update.lookup({"PYTHON_LINE": "3.14"}, fetch_json, lambda u: b"", releases_out=seen)
+    assert out["PYTHON_VERSION"] == "3.14.10" and seen == RELS
+    out = update.lookup({}, fetch_json, lambda u: b"")  # no PYTHON_LINE: no default
+    assert out["PYTHON_VERSION"].startswith(update.FAILED)
+    assert "PYTHON_LINE" in out["PYTHON_VERSION"]
+    # the line and its end date are never looked up: they show as manual
+    rows = update.table({"PYTHON_LINE": "3.14", "PYTHON_LINE_EOL": "2030-10"}, out)
+    assert [r.status for r in rows] == ["manual", "manual"]
+
+
+def test_apply_rollback_keeps_other_edits_to_versions_env(repo, monkeypatch):
+    calls = []
+    fake_docker(monkeypatch, calls)
+    env_f = repo / "images/agent/versions.env"
+    before = env_f.read_text()
+
+    def build():
+        # someone edits another pin while the build runs
+        env_f.write_text(env_f.read_text().replace("PI_VERSION=", "PI_VERSION=9", 1))
+        raise RuntimeError("injected build failure")
+
+    info: dict = {}
+    ok = update.apply(repo, {"CODEX_VERSION": "9.9.9", "PYTHON_VERSION": "3.14.99"}, build,
+                      lambda: True, info=info)  # fmt: skip
+    assert ok is False
+    after = update.read_env(env_f.read_text())
+    assert after["CODEX_VERSION"] == update.read_env(before)["CODEX_VERSION"]  # restored
+    assert after["PYTHON_VERSION"] == "3.14.8"  # restored
+    assert after["PI_VERSION"] == "9" + update.read_env(before)["PI_VERSION"]  # the edit stays
+    assert info["step"] == "build" and "injected build failure" in info["error"]
+    assert calls == [["docker", "tag", "sha256:prev", "agentbox/agent:latest"]]
+
+
+@pytest.mark.parametrize("stop,step", [("check", "check"), ("doctor", "doctor")])
+def test_apply_reports_the_step_that_failed(repo, monkeypatch, stop, step):
+    fake_docker(monkeypatch, [])
+
+    def check():
+        if stop == "check":
+            raise update.UpdateError("lock check failed")
+
+    info: dict = {}
+    ok = update.apply(repo, {"CODEX_VERSION": "9.9.9"}, lambda: None, lambda: stop != "doctor",
+                      check=check, info=info)  # fmt: skip
+    assert ok is False and info["step"] == step
+
+
+def test_apply_check_runs_between_build_and_doctor(repo, monkeypatch):
+    fake_docker(monkeypatch, [])
+    steps = []
+    ok = update.apply(
+        repo,
+        {"CODEX_VERSION": "9.9.9"},
+        lambda: steps.append("build"),
+        lambda: steps.append("doctor") or True,
+        check=lambda: steps.append("check"),
+    )
+    assert ok and steps == ["build", "check", "doctor"]
+
+
+def test_apply_write_failure_is_step_write_and_rolls_back(repo, monkeypatch):
+    fake_docker(monkeypatch, [])
+    monkeypatch.setattr(update, "write_env", lambda text, new: (_ for _ in ()).throw(
+        update.UpdateError("refusing to write an invalid value for X")))  # fmt: skip
+    info: dict = {}
+    assert update.apply(repo, {"CODEX_VERSION": "9.9.9"}, lambda: None, lambda: True,
+                        info=info) is False  # fmt: skip
+    assert info["step"] == "write" and "refusing" in info["error"]

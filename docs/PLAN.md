@@ -187,10 +187,11 @@ Per profile, one Compose project `agentbox-<profile>` with two networks:
     Docker Desktop on macOS has no GPU passthrough; models run on the host or
     on Modal.
   - GitHub CLI `gh` — official apt repository.
-  - Python — the latest stable CPython release on python.org at build time
-    (3.14.x today; 3.15.0 is due 2026-10-01), pinned in `versions.env`,
-    installed with `uv python install`; `python3`/`python` symlinked to it.
-    `uv` also installed.
+  - Python — the latest patch release of one CPython line (`PYTHON_LINE`,
+    3.14 today), pinned in `versions.env` as `PYTHON_VERSION`, installed
+    with `uv python install`; `python3`/`python` symlinked to it. `uv` also
+    installed. Patch releases come in automatically; a line change is
+    deliberate (§2.9).
   - `jq`, `git`, `ripgrep`, `curl`, `ca-certificates`, `unzip`, `less`,
     `build-essential`, `make`.
 - Per-profile extra packages: `[box] packages = ["ffmpeg", …]`. The CLI
@@ -293,7 +294,9 @@ in that directory.
 | `agentbox mcp login <profile> <server>` | OAuth for an MCP upstream, on the host (§2.6). |
 | `agentbox up/down/ls` | Explicit start/stop/status (sessions auto-start). |
 | `agentbox schedule add/ls/rm/edit/run-now` | Host scheduling of agent runs and command jobs (§2.7). |
-| `agentbox update` | Bump the agent image pins in `versions.env` to current releases (values validated), rebuild, run full `doctor`; keep the previous image tag if doctor fails. Sidecar image digests and the gateway lockfile change by hand (listed in SECURITY.md). |
+| `agentbox update` | Bump the agent image pins in `versions.env` to current releases (values validated), rebuild, run full `doctor`; keep the previous image tag if doctor fails. Python stays in its line (§2.9). Sidecar image digests and the gateway lockfile change by hand (listed in SECURITY.md). |
+| `agentbox update --python-patch [--install [--at HH:MM] \| --uninstall]` | Python patch update only, for the daily host job (§2.9). |
+| `agentbox update --python-line X.Y` | Move Python to another line, with the lock check (§2.9). |
 | `agentbox doctor [profile]` | Full isolation self-test (§4). |
 
 Agent launch flags set by the CLI (the box is the external sandbox):
@@ -1079,11 +1082,156 @@ Missed causes, in this order (first match wins):
   value read during the report before the 200-character cap, so the cap
   cannot leave a visible piece of a secret.
 
+### 2.9 Python line and patch updates
+
+Patch releases of one CPython line keep the ABI: a wheel built for
+`cp314` works on every 3.14.x. Security fixes ship as patch releases. A
+new line (3.15) changes the ABI, and a lock whose packages have no wheel
+for it fails to install (1.1.1: boletim, `uv sync --frozen` tried a
+source build that needs rustup, denied by egress). So patches are
+automatic and a line change is deliberate.
+
+- Pins in `images/agent/versions.env`: `PYTHON_LINE` (`3.14`),
+  `PYTHON_VERSION` (`3.14.8`), and `PYTHON_LINE_EOL` (`2030-10`, the end
+  of security support for the line, from its release PEP; PEP 745 for
+  3.14; set by hand with the line). `value_problem` validates all three:
+  `PYTHON_LINE` is `3.N`, `PYTHON_VERSION` is `PYTHON_LINE` + `.N`,
+  `PYTHON_LINE_EOL` is `YYYY-MM`. The Dockerfile build fails when
+  `PYTHON_VERSION` is not in `PYTHON_LINE`.
+- Source: the python.org release API (as today), filtered to final
+  releases `Python <PYTHON_LINE>.N`. The newest such patch is the target.
+- uv coupling: the image installs Python with the pinned uv, and the
+  CPython builds a uv release can download are frozen at that release.
+  Probe: `docker run --rm --network none <image> uv python list
+  --all-versions --only-downloads --output-format json cpython@<target>`;
+  the target is available when the JSON has an entry whose `version`
+  equals the target (the text form prints nothing and exits 0 for an
+  unknown version). The first probe uses the current agent image (the
+  pinned uv); when no agent image exists, it uses the pinned `UV_VERSION`
+  tarball in the second-probe form. No entry: the update looks up the latest uv release (same
+  source and checksum rule as today), downloads and verifies its tarball
+  on the host, and repeats the probe with that binary, mounted read-only,
+  in a `--network none` container of `UBUNTU_IMAGE`. No entry there
+  either: result `not_installable`; nothing is written or built. An
+  entry: write `UV_VERSION`/`UV_SHA256` with `PYTHON_VERSION` and build.
+  Any build or doctor failure after a positive probe is `failed` (rolled
+  back). A uv lookup, download, or checksum failure before anything is
+  written is `lookup_failed`.
+- Update lock: every apply path (full `update`, `--python-patch`,
+  `--python-line`) takes the exclusive lock
+  `~/.local/state/agentbox/_update/update.lock`; a second update exits 75
+  with one line. `schedule _fire` checks the lock in preflight: while it
+  is held, the fire waits up to 15 min (poll 10 s), then records
+  `not_run` with the reason `update in progress` (rc 69). `agentbox up`
+  (and every command that starts a box) prints `an update is running;
+  retry in a few minutes` and exits 75. So no box builds or starts on an
+  image that doctor has not passed, and no rollback happens under a
+  running fire that started during the update. The holder is exempt: the
+  check passes when the lock is held by the current process (an
+  in-process flag that the apply path sets while it holds the lock; the
+  scratch doctor box and the lock check run in that process). A fire,
+  another CLI process, or a shell never passes it; no environment
+  variable carries it.
+- Rollback re-applies only the keys the update changed (`write_env` with
+  their old values), so other edits to `versions.env` during the build
+  stay. The image tag rollback is as today.
+- `agentbox update` (full): unchanged, except that `PYTHON_VERSION`
+  follows the line (with the uv probe above). It never changes
+  `PYTHON_LINE`.
+- `agentbox update --python-patch`: looks up only the python.org list
+  (and uv when the probe needs it), not the full table. Changes only
+  `PYTHON_VERSION` (and uv when needed). Same `apply` path: write
+  `versions.env`, build, full scratch `doctor`, roll back on any failure.
+  After a successful update it builds the derived image of every profile
+  that has `packages` (`images.ensure_pkgs` for each profile), so no scheduled
+  fire pays that build inside its timeout. A derived build failure is a
+  warning in the result, not a rollback. It then lists agent and derived
+  images that `:latest`, the current derived tags, and running containers
+  do not use, and prints the `docker image rm` line; it removes nothing.
+  Exit 0 for `current`, `applied`, `not_installable`, `lookup_failed`; 1
+  for `failed`.
+- Daily job: `agentbox update --python-patch --install [--at HH:MM]`
+  (default 05:00) and `--uninstall`. Same mechanism as the report job
+  (§2.8): launchd label `<launchd prefix>._update`, crontab tag
+  `# agentbox:_update`, files (`launchd.out`, `launchd.err`, `last.json`,
+  `history.jsonl`, `update.lock`) in `~/.local/state/agentbox/_update/`
+  (mode 0700). The plist runs `agentbox update --python-patch` with the
+  job environment (`PATH`, `HOME`) and starts Docker Desktop when it is
+  down, as a fire does. The fire interlock above makes the time safe for
+  any schedule.
+- Result record (`last.json`, one `history.jsonl` line per run): `start`,
+  `end`, `result` (`current`, `applied`, `not_installable`,
+  `lookup_failed`, `failed`), `step` (for `failed`: `build`, `doctor
+  <check id>`, or `write`), `python_from`, `python_to`, `uv_from`,
+  `uv_to`, `image`, `derived_warnings`, `message`, `notify`, and
+  `reported` (the dedupe keys below).
+- Slack: through the host notification webhook (`notify_webhook_secret`,
+  §2.7), same post rules (host only, 10 s, https, no redirect, failure
+  never changes the exit code, reason scrubbed and capped). Posts:
+  - applied: `🐍 agentbox: Python 3.14.8 -> 3.14.9 applied (uv 0.13.6 ->
+    0.13.7); new image <short id>. Commit and release the pins.`, plus
+    `; derived image failed: <profiles>` when any. Every apply posts.
+  - failed: `🐍 agentbox: Python 3.14.9 update FAILED at <step>, kept
+    3.14.8: <reason>`. Once per (target, step, first line of the reason with hex ids and
+    digits normalized).
+  - not installable: `🐍 agentbox: Python 3.14.9 is out; uv has no build
+    yet. Retrying daily.` Once per target.
+  - lookup failed: no post on the first two consecutive days; on the
+    third, `🐍 agentbox: Python check has failed for 3 days: <reason>`,
+    then every 7th day while it lasts.
+  - new line: once per line, when the python.org list has a final
+    `3.(N+1).0`: `🐍 agentbox: Python 3.(N+1) is out; the box stays on
+    3.N (agentbox update --python-line 3.(N+1)).`
+  - end of support: on the first run of each month in the 6 months
+    before `PYTHON_LINE_EOL` and in that month: `🐍 agentbox: Python <line> security
+    support ends <YYYY-MM>. Plan a line change (agentbox update
+    --python-line).` After that month, on the first run of each month:
+    `🐍 agentbox: Python <line> security support ended <YYYY-MM>. Change
+    the line now (agentbox update --python-line).`
+  An up-to-date run posts nothing. Notifications unset: no post; the
+  record still has the result. `update --check` prints the new-line and
+  EOL lines too.
+- Doctor check 22 also covers `_update`: when the job is installed, it is
+  loaded (launchd) or present (crontab); when it is not installed, SKIP
+  names `agentbox update --python-patch --install`.
+- Pickup: scheduled boxes stop after each fire (§2.7), so the next fire
+  starts on the new image. `agentbox ls` marks a running box whose agent
+  container image is not the current `agentbox/agent` hash (or its
+  derived image) with `image outdated`; `agentbox up` of a running box
+  says the same and how to recreate it (§2.3 rules for session-safe
+  recreation are unchanged).
+- Pins stay in git: the job edits the working tree of the checkout
+  (`paths.repo_root()`), as `agentbox update` does, and does not commit.
+  The applied post tells the owner to commit and release.
+- `agentbox update --python-line X.Y --eol YYYY-MM`: sets `PYTHON_LINE`,
+  `PYTHON_LINE_EOL`, and the newest `X.Y.N` (uv probe as above), builds
+  the candidate image, then runs the lock check before doctor:
+  - Scope: for each profile in the profiles directory, each host mount,
+    the `uv.lock` files at depth 0–2 under the mount: regular files only,
+    no symlink following, no dot-directories.
+  - Each lock runs twice, in the current image and in the candidate: a
+    plain `docker run --rm --network none` of the image as its `agent`
+    user, the project directory mounted read-only, no secrets, no
+    Compose project, no proxy; `UV_OFFLINE=1`, `UV_CACHE_DIR=/tmp/uv-cache`,
+    `UV_PROJECT_ENVIRONMENT=/tmp/venv`; `uv sync --frozen --no-build
+    --dry-run --python /usr/local/bin/python`; 120 s limit per run. These
+    flags run no project code and write nothing.
+  - A lock fails only when the candidate run fails with `marked as
+    --no-build but has no binary distribution` or `incompatible with the
+    project's Python requirement` and the current run passes. Every
+    other non-zero result is `undecided`: printed, not blocking.
+  - Any failed lock: roll back, print each project and package, exit 1.
+    `--force` skips the block after it prints the result.
+  - On success: doctor, then the applied post, with "line".
+- Not covered: the gateway image Python (3.13, FastMCP pin, §2.6) and the
+  `uv` that profiles use for their own projects.
+
 ## 3. Repository layout
 
 ```text
 cli/agentbox/          host CLI (stdlib), pyproject.toml
                        fleet.py (§2.8 report facts), report_outputs.py (§2.8 outputs)
+                       firehook.py (§2.7 fire hook), pyupdate.py and updatelock.py (§2.9)
 images/agent/          Dockerfile, entrypoint, with-secrets, managed-mcp.json, versions.env
 images/egress/         squid.conf template
 images/mcp-gateway/    gateway service, entrypoint
@@ -1183,6 +1331,7 @@ rounds, then escalate. Coordinator signs off.
 | P6b | OAuth MCP upstreams | `agentbox mcp login` completes against one real OAuth MCP server; gateway refreshes an expired access token; token never visible in the agent container |
 | P7 | Scheduling | launchd job fires `agentbox run`; transcript and exit code recorded; Docker Desktop auto-start works; failure logged; `schedule ls` shows last result |
 | P8 | SECURITY.md, USAGE.md (quick start first), security review pass | Independent review finds no BLOCKER; a new user reaches a first Claude session with the quick start alone |
+| p1 | Python line and patch updates (§2.9) | Unit: line filter of the python.org list; `value_problem` for the three keys; probe JSON parsing (`[]` = absent); result classification and post dedupe; partial rollback keeps other `versions.env` lines; update lock and the fire/`up` interlock; the scratch doctor starts its box while the lock is held. Live (marked): the lock check fails a cp-less lock by name offline and passes a current lock; one real `--python-patch` run applies a patch, posts to Slack, and doctor 22 sees the job |
 
 P1 and P2 can build in parallel; P3 needs P1+P2; P4–P6 need P3; P6b needs
 P6; P7 needs P3.
@@ -1258,6 +1407,7 @@ P6; P7 needs P3.
 - n1: scheduled-run Slack notifications from the host (`notify_webhook_secret`, host-only shared secret), §1, §2.4, and §2.7. No box change; new outbound HTTPS from the host only.
 - f1: fleet report (`schedule report`, §2.8): due fires from the live schedules, rule causes, idle boxes, job copy drift, output plugins, optional investigator box. §2.7: `trigger` in fire rows, `source` in `job.json`. Host-side and read-only; the investigator is a normal box with one empty ro folder (user-made, outside the denylist) and the anthropic preset only; doctor 22 checks it.
 - h1: fire hook (`fire_command`, §2.7): a host command gets each fire's outcome as JSON on stdin, for external triage. Host-side, owner-configured, no box change, no new network path; agentbox adds no secret to the payload (`detail` and `message` are unscrubbed box output, §2.7).
+- p1: Python line and patch updates (§2.9, §2.1, §2.3): `PYTHON_LINE`, daily `update --python-patch` host job with Slack posts, uv coupling, `--python-line` with an offline lock check. After the 1.1.1 regression (3.15). Host-side; no box isolation change.
 
 ## 9. Usability balance (architect, post-review)
 

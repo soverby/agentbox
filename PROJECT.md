@@ -15,7 +15,7 @@ and open weight models run locally or on Modal Labs or other GPU hosting service
 - Support ollama at the command line.
 - Support model routing (must not require the API version of Claude Code or Codex, subscription access).
 - Has github client. 
-- Has the latest production release of Python. 
+- Has the latest patch release of a supported Python line. Security patches come in automatically; a change of line is deliberate.
 - Has the jq tool installed. 
 - Mounts one or more specified file system paths from the host.
 - Runs a password manager or similar - effectively we need a way to store secrets so that the AI agents can only access secrets the particular container is used for. 

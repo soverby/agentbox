@@ -12,8 +12,8 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import notify, paths, schedule
-from .fleet import NOT_UNDERSTOOD, Fire, Report, label, parse_dt
+from . import notify, paths, prune, schedule
+from .fleet import NOT_UNDERSTOOD, Fire, Report, hhmm, label, parse_dt
 
 MAX_PROBLEM_LINES = 20
 EXCERPT = 80  # characters of the last line shown after an investigator answer
@@ -192,6 +192,9 @@ def render_text(report: Report, slack: bool = False) -> str:
         entries.append((f"… and {len(probs) - MAX_PROBLEM_LINES} more", False))
     if report.idle_check != "ok" and probs:
         entries.append((report.idle_check, False))
+    if report.prune is not None:  # not a problem line: no count changes
+        at = hhmm(parse_dt(report.prune["end"]))
+        entries.append((prune.fleet_line(report.prune, at), False))
     if not slack:
         entries += [(x, False) for x in every_lines(report)]
     # A line with an investigator answer is cleaned but never cut: the answer is

@@ -565,6 +565,14 @@ def update_options(args) -> None:
         raise CliError("--force works only with --python-line")
     if args.check and (args.python_patch or args.python_line):
         raise CliError("--check cannot be combined with --python-patch or --python-line")
+    if args.dry_run and not args.prune:
+        raise CliError("--dry-run works only with --prune")
+    if args.prune:
+        for flag, on in (("--check", args.check), ("--python-patch", args.python_patch),
+                         ("--python-line", args.python_line), ("--install", args.install),
+                         ("--uninstall", args.uninstall)):  # fmt: skip
+            if on:
+                raise CliError(f"--prune cannot be combined with {flag}")
 
 
 def update_job(args) -> int:
@@ -609,10 +617,14 @@ def cmd_update(args) -> int:
     repo = paths.repo_root()
     if args.check:
         return update_check(repo)
+    if args.prune and args.dry_run:  # read-only: no lock
+        return update_prune(repo, dry_run=True)
     sigs = (signal.SIGTERM, signal.SIGHUP)  # a stop rolls back like Ctrl-C
     saved = {sig: signal.signal(sig, on_update_signal) for sig in sigs}
     try:
         with updatelock.hold():
+            if args.prune:
+                return update_prune(repo, dry_run=False)
             if args.python_patch:
                 return update_patch(repo)
             if args.python_line:
@@ -651,7 +663,17 @@ def update_full(repo: Path) -> int:
         docker.run(["bash", str(repo / "images/agent/pi-mcp-adapter/lock.sh")], capture=False)
 
     ok = upd.apply(repo, latest, update_build(repo), scratch_doctor, relock)
+    if ok:  # also when all pins are current (PLAN §2.10)
+        pyupdate.store_prune(pyupdate.prune_images(repo))
     return 0 if ok else 1
+
+
+def update_prune(repo: Path, dry_run: bool) -> int:
+    """`update --prune [--dry-run]` (PLAN §2.10): exit 1 when the prune has an error."""
+    rec = pyupdate.prune_images(repo, dry_run=dry_run)
+    if not dry_run:
+        pyupdate.store_prune(rec)
+    return 1 if rec["error"] else 0
 
 
 def update_patch(repo: Path) -> int:
@@ -1627,6 +1649,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eol", metavar="YYYY-MM", help="with --python-line: end of security support")
     p.add_argument("--force", action="store_true",
                    help="with --python-line: go on although the lock check fails")  # fmt: skip
+    p.add_argument("--prune", action="store_true",
+                   help="remove superseded agentbox images and old build cache")  # fmt: skip
+    p.add_argument("--dry-run", action="store_true",
+                   help="with --prune: list the tags it would remove, remove nothing")  # fmt: skip
     p.set_defaults(func=cmd_update)
     return parser
 

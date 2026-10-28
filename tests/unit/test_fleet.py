@@ -1807,3 +1807,76 @@ def test_report_command_error_is_scrubbed_before_it_is_cut(
     assert "fleet report FAILED: report_command exited 3: xxx" in out
     assert "<redacted>" in out
     assert_no_piece(out)
+
+
+# ---------------------------------------------------------------- Docker disk prune (PLAN §2.10)
+def prune_rec(end, **kw):
+    rec = {"end": end, "removed": [], "images": [], "kept_busy": [], "freed_bytes": 0,
+           "after": None, "error": None}  # fmt: skip
+    return {**rec, **kw}
+
+
+def put_prune(w, rec, name="prune.json"):
+    d = w.state / "_update"
+    d.mkdir(exist_ok=True)
+    data = rec if name == "prune.json" else {"result": "current", "prune": rec}
+    (d / name).write_text(json.dumps(data))
+
+
+def test_report_has_the_newest_prune_that_ended_in_the_window(world):
+    put_prune(world, prune_rec("2026-10-08 05:00", freed_bytes=7))  # NOW is 10:00, window 24 h
+    rep = run_report(world)
+    assert rep.prune["freed_bytes"] == 7 and rep.as_dict()["prune"] == rep.prune
+    assert set(rep.prune) == {"end", "removed", "images", "kept_busy", "freed_bytes", "after",
+                              "error"}  # fmt: skip
+
+
+def test_report_without_a_prune_has_none_and_no_json_key(world):
+    rep = run_report(world)
+    assert rep.prune is None and "prune" not in rep.as_dict()
+
+
+def test_report_ignores_a_prune_outside_the_window(world):
+    put_prune(world, prune_rec("2026-10-07 09:59"))  # before now - 24 h
+    assert run_report(world).prune is None
+    put_prune(world, prune_rec("2026-10-08 10:00"))  # end is exclusive
+    assert run_report(world).prune is None
+    put_prune(world, prune_rec("2026-10-07 09:59"))
+    assert run_report(world, since="48h").prune is not None
+
+
+def test_report_takes_the_newer_of_last_json_and_prune_json(world):
+    put_prune(world, prune_rec("2026-10-08 05:00", freed_bytes=1), "prune.json")
+    put_prune(world, prune_rec("2026-10-08 06:00", freed_bytes=2), "last.json")
+    assert run_report(world).prune["freed_bytes"] == 2
+    put_prune(world, prune_rec("2026-10-08 07:00", freed_bytes=3), "prune.json")
+    assert run_report(world).prune["freed_bytes"] == 3
+
+
+def test_the_newest_prune_outside_the_window_hides_an_older_one_inside(world):
+    put_prune(world, prune_rec("2026-10-08 05:00", freed_bytes=1), "prune.json")
+    put_prune(world, prune_rec("2026-10-08 12:00", freed_bytes=2), "last.json")  # after now
+    assert run_report(world).prune is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"end": "yesterday"}, {"removed": "x"}, {"freed_bytes": -1}, {"freed_bytes": "1"},
+     {"after": {"images": 1}}, {"error": 5}, {"images": [1]}],
+)  # fmt: skip
+def test_a_malformed_prune_is_ignored(world, bad):
+    put_prune(world, {**prune_rec("2026-10-08 05:00"), **bad})
+    assert run_report(world).prune is None
+
+
+def test_an_unreadable_prune_file_is_ignored(world):
+    d = world.state / "_update"
+    d.mkdir()
+    (d / "prune.json").write_text("{not json")
+    (d / "last.json").write_text("[1]")
+    assert run_report(world).prune is None
+
+
+def test_the_report_does_not_make_the_update_directory(world):
+    run_report(world)
+    assert not (world.state / "_update").exists()

@@ -316,6 +316,28 @@ def format_table(rows: list[Row]) -> str:
     return "\n".join(term.clean(x) for x in lines)
 
 
+def candidate_tag(repo: Path) -> str | None:
+    """`agentbox/agent:<hash>` of the inputs on disk, or None when they cannot
+    be hashed (the build has failed then too)."""
+    try:
+        return f"{images.AGENT_REPO}:{images.agent_hash(repo)}"
+    except (images.ImageError, OSError):
+        return None
+
+
+def drop_candidate(tag: str, prev: str | None) -> None:
+    """Rollback of a failed build (PLAN §2.10): remove the candidate tag so the
+    newest non-current agent image stays the last good one. No `-f`; a refusal
+    or a missing tag is ignored. Not when the candidate is the previous image."""
+    try:
+        cid = docker.image_id(tag)
+        if cid is not None and cid == prev:
+            return
+        docker.run(["docker", "image", "rm", tag], check=False, timeout=120)
+    except (docker.DockerError, OSError):
+        pass
+
+
 def apply(
     repo: Path,
     latest: dict[str, str],
@@ -339,6 +361,7 @@ def apply(
     pkg = repo / "images/agent/pi-mcp-adapter/package.json"
     old_env, old_lock, old_pkg = env_file.read_text(), lock.read_bytes(), pkg.read_bytes()
     prev = docker.image_id(images.AGENT_LATEST)
+    candidate: str | None = None  # the new hash tag; set once the build has returned
     cur = read_env(old_env)
     changes = {
         k: v for k, v in latest.items() if k in cur and cur[k] != v and not v.startswith(FAILED)
@@ -360,6 +383,7 @@ def apply(
             relock()
         info["step"] = "build"
         build()
+        candidate = candidate_tag(repo)
         if check is not None:
             info["step"] = "check"
             check()
@@ -379,6 +403,8 @@ def apply(
             pkg.write_bytes(old_pkg)
         if prev is not None:
             docker.run(["docker", "tag", prev, images.AGENT_LATEST])
+        if candidate is not None:
+            drop_candidate(candidate, prev)
         if not isinstance(e, Exception):
             raise
         return False

@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
-from . import docker, images, launch, notify, paths, schedule, term, updatelock
+from . import docker, images, launch, notify, paths, prune, schedule, term, updatelock
 from . import update as upd
 from .profile import ProfileError, load_profile
 
@@ -243,6 +243,7 @@ def new_record(env: dict[str, str]) -> dict:
         "uv_to": None,
         "image": None,
         "derived_warnings": [],
+        "prune": None,
         "message": None,
         "notify": None,
         "reported": [],
@@ -283,7 +284,7 @@ def clean_reason(reason: str) -> str:
     return notify.slack_escape(notify.clean_line(reason, notify.REASON_CAP))
 
 
-def applied_text(rec: dict, line: tuple[str, str] | None = None) -> str:
+def applied_text(rec: dict, line: tuple[str, str] | None = None, freed: int | None = None) -> str:
     uv = ""
     if rec["uv_to"] and rec["uv_to"] != rec["uv_from"]:
         uv = f" (uv {rec['uv_from']} -> {rec['uv_to']})"
@@ -293,6 +294,7 @@ def applied_text(rec: dict, line: tuple[str, str] | None = None) -> str:
     derived = ""
     if rec["derived_warnings"]:
         derived = "; derived image failed: " + ", ".join(rec["derived_warnings"])
+    derived += prune.post_suffix(freed)
     image = (rec["image"] or "?").removeprefix("sha256:")[:12]
     return (f"{EMOJI} agentbox: {what} applied{uv}; new image {image}{derived}. "
             "Commit and release the pins.")  # fmt: skip
@@ -373,16 +375,21 @@ def lookup_failed_post(history: list[dict], today: date, reason: str) -> tuple[s
 
 
 def messages(rec: dict, env: dict[str, str], releases: list, history: list[dict],
-             line_change: tuple[str, str] | None = None) -> list[tuple[str, str]]:  # fmt: skip
+             line_change: tuple[str, str] | None = None,
+             freed: int | None = None) -> list[tuple[str, str]]:  # fmt: skip
     """The posts of this run as (dedupe key, text), in order, after dedupe against
     `history` (the earlier records). Applied: every time. Failed: once per
-    (target, step, normalized reason). Not installable: once per target."""
+    (target, step, normalized reason). Not installable: once per target.
+    `freed` (bytes) is the prune of a run whose record does not hold it."""
     seen = reported_keys(history)
     today = datetime.fromisoformat(rec["start"]).date()
     out: list[tuple[str, str]] = []
     result = rec["result"]
     if result == "applied":
-        out.append((f"applied:{rec['python_to']}:{rec['start']}", applied_text(rec, line_change)))
+        if freed is None:
+            freed = (rec.get("prune") or {}).get("freed_bytes")
+        text = applied_text(rec, line_change, freed)
+        out.append((f"applied:{rec['python_to']}:{rec['start']}", text))
     elif result == "failed":
         key = f"failed|{rec['python_to']}|{rec['step']}|{normalize_reason(rec['message'] or '')}"
         if key not in seen:
@@ -434,19 +441,20 @@ def write_record(rec: dict, final: bool) -> None:
 
 
 def finish(rec: dict, result: str, env: dict[str, str], releases: list,
-           line_change: tuple[str, str] | None = None, **fields) -> dict:  # fmt: skip
+           line_change: tuple[str, str] | None = None, freed: int | None = None,
+           **fields) -> dict:  # fmt: skip
     """Set the result, write the record, post, write the record again."""
     assert result in RESULTS
     rec.update(result=result, end=schedule.now_iso(), **fields)
     history = read_history(updatelock.update_dir())
     write_record(rec, final=False)  # the true outcome is on disk before the post
-    post_all(rec, messages(rec, env, releases, history, line_change))
+    post_all(rec, messages(rec, env, releases, history, line_change, freed))
     rec["end"] = schedule.now_iso()
     write_record(rec, final=True)
     return rec
 
 
-# ---------------------------------------------------------------- derived and unused images
+# ---------------------------------------------------------------- derived images and prune
 def profiles_with_packages() -> list[tuple[str, list[str]]]:
     out = []
     for name in launch.list_profiles(paths.profiles_dir()):
@@ -471,49 +479,50 @@ def build_derived(profs: list[tuple[str, list[str]]]) -> list[str]:
     return bad
 
 
-def unused_images(profs: list[tuple[str, list[str]]]) -> list[str]:
-    """`repo:tag` of agent and derived images that `:latest`, the current derived
-    tags and running containers do not use. Removes nothing."""
-    ls = docker.run(["docker", "image", "ls", "--no-trunc", "--filter", "reference=agentbox/agent",
-                     "--filter", "reference=agentbox/agent-pkgs", "--format",
-                     "{{.ID}} {{.Repository}}:{{.Tag}}"], check=False)  # fmt: skip
-    if ls.returncode != 0:
-        return []
-    keep: set[str | None] = {docker.image_id(images.AGENT_LATEST)}
-    for _, packages in profs:
-        base = docker.image_id(images.AGENT_LATEST)
-        if base:
-            keep.add(docker.image_id(images.pkgs_tag(base, packages)))
-    ps = docker.run(["docker", "ps", "-q"], check=False)
-    ids = ps.stdout.split() if ps.returncode == 0 else []
-    if ids:
-        ins = docker.run(["docker", "inspect", "--format", "{{.Image}}", *ids], check=False)
-        keep.update(ins.stdout.split() if ins.returncode == 0 else [])
-    tags = []
-    for row in ls.stdout.splitlines():
-        image, _, ref = row.partition(" ")
-        if image and image not in keep and not ref.endswith(":<none>"):
-            tags.append(ref)
-    return sorted(tags)
+def prune_images(repo: Path, profs: list[tuple[str, list[str]]] | None = None,
+                 dry_run: bool = False) -> dict:  # fmt: skip
+    """Prune superseded images (PLAN §2.10), print the result, return the record
+    object. Never raises (a stop signal aside): a failure is its `error`."""
+    try:
+        if profs is None:
+            profs = profiles_with_packages()
+        rec = prune.run(repo, profs, dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001 - a prune must not fail the update
+        rec = prune.error_record(f"cannot prune: {type(e).__name__}: {e}")
+    for text in prune.lines(rec):
+        print(text)
+    return rec
 
 
-def after_apply(rec: dict) -> None:
+def store_prune(rec: dict) -> None:
+    """`_update/prune.json`, for a prune that is not in a patch record. A write
+    failure is a warning."""
+    try:
+        prune.write(rec)
+    except OSError as e:
+        print(term.clean(f"warning: cannot write {prune.PRUNE_FILE}: {e}"))
+
+
+def after_apply(repo: Path, rec: dict, in_record: bool = True) -> dict:
     """After a successful update: record the image, build the derived images
-    (a failure is a warning), list the images that nothing uses. Nothing here
-    can undo or fail the update: doctor has passed."""
+    (a failure is a warning), then prune superseded images. Returns the prune
+    record: `rec["prune"]` for a patch run, else `_update/prune.json`. Nothing
+    here can undo or fail the update: doctor has passed."""
+    profs = None
     try:
         rec["image"] = docker.image_id(images.AGENT_LATEST)
         profs = profiles_with_packages()
         rec["derived_warnings"] = build_derived(profs)
         if rec["derived_warnings"]:
             print(f"warning: derived image failed for: {', '.join(rec['derived_warnings'])}")
-        unused = unused_images(profs)
     except (docker.DockerError, OSError) as e:
         print(term.clean(f"warning: after the update: {e}"))
-        return
-    if unused:
-        print("images that nothing uses (remove them if you want the space back):")
-        print(f"  docker image rm {' '.join(unused)}")
+    pr = prune_images(repo, profs)
+    if in_record:
+        rec["prune"] = pr
+    else:
+        store_prune(pr)
+    return pr
 
 
 # ---------------------------------------------------------------- patch
@@ -543,6 +552,14 @@ def patch(
     env = load_env(repo)
     rec = new_record(env)
     releases: list = []
+
+    def settle(result: str, **fields) -> None:
+        """A result that changed nothing: prune (Docker is up), then record and post."""
+        try:
+            rec["prune"] = prune_images(repo)
+        finally:  # a stop signal here must not lose the record
+            finish(rec, result, env, releases, **fields)
+
     if not docker_ready():
         finish(rec, "lookup_failed", env, releases, message="Docker did not come up")
         say(rec)
@@ -551,22 +568,22 @@ def patch(
         releases = fetch_json(upd.PYTHON_RELEASES)
         target = upd.python_latest(releases, env["PYTHON_LINE"])
     except upd.LOOKUP_ERRORS as e:
-        finish(rec, "lookup_failed", env, [], message=short_reason(e))
+        settle("lookup_failed", message=short_reason(e))
         say(rec)
         return rec
     cur = env["PYTHON_VERSION"]
     rec["python_to"] = target
     if upd.vkey(target) <= upd.vkey(cur):  # never a downgrade
         rec["python_to"] = cur
-        finish(rec, "current", env, releases)
+        settle("current")
         say(rec)
         return rec
     try:
         res = resolve(env, target)
     except NotInstallable as e:
-        finish(rec, "not_installable", env, releases, message=short_reason(e))
+        settle("not_installable", message=short_reason(e))
     except LookupFailed as e:
-        finish(rec, "lookup_failed", env, releases, message=short_reason(e))
+        settle("lookup_failed", message=short_reason(e))
     else:
         changes = {"PYTHON_VERSION": target}
         if res.uv:
@@ -577,7 +594,7 @@ def patch(
         ok = upd.apply(repo, changes, build, lambda: doctor(failed_checks), info=info)
         if ok:
             try:
-                after_apply(rec)
+                after_apply(repo, rec)
             finally:  # a stop signal here must not lose the record or the post
                 finish(rec, "applied", env, releases, derived_warnings=rec["derived_warnings"])
         else:
@@ -771,10 +788,13 @@ def change_line(repo: Path, new_line: str, eol: str, *, build: Callable[[], None
     ok = upd.apply(repo, changes, build, lambda: doctor(failed_checks), check=check, info=info)
     change = (env["PYTHON_LINE"], new_line)
     if ok:
+        pr = None
         try:
-            after_apply(rec)
+            pr = after_apply(repo, rec, in_record=False)
         finally:  # a stop signal here must not lose the record or the post
-            finish(rec, "applied", env, releases, change, derived_warnings=rec["derived_warnings"])
+            freed = (pr or {}).get("freed_bytes")
+            finish(rec, "applied", env, releases, change, freed,
+                   derived_warnings=rec["derived_warnings"])  # fmt: skip
     else:
         step = info.get("step", "write")
         if step == "doctor" and failed_checks:

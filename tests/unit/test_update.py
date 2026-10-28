@@ -4,8 +4,9 @@ import json
 import shutil
 
 import pytest
-from agentbox import docker, update
+from agentbox import docker, images, update
 from conftest import ROOT
+from fakedocker import FakeDocker
 
 ENV = "# c\nA=1\n# d\nB=x@sha256:1\n"
 
@@ -416,3 +417,87 @@ def test_apply_write_failure_is_step_write_and_rolls_back(repo, monkeypatch):
     assert update.apply(repo, {"CODEX_VERSION": "9.9.9"}, lambda: None, lambda: True,
                         info=info) is False  # fmt: skip
     assert info["step"] == "write" and "refusing" in info["error"]
+
+
+# ---------------------------------------------------------------- the candidate tag (PLAN §2.10)
+@pytest.fixture
+def full_repo(tmp_path):
+    """A repo copy with every agent build input, so `images.agent_hash` works."""
+    for f in ("images/agent/versions.env", *(f"images/agent/{x}" for x in images.AGENT_INPUTS)):
+        (tmp_path / f).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(ROOT / f, tmp_path / f)
+    return tmp_path
+
+
+def good_and_candidate(monkeypatch, repo, *, same_image=False):
+    """A fake daemon with the last good image (latest + its hash tag). Returns it and a
+    `build` that, like build.sh, tags the new hash and moves latest to the new image."""
+    d = FakeDocker()
+    monkeypatch.setattr(docker, "run", d.run)
+    good_tag = f"{images.AGENT_REPO}:{images.agent_hash(repo)}"
+    d.image(1, [good_tag, images.AGENT_LATEST], 5)
+    box = {}
+
+    def build():
+        box["tag"] = f"{images.AGENT_REPO}:{images.agent_hash(repo)}"  # the new inputs
+        new = d.tags[good_tag] if same_image else d.image(2, [], 6)
+        d.tags[box["tag"]] = new
+        d.tags[images.AGENT_LATEST] = new
+
+    return d, good_tag, box, build
+
+
+def test_rollback_removes_only_the_candidate_tag_and_keeps_the_previous_hash_tag(
+    full_repo, monkeypatch
+):
+    d, good_tag, box, build = good_and_candidate(monkeypatch, full_repo)
+    ok = update.apply(full_repo, {"CODEX_VERSION": "9.9.9"}, build, lambda: False)
+    assert ok is False
+    assert d.tags[images.AGENT_LATEST] == d.tags[good_tag]  # latest is the last good image
+    assert box["tag"] not in d.tags and good_tag in d.tags  # only the candidate tag went
+    rm = [c for c in d.calls if c[:3] == ["docker", "image", "rm"]]
+    assert rm == [["docker", "image", "rm", box["tag"]]]  # no -f, one tag
+    tag_at = d.calls.index(["docker", "tag", d.tags[good_tag], images.AGENT_LATEST])
+    assert d.calls.index(rm[0]) > tag_at  # after latest is re-tagged
+
+
+def test_the_candidate_is_computed_after_the_build_from_the_new_inputs(full_repo, monkeypatch):
+    d, good_tag, box, build = good_and_candidate(monkeypatch, full_repo)
+    update.apply(full_repo, {"CODEX_VERSION": "9.9.9"}, build, lambda: False)
+    assert box["tag"] != good_tag  # the hash changed with versions.env
+
+
+def test_a_failure_before_the_build_returns_has_no_candidate(full_repo, monkeypatch):
+    d, good_tag, box, build = good_and_candidate(monkeypatch, full_repo)
+
+    def failing_build():
+        build()  # tagged, then failed: still no candidate (the plan: before the build returns)
+        raise RuntimeError("build died")
+
+    assert update.apply(full_repo, {"CODEX_VERSION": "9.9.9"}, failing_build, lambda: True) is False
+    assert not [c for c in d.calls if c[:3] == ["docker", "image", "rm"]]
+
+
+def test_the_candidate_is_kept_when_it_is_the_previous_image(full_repo, monkeypatch):
+    d, good_tag, box, build = good_and_candidate(monkeypatch, full_repo, same_image=True)
+    update.apply(full_repo, {"CODEX_VERSION": "9.9.9"}, build, lambda: False)
+    assert not [c for c in d.calls if c[:3] == ["docker", "image", "rm"]]
+    assert box["tag"] in d.tags and good_tag in d.tags
+
+
+def test_a_refused_candidate_removal_does_not_fail_the_rollback(full_repo, monkeypatch):
+    d, good_tag, box, build = good_and_candidate(monkeypatch, full_repo)
+    d.fail["image rm"] = (1, "conflict: image is being used by a container")
+    info: dict = {}
+    assert (
+        update.apply(full_repo, {"CODEX_VERSION": "9.9.9"}, build, lambda: False, info=info)
+        is False
+    )
+    assert info["step"] == "doctor" and "doctor failed" in info["error"]
+    assert d.tags[images.AGENT_LATEST] == d.tags[good_tag]
+
+
+def test_a_success_removes_nothing(full_repo, monkeypatch):
+    d, good_tag, box, build = good_and_candidate(monkeypatch, full_repo)
+    assert update.apply(full_repo, {"CODEX_VERSION": "9.9.9"}, build, lambda: True)
+    assert not [c for c in d.calls if c[:3] == ["docker", "image", "rm"]]

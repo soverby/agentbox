@@ -1294,8 +1294,9 @@ build cache filled it (64 GB) and another stack's Postgres did not start
   (`null`), the prune still runs.
 - When: under the update lock (§2.9), so no fire or `up` builds or starts
   a box during the prune.
-  - After every successful apply: full `update`, `--python-patch`
-    (`applied`), `--python-line`. After the derived builds.
+  - After every successful apply: full `update` (also when all pins
+    are current), `--python-patch` (`applied`), `--python-line`. After
+    the derived builds.
   - On every `--python-patch` run whose result is `current`,
     `not_installable`, or `lookup_failed`, when Docker is up. So the
     daily job also removes what `up` and other builds left (new sidecar

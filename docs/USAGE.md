@@ -109,6 +109,7 @@ If a step fails, read [Troubleshooting](#troubleshooting).
 | `agentbox update [--check]` | Update tool versions, rebuild, self-test. Python stays in its line. |
 | `agentbox update --python-patch [--install [--at HH:MM] \| --uninstall]` | Python patch update only. The daily host job runs it (read [Python updates](#python-updates)). |
 | `agentbox update --python-line X.Y --eol YYYY-MM [--force]` | Move Python to another line, after the lock check. |
+| `agentbox update --prune [--dry-run]` | Remove superseded agentbox images and old build cache (read [Image pruning](#image-pruning)). |
 
 Where `[profile]` is optional, the CLI uses the profile whose mount contains
 the current directory. If no profile or more than one profile matches, the
@@ -1152,6 +1153,17 @@ shows at most 20 problem lines, then `… and N more`. Every line is cleaned of
 control characters and cut at 300 characters. Slack lines also escape `&`,
 `<`, and `>`.
 
+When an image prune ended in the window, the text and Slack forms add one more line
+after the problem lines. It is not a problem and changes no count:
+
+```text
+Docker disk: pruned 3 images, freed 4.2 GB at 05:00; images 12.3 GB, build cache 0.5 GB
+Docker disk: prune failed at 05:00: docker ps -a failed (1): <reason>
+```
+
+The JSON form adds `prune` (the record of [Image pruning](#image-pruning))
+in that case.
+
 **Window.** Without `--post`, the window is the last `--since` before now.
 With `--post`, the window starts where the last posted report ended (at most
 14 days back), so a report that runs late after a wake leaves no gap and no
@@ -1427,8 +1439,9 @@ the latest `uv`, checks its checksum, and asks again. Then it writes the new
 pins, builds the image, and runs the full doctor on a scratch profile. If a
 step fails, it restores only the pins that it changed and the previous image.
 After a good update it builds the derived image of every profile that has
-`packages`, so no scheduled run pays that build. It then prints the old
-images that nothing uses and the `docker image rm` line. It removes nothing.
+`packages`, so no scheduled run pays that build. It then removes the images
+that the update superseded and the old build cache (read
+[Image pruning](#image-pruning)).
 
 The job edits the working tree of the checkout. It does not commit. Commit
 and release the pins yourself.
@@ -1446,6 +1459,9 @@ Scheduled boxes stop after each run, so the next run uses the new image.
 Results (`last.json`, one line per run in `history.jsonl`): `current`,
 `applied`, `not_installable` (`uv` has no build yet; retried each day),
 `lookup_failed`, and `failed` (rolled back; exit 1). The other results exit 0.
+Every result except `failed` also runs the image prune when Docker is up.
+Its result is the `prune` field of the record. A prune that fails does not
+change the result or the exit code.
 
 #### What Slack gets
 
@@ -1455,7 +1471,7 @@ Without the setting, nothing is posted, and the record still has the result.
 
 | Event | Post | How often |
 | --- | --- | --- |
-| Applied | `🐍 agentbox: Python 3.14.8 -> 3.14.9 applied (uv 0.13.6 -> 0.13.7); new image <id>. Commit and release the pins.` | Every time. The uv part shows when `uv` changed. `; derived image failed: <profiles>` shows when a derived build failed. |
+| Applied | `🐍 agentbox: Python 3.14.8 -> 3.14.9 applied (uv 0.13.6 -> 0.13.7); new image <id>. Commit and release the pins.` | Every time. The uv part shows when `uv` changed. `; derived image failed: <profiles>` shows when a derived build failed. `; freed 4.2 GB` shows when the prune freed 0.1 GB or more. |
 | Failed | `🐍 agentbox: Python 3.14.9 update FAILED at <step>, kept 3.14.8: <reason>` | Once for each target, step, and reason (hex ids and digits do not count). A failed `--python-line` run posts it too. |
 | Not installable | `🐍 agentbox: Python 3.14.9 is out; uv has no build yet. Retrying daily.` | Once for each target. |
 | Lookup failed | `🐍 agentbox: Python check has failed for 3 days: <reason>` | Not on days 1 and 2. On day 3, then every 7th day. |
@@ -1494,6 +1510,75 @@ doctor passes, the command posts the applied line, with "line".
 
 The gateway image Python (3.13) and the `uv` that your projects use are not
 part of this.
+
+## Image pruning
+
+Each image change leaves the old agentbox images on the disk: a new agent
+image, new derived images (`agentbox/agent-pkgs`), and new sidecar images
+(`egress`, `ollama-gate`, `mcp-gateway`, `router`). Docker Desktop has one
+disk for all containers on the host. When agentbox images fill it, other
+stacks stop. So agentbox removes what it superseded.
+
+```sh
+agentbox update --prune --dry-run   # list the tags it would remove; remove nothing
+agentbox update --prune             # remove them, then the old build cache
+```
+
+A prune runs by itself:
+
+- After every good `agentbox update`, `--python-patch` update, and
+  `--python-line` update. The `--python-patch` and `--python-line` updates
+  build the derived images first. An `update` that finds all pins current
+  also prunes.
+- On every `--python-patch` run that ends `current`, `not_installable`, or
+  `lookup_failed`, when Docker is up. So the daily job also removes the
+  images that `up` and other builds left.
+- Never after a `failed` update. A failed update rolls back, and it removes
+  its own new image tag (the previous image keeps its tag).
+
+What the prune removes:
+
+- Only tags that agentbox makes: `agentbox/agent:<12 hex>`,
+  `agentbox/agent:base-<12 hex>`, `agentbox/agent-pkgs:<12 hex>`, and
+  `agentbox/<sidecar>:<12 hex>`. It never removes `latest`, other tags, other
+  repositories, or an image with no name.
+- It keeps the current images, one previous generation (the way back), the
+  derived images of both, and every image that any container uses, running
+  or stopped. Everything else loses all its agentbox tags with
+  `docker image rm` (never `-f`). Docker refuses to delete an image that a
+  container uses, or an image with a tag from another project. Those images
+  are kept and not an error.
+- It then runs `docker builder prune --force --filter until=24h`. The build
+  cache is shared by all projects on the host, so this also removes cache of
+  other projects that was not used for 24 hours. That makes their next build
+  slower. It never removes data.
+- Volumes stay. A stopped box can hold the only copy of its data in its home
+  volume.
+
+If `docker ps -a` or `docker image ls` fails, the prune stops with an error
+and removes nothing.
+
+The output is `pruned 3 images, freed 4.2 GB (images 12.3 GB, build cache
+0.5 GB now)`. Freed space is the drop in the size of the images plus the
+reclaimable build cache. It counts 0 for an image whose cache is kept
+(used in the last 24 hours) until a later prune. `freed unknown` means that
+`docker system df` failed.
+
+The result is in the `prune` field of the record for a `--python-patch` run
+(`last.json` and `history.jsonl`). The other prunes write it to
+`~/.local/state/agentbox/_update/prune.json` (mode 0600). The fields are
+`end`, `removed` (tags), `images` (ids), `kept_busy` (ids that Docker kept),
+`freed_bytes` (or `null`), `after` (`images` and `build_cache` in bytes), and
+`error`. The [fleet report](#fleet-report) shows the newest prune as a
+`Docker disk:` line.
+
+`agentbox update --prune` takes the update lock and exits 75 when an update
+runs. It exits 1 when the prune has an error. `--dry-run` takes no lock.
+`--prune` does not combine with `--check`, `--python-patch`, `--python-line`,
+or `--install`.
+
+Limit: the images that `agentbox up` builds between two daily runs stay until
+the next run. One agent image with its derived images is about 2.4 GB.
 
 ## Troubleshooting
 

@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import box as boxmod
-from . import delivery, docker, launch, notify, paths, schedule, secretstore
+from . import delivery, docker, launch, notify, paths, prune, schedule, secretstore, updatelock
 from .profile import (
     CLAUDE_TOKEN,
     PROFILE_NAME_RE,
@@ -193,6 +193,7 @@ class Report:
     idle_check: str = "ok"  # "ok" or the reason it was skipped
     drift: list[dict] = field(default_factory=list)
     carry: list[dict] = field(default_factory=list)  # pending / not_run_yet, for the next --post
+    prune: dict | None = None  # the newest image prune that ended in the window (PLAN §2.10)
 
     @property
     def scheduled(self) -> int:
@@ -210,7 +211,7 @@ class Report:
         return sum(1 for f in self.fires if f.origin in ("manual", "extra"))
 
     def as_dict(self) -> dict:
-        return {
+        out = {
             "version": SCHEMA_VERSION,
             "generated": self.generated,
             "window": {"start": self.window_start, "end": self.window_end},
@@ -228,6 +229,9 @@ class Report:
             "drift": self.drift,
             "carry": self.carry,
         }
+        if self.prune is not None:  # added only when a prune ended in the window
+            out["prune"] = self.prune
+        return out
 
 
 # ---------------------------------------------------------------- window
@@ -274,6 +278,51 @@ def save_last_report(report: Report, rdir: Path | None = None) -> None:
     rdir = rdir if rdir is not None else report_dir()
     data = {"version": SCHEMA_VERSION, "window_end": report.window_end, "carry": report.carry}
     schedule.write_private(rdir / "last.json", (json.dumps(data, indent=1) + "\n").encode())
+
+
+# ---------------------------------------------------------------- image prune
+def _ints(v, allow_none: bool = False) -> bool:
+    ok = isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    return ok or (allow_none and v is None)
+
+
+def valid_prune(raw) -> dict | None:
+    """The prune record object (prune.KEYS) if it has the expected shape, else None."""
+    if not isinstance(raw, dict) or parse_dt(raw.get("end")) is None:
+        return None
+    for k in ("removed", "images", "kept_busy"):
+        if not isinstance(raw.get(k), list) or not all(isinstance(x, str) for x in raw[k]):
+            return None
+    after = raw.get("after")
+    if after is not None and not (
+        isinstance(after, dict) and _ints(after.get("images")) and _ints(after.get("build_cache"))
+    ):
+        return None
+    if not _ints(raw.get("freed_bytes"), allow_none=True):
+        return None
+    if raw.get("error") is not None and not isinstance(raw["error"], str):
+        return None
+    return {k: raw.get(k) for k in prune.KEYS}
+
+
+def newest_prune(start: datetime, end: datetime, udir: Path | None = None) -> dict | None:
+    """The newest prune (`prune` of `_update/last.json`, or `_update/prune.json`, by
+    `end`) when it ended in [start, end). Reads only: it does not make the directory."""
+    udir = udir if udir is not None else paths.state_home() / updatelock.UPDATE_DIR
+    found = []
+    for name in ("last.json", prune.PRUNE_FILE):
+        try:
+            data = json.loads((udir / name).read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            rec = valid_prune(data.get("prune") if name == "last.json" else data)
+            if rec is not None:
+                found.append(rec)
+    if not found:
+        return None
+    best = max(found, key=lambda r: parse_dt(r["end"]))
+    return best if start <= parse_dt(best["end"]) < end else None
 
 
 # ---------------------------------------------------------------- rows
@@ -1013,6 +1062,7 @@ def build_report(
     rep.fires.sort(key=lambda f: (parse_dt(f.when), f.job))  # by instant, not by text
     # Idle boxes first: the investigator's own box must not be counted.
     rep.idle_boxes, rep.idle_check = find_idle_boxes(now, jobs)
+    rep.prune = newest_prune(start, end)
     inv = Investigator(cfg, scrubber, enabled=investigate)
     for f in rep.fires:
         if f.cls == "failed" and f.unexplained and f.row is not None:

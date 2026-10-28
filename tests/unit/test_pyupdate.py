@@ -22,6 +22,7 @@ from agentbox import box as boxmod
 from agentbox import cli, docker, images, notify, pyupdate, schedule, updatelock
 from agentbox import update as upd
 from conftest import ROOT
+from fakedocker import FakeDocker
 
 HOOK = "https://hooks.slack.com/services/T0AAAAAAA/B0BBBBBBB/hookSECRETVALUE0123456789"
 IMG = "sha256:" + "ab" * 32  # agentbox/agent:latest after a build
@@ -47,10 +48,8 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     repo = tmp_path / "repo"
     for f in (
-        "images/agent/versions.env",
         "images/agent/build.sh",
-        "images/agent/pi-mcp-adapter/package.json",
-        "images/agent/pi-mcp-adapter/package-lock.json",
+        *(f"images/agent/{x}" for x in images.AGENT_INPUTS),
     ):
         (repo / f).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / f, repo / f)
@@ -70,18 +69,11 @@ def world(tmp_path, monkeypatch):
 
     w = SimpleNamespace(tmp=tmp_path, cfg=cfg, state=state, la=la, repo=repo, runs=[],
                         images={images.AGENT_LATEST: IMG}, at="2026-10-28T05:00:00+01:00",
-                        posts=[], ps="", ls="")  # fmt: skip
-
-    def run(args, **kw):
-        w.runs.append(list(args))
-        out = ""
-        if args[:3] == ["docker", "image", "ls"]:
-            out = w.ls
-        elif args[:2] == ["docker", "ps"]:
-            out = w.ps
-        return subprocess.CompletedProcess(args, 0, out, "")
-
-    monkeypatch.setattr(docker, "run", run)
+                        posts=[])  # fmt: skip
+    # The fake daemon (PLAN §2.10 prune): one current agent image, nothing to remove.
+    w.fake = FakeDocker(w.runs)
+    w.fake.image(0xAB, [images.AGENT_LATEST, f"{images.AGENT_REPO}:{images.agent_hash(repo)}"])
+    monkeypatch.setattr(docker, "run", w.fake.run)
     monkeypatch.setattr(docker, "image_id", lambda ref: w.images.get(ref))
     monkeypatch.setattr(schedule, "now_iso", lambda: w.at)
     # Slack: the secret in the env-backend store; notify.post records instead of using the network.
@@ -350,8 +342,8 @@ def test_current_posts_nothing_and_writes_the_record(world, monkeypatch):
     assert last(world) == rec and history(world) == [rec]
     assert (updatelock.update_dir().stat().st_mode & 0o777) == 0o700
     assert set(rec) == {"start", "end", "result", "step", "python_from", "python_to", "uv_from",
-                        "uv_to", "image", "derived_warnings", "message", "notify",
-                        "reported"}  # fmt: skip
+                        "uv_to", "image", "derived_warnings", "prune", "message",
+                        "notify", "reported"}  # fmt: skip
     assert env_of(world)["PYTHON_VERSION"] == "3.14.8"
 
 
@@ -427,35 +419,6 @@ def test_applied_builds_derived_images_and_a_failure_is_a_warning(world, monkeyp
         "derived image failed: docs. Commit and release the pins."
     ]
     assert "derived image failed for: docs" in capsys.readouterr().out
-
-
-def test_applied_lists_unused_images_and_removes_nothing(world, monkeypatch, capsys):
-    resolves(monkeypatch, pyupdate.Resolution(None))
-    world.ls = (
-        f"{IMG} agentbox/agent:latest\n"
-        f"{IMG} agentbox/agent:0123456789ab\n"
-        "sha256:old1 agentbox/agent:aaaaaaaaaaaa\n"
-        "sha256:old1 agentbox/agent:base-old1\n"
-        "sha256:old2 agentbox/agent-pkgs:bbbbbbbbbbbb\n"
-        "sha256:run1 agentbox/agent-pkgs:cccccccccccc\n"
-        "sha256:dang <none>:<none>\n"
-    )
-    world.ps = "c1\n"
-    base_run = docker.run
-
-    def run(args, **kw):
-        if args[:2] == ["docker", "inspect"]:
-            world.runs.append(list(args))
-            return subprocess.CompletedProcess(args, 0, "sha256:run1\n", "")
-        return base_run(args, **kw)
-
-    monkeypatch.setattr(docker, "run", run)
-    run_patch(world, rels("3.14.9"))
-    out = capsys.readouterr().out
-    assert ("  docker image rm agentbox/agent-pkgs:bbbbbbbbbbbb agentbox/agent:aaaaaaaaaaaa "
-            "agentbox/agent:base-old1") in out  # fmt: skip
-    assert "agentbox/agent:latest" not in out.split("docker image rm")[1]
-    assert not any(r[:3] == ["docker", "image", "rm"] for r in world.runs)  # prints, never removes
 
 
 def test_not_installable_changes_nothing_and_posts_once_per_target(world, monkeypatch):
@@ -1892,3 +1855,301 @@ def test_a_stop_during_after_apply_still_writes_the_record_and_posts(world, monk
     with pytest.raises(KeyboardInterrupt):
         run_line(world)
     assert last(world)["result"] == "applied" and "Python line 3.14 -> 3.15" in world.posts[0]
+
+
+# ---------------------------------------------------------------- image pruning (PLAN §2.10)
+GB = 10**9
+BUILDER = ["docker", "builder", "prune", "--force", "--filter", "until=24h"]
+
+
+def stale_images(w, n=2, size=GB):
+    """`n` superseded agent images (older than the current one and one previous)."""
+    w.fake.image(0x02, ["agentbox/agent:" + "0" * 11 + "2"], 3, size)  # the previous generation
+    for k in range(n):
+        w.fake.image(0x10 + k, [f"agentbox/agent:{0x10 + k:012x}"], 2, size)
+
+
+def rm_ran(w):
+    return [r for r in w.runs if r[:3] == ["docker", "image", "rm"]]
+
+
+def prune_file(w):
+    return updatelock.update_dir() / "prune.json"
+
+
+def test_applied_prunes_after_the_derived_builds_and_records_it(world, monkeypatch, capsys):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    monkeypatch.setattr("agentbox.profile.check_mount_host", lambda h, d=False, **kw: h)
+    profile_with_packages(world, "media", ["ffmpeg"])
+    stale_images(world, n=2, size=2 * GB)
+    monkeypatch.setattr(
+        images, "ensure_pkgs", lambda base, packages: world.runs.append(["derived"])
+    )
+    rec = run_patch(world, rels("3.14.9"))
+    assert world.runs.index(["derived"]) < world.runs.index(BUILDER)
+    assert rec["result"] == "applied"
+    pr = rec["prune"]
+    assert pr["end"] == world.at and len(pr["images"]) == 2 and pr["freed_bytes"] == 4 * GB
+    assert pr["after"]["images"] == 3 * GB and pr["error"] is None and pr["kept_busy"] == []
+    assert last(world) == rec and history(world) == [rec]
+    assert not prune_file(world).exists()  # a patch prune is in the record, not in prune.json
+    assert world.posts == [
+        f"{PREFIX}Python 3.14.8 -> 3.14.9 applied; new image {SHORT}; freed 4.0 GB. "
+        "Commit and release the pins."
+    ]
+    out = capsys.readouterr().out
+    assert "pruned 2 images, freed 4.0 GB (images 3.0 GB, build cache 0.0 GB now)" in out
+    assert out.index("pruned 2 images") < out.index("applied; new image")
+    assert "images that nothing uses" not in out and "docker image rm" not in out
+
+
+def test_the_applied_post_has_no_suffix_below_a_tenth_of_a_gigabyte(world, monkeypatch):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    stale_images(world, n=1, size=50_000_000)
+    run_patch(world, rels("3.14.9"))
+    assert world.posts == [
+        f"{PREFIX}Python 3.14.8 -> 3.14.9 applied; new image {SHORT}. Commit and release the pins."
+    ]
+
+
+def test_the_applied_post_has_no_suffix_when_freed_is_unknown(world, monkeypatch):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    stale_images(world, n=1)
+    world.fake.fail["df"] = (1, "no")
+    rec = run_patch(world, rels("3.14.9"))
+    assert rec["prune"]["freed_bytes"] is None and "freed" not in world.posts[0]
+
+
+def test_the_suffix_follows_the_derived_warning(world, monkeypatch):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    monkeypatch.setattr("agentbox.profile.check_mount_host", lambda h, d=False, **kw: h)
+    profile_with_packages(world, "docs", ["pandoc"])
+    monkeypatch.setattr(images, "ensure_pkgs", failing(docker.DockerError("apt failed")))
+    stale_images(world, n=1, size=2 * GB)
+    run_patch(world, rels("3.14.9"))
+    assert world.posts == [
+        f"{PREFIX}Python 3.14.8 -> 3.14.9 applied; new image {SHORT}; "
+        "derived image failed: docs; freed 2.0 GB. Commit and release the pins."
+    ]
+
+
+@pytest.mark.parametrize("why", ["current", "not_installable", "lookup_uv", "lookup_python_org"])
+def test_every_patch_run_that_changes_nothing_prunes_too(world, monkeypatch, why):
+    stale_images(world, n=2)
+    boom = lambda: pytest.fail("must not build")  # noqa: E731
+    if why == "current":
+        rec = run_patch(world, rels("3.14.8"), build=boom)
+    elif why == "lookup_python_org":
+        rec = pyupdate.patch(world.repo, build=boom, doctor=lambda f: True,
+                             fetch_json=failing(urllib.error.URLError("offline")))  # fmt: skip
+    else:
+        resolves(monkeypatch, pyupdate.NotInstallable("x") if why == "not_installable"
+                 else pyupdate.LookupFailed("uv: down"))  # fmt: skip
+        rec = run_patch(world, rels("3.14.9"), build=boom)
+    assert rec["result"] == ("lookup_failed" if why.startswith("lookup") else why)
+    assert len(rec["prune"]["images"]) == 2 and BUILDER in world.runs
+    assert last(world)["prune"] == rec["prune"] and history(world)[-1]["prune"] == rec["prune"]
+    assert not prune_file(world).exists()
+
+
+def test_a_failed_update_does_not_prune(world, monkeypatch):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    stale_images(world, n=2)
+
+    def build():
+        raise docker.DockerError("build failed")
+
+    rec = run_patch(world, rels("3.14.9"), build=build)
+    assert rec["result"] == "failed" and rec["prune"] is None
+    assert rm_ran(world) == [] and BUILDER not in world.runs
+    assert not any(r[:3] == ["docker", "system", "df"] for r in world.runs)
+
+
+def test_a_failed_doctor_does_not_prune_either(world, monkeypatch):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    stale_images(world, n=2)
+    rec = run_patch(world, rels("3.14.9"), doctor=lambda failed: False)
+    assert rec["result"] == "failed" and rec["prune"] is None and BUILDER not in world.runs
+
+
+def test_docker_not_up_does_not_prune(world, monkeypatch):
+    stale_images(world, n=2)
+    rec = run_patch(world, rels("3.14.9"), ready=False)
+    assert rec["result"] == "lookup_failed" and rec["prune"] is None and world.runs == []
+
+
+def test_a_prune_error_changes_neither_the_result_nor_the_post(world, monkeypatch, capsys):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    stale_images(world, n=2)
+    world.fake.fail["ps -a"] = (1, "Cannot connect to the Docker daemon")
+    rec = run_patch(world, rels("3.14.9"))
+    assert rec["result"] == "applied" and env_of(world)["PYTHON_VERSION"] == "3.14.9"
+    assert "docker ps -a failed" in rec["prune"]["error"] and rec["prune"]["images"] == []
+    assert rm_ran(world) == []
+    assert world.posts == [
+        f"{PREFIX}Python 3.14.8 -> 3.14.9 applied; new image {SHORT}. Commit and release the pins."
+    ]
+    assert "prune failed: docker ps -a failed" in capsys.readouterr().out
+
+
+def test_an_unexpected_prune_crash_does_not_fail_the_update(world, monkeypatch):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    monkeypatch.setattr(pyupdate.prune, "run", failing(RuntimeError("bug")))
+    rec = run_patch(world, rels("3.14.9"))
+    assert rec["result"] == "applied" and "RuntimeError: bug" in rec["prune"]["error"]
+
+
+def test_a_stop_during_the_prune_still_writes_the_record_and_posts(world, monkeypatch):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    monkeypatch.setattr(pyupdate.prune, "run", failing(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        run_patch(world, rels("3.14.9"))
+    assert last(world)["result"] == "applied" and len(world.posts) == 1
+
+
+def test_a_line_change_prunes_into_prune_json_and_posts_the_freed_space(world, monkeypatch):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    stale_images(world, n=2, size=2 * GB)
+    rec = run_line(world)
+    assert rec["result"] == "applied" and rec["prune"] is None  # not in last.json
+    assert last(world)["prune"] is None and history(world)[-1]["prune"] is None
+    f = prune_file(world)
+    assert (f.stat().st_mode & 0o777) == 0o600
+    data = json.loads(f.read_text())
+    assert data["freed_bytes"] == 4 * GB and len(data["images"]) == 2
+    assert set(data) == {"end", "removed", "images", "kept_busy", "freed_bytes", "after", "error"}
+    assert world.posts == [
+        f"{PREFIX}Python line 3.14 -> 3.15 (3.14.8 -> 3.15.0) applied; new image {SHORT}; "
+        "freed 4.0 GB. Commit and release the pins."
+    ]
+
+
+def test_a_failed_line_change_does_not_prune(world, monkeypatch):
+    resolves(monkeypatch, pyupdate.Resolution(None))
+    stale_images(world, n=2)
+    rec = run_line(world, doctor=lambda failed: False)
+    assert (
+        rec["result"] == "failed" and not prune_file(world).exists() and BUILDER not in world.runs
+    )
+
+
+# ---------------------------------------------------------------- the commands
+def test_full_update_prunes_after_an_apply_and_writes_prune_json(world, monkeypatch, capsys):
+    stale_images(world, n=2)
+    monkeypatch.setattr(upd, "lookup", lambda current, **kw: {"CODEX_VERSION": "9.9.9"})
+    monkeypatch.setattr(cli, "update_build", lambda repo: lambda: None)
+    monkeypatch.setattr(cli, "scratch_doctor", lambda failed=None: True)
+    assert cli.main(["update"]) == 0
+    data = json.loads(prune_file(world).read_text())
+    assert len(data["images"]) == 2 and (prune_file(world).stat().st_mode & 0o777) == 0o600
+    assert "pruned 2 images, freed 2.0 GB" in capsys.readouterr().out
+    assert not (updatelock.update_dir() / "last.json").exists()  # patch readers see nothing new
+
+
+def test_full_update_that_fails_does_not_prune(world, monkeypatch):
+    stale_images(world, n=2)
+    monkeypatch.setattr(upd, "lookup", lambda current, **kw: {"CODEX_VERSION": "9.9.9"})
+    monkeypatch.setattr(cli, "update_build", lambda repo: lambda: None)
+    monkeypatch.setattr(cli, "scratch_doctor", lambda failed=None: False)
+    assert cli.main(["update"]) == 1
+    assert not prune_file(world).exists() and BUILDER not in world.runs
+
+
+def test_full_update_with_nothing_to_apply_still_prunes(world, monkeypatch):
+    stale_images(world, n=2)
+    monkeypatch.setattr(upd, "lookup", lambda current, **kw: {})
+    assert cli.main(["update"]) == 0
+    assert prune_file(world).exists() and BUILDER in world.runs
+
+
+def test_full_update_prune_error_keeps_exit_0(world, monkeypatch, capsys):
+    stale_images(world, n=2)
+    world.fake.fail["image ls"] = (1, "down")
+    monkeypatch.setattr(upd, "lookup", lambda current, **kw: {"CODEX_VERSION": "9.9.9"})
+    monkeypatch.setattr(cli, "update_build", lambda repo: lambda: None)
+    monkeypatch.setattr(cli, "scratch_doctor", lambda failed=None: True)
+    assert cli.main(["update"]) == 0
+    assert "docker image ls failed" in json.loads(prune_file(world).read_text())["error"]
+
+
+def test_the_daily_job_exit_code_ignores_a_prune_error(world, cmd):
+    world.fake.fail["ps -a"] = (1, "down")
+    cmd.releases = rels("3.14.9")
+    assert cli.main(["update", "--python-patch"]) == 0
+    assert last(world)["result"] == "applied" and last(world)["prune"]["error"]
+
+
+def test_update_prune_removes_and_writes_prune_json(world, capsys):
+    stale_images(world, n=2)
+    assert cli.main(["update", "--prune"]) == 0
+    out = capsys.readouterr().out
+    assert "pruned 2 images, freed 2.0 GB" in out
+    assert len(json.loads(prune_file(world).read_text())["images"]) == 2
+    assert not (updatelock.update_dir() / "last.json").exists() and world.posts == []
+
+
+def test_update_prune_holds_the_lock_and_exits_75_when_busy(world, monkeypatch, capsys):
+    stale_images(world, n=2)
+    seen = []
+    real = world.fake.run
+
+    def spy(args, **kw):
+        seen.append(updatelock.holder())
+        return real(args, **kw)
+
+    monkeypatch.setattr(docker, "run", spy)
+    assert cli.main(["update", "--prune"]) == 0
+    assert seen and all(seen)
+    held = raw_lock(updatelock.update_dir() / "update.lock")
+    try:
+        before = list(world.runs)
+        assert cli.main(["update", "--prune"]) == 75
+        assert "another update is running" in capsys.readouterr().err
+        assert world.runs == before  # nothing ran
+    finally:
+        held.close()
+
+
+def test_update_prune_exits_1_on_an_error(world, capsys):
+    world.fake.fail["ps -a"] = (1, "Cannot connect")
+    assert cli.main(["update", "--prune"]) == 1
+    assert "prune failed: docker ps -a failed" in capsys.readouterr().out
+    assert "docker ps -a failed" in json.loads(prune_file(world).read_text())["error"]
+
+
+def test_update_prune_dry_run_lists_tags_removes_nothing_and_takes_no_lock(world, capsys):
+    stale_images(world, n=1)
+    before = dict(world.fake.tags)
+    held = raw_lock(updatelock.update_dir() / "update.lock")
+    try:
+        assert cli.main(["update", "--prune", "--dry-run"]) == 0
+    finally:
+        held.close()
+    out = capsys.readouterr().out
+    assert "would remove 1 image (1 tags):" in out and f"  agentbox/agent:{0x10:012x}" in out
+    assert world.fake.tags == before and rm_ran(world) == [] and BUILDER not in world.runs
+    assert not prune_file(world).exists()
+
+
+def test_update_prune_dry_run_with_an_error_exits_1(world):
+    world.fake.fail["image ls"] = (1, "down")
+    assert cli.main(["update", "--prune", "--dry-run"]) == 1
+
+
+@pytest.mark.parametrize(
+    "argv,msg",
+    [
+        (["--dry-run"], "--dry-run works only with --prune"),
+        (["--check", "--dry-run"], "--dry-run works only with --prune"),
+        (["--prune", "--check"], "--prune cannot be combined with --check"),
+        (["--prune", "--python-patch"], "--prune cannot be combined with --python-patch"),
+        (["--prune", "--python-line", "3.15", "--eol", "2031-10"],
+         "--prune cannot be combined with --python-line"),
+        (["--prune", "--python-patch", "--install"], "--prune cannot be combined"),
+        (["--prune", "--install"], "need --python-patch"),
+    ],
+)  # fmt: skip
+def test_prune_option_errors(world, cmd, capsys, argv, msg):
+    assert cli.main(["update", *argv]) == 1
+    assert msg in capsys.readouterr().err
+    assert world.runs == [] and cmd.build_calls == 0 and history(world) == []

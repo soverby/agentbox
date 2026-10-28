@@ -367,3 +367,74 @@ def test_unknown_history_row_line():
         "⚠️ 1 of 1 scheduled runs completed normally, 1 history row not understood",
         "• p/j 10-08 08:15 history row not understood",
     ]
+
+
+# ---------------------------------------------------------------- Docker disk line (PLAN §2.10)
+PRUNE = {
+    "end": "2026-10-08T05:00:07+01:00",
+    "removed": ["agentbox/agent:aaaaaaaaaaaa"],
+    "images": ["sha256:" + "aa" * 32, "sha256:" + "bb" * 32],
+    "kept_busy": [],
+    "freed_bytes": 4_250_000_000,
+    "after": {"images": 12_300_000_000, "build_cache": 500_000_000},
+    "error": None,
+}
+
+
+def test_docker_disk_line_follows_the_summary_and_is_not_a_problem():
+    r = report([fire(), fire()])
+    plain = report_outputs.render_text(r)
+    r.prune = PRUNE
+    text = report_outputs.render_text(r)
+    assert text == (
+        plain + "\nDocker disk: pruned 2 images, freed 4.3 GB at 05:00; "
+        "images 12.3 GB, build cache 0.5 GB"
+    )
+    assert report_outputs.render_text(r, slack=True) == text
+    assert report_outputs.problem_lines(r) == []  # not a problem line
+
+
+def test_docker_disk_line_does_not_change_the_summary_counts():
+    bad = report([fire(), fire("failed", rc=1, cause="exit 1")])
+    before = (report_outputs.summary(bad), report_outputs.counts(bad))
+    bad.prune = PRUNE
+    assert (report_outputs.summary(bad), report_outputs.counts(bad)) == before
+    assert report_outputs.render_text(bad).splitlines()[0] == before[0]
+    assert report_outputs.render_text(bad).splitlines()[-1].startswith("Docker disk: pruned 2")
+
+
+def test_docker_disk_line_for_a_failed_prune_and_unknown_freed():
+    r = report([fire()])
+    r.prune = {**PRUNE, "error": "docker ps -a failed (1): down", "freed_bytes": None}
+    assert report_outputs.render_text(r).splitlines()[-1] == (
+        "Docker disk: prune failed at 05:00: docker ps -a failed (1): down"
+    )
+    r.prune = {**PRUNE, "error": None, "freed_bytes": None, "after": None}
+    assert report_outputs.render_text(r).splitlines()[-1] == (
+        "Docker disk: pruned 2 images, freed unknown at 05:00"
+    )
+
+
+def test_docker_disk_line_is_cleaned_and_slack_escaped():
+    r = report([fire()])
+    r.prune = {**PRUNE, "error": "bad <b>&\x1b[31m red"}
+    assert "\x1b" not in report_outputs.render_text(r)
+    assert (
+        report_outputs.render_text(r, slack=True)
+        .splitlines()[-1]
+        .startswith("Docker disk: prune failed at 05:00: bad &lt;b&gt;&amp;")
+    )
+
+
+def test_docker_disk_line_comes_before_the_interval_job_lines():
+    r = report([fire()], every=[{"job": "p/e", "runs": 3, "expected": 4}])
+    r.prune = PRUNE
+    lines = report_outputs.render_text(r).splitlines()
+    assert lines[1].startswith("Docker disk:") and lines[2].startswith("interval job p/e")
+
+
+def test_json_has_prune_only_when_a_prune_ended_in_the_window():
+    r = report([fire()])
+    assert "prune" not in json.loads(report_outputs.render_json(r))
+    r.prune = PRUNE
+    assert json.loads(report_outputs.render_json(r))["prune"] == PRUNE

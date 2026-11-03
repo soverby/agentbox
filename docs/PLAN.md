@@ -1367,7 +1367,9 @@ the existing Keychain backend, for any directory with a manifest.
 - Scope `_stack/<name>`: items `agentbox/_stack/<name>/<NAME>`, owned
   (base64 envelope, §2.4). It is distinct from every profile scope and from
   `_shared`; a stack cannot read a profile's or the shared items by default
-  ref. The reserved-name list of §2.4 applies to the manifest, and
+  ref. The reserved-name list of §2.4 applies to the manifest, plus
+  `COMPOSE_*` and `DOCKER_*` (any case: they would steer compose or the
+  docker client in the command `stack run` execs), and
   `notify_webhook_secret` is refused by the same `collect` rule (compared by
   item key).
 - Commands (§2.3 table):

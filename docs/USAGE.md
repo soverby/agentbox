@@ -580,7 +580,8 @@ plus `AGENTBOX_SECRET_<NAME>` and `<NAME>` for each manifest secret. When the
 manifest has `compose_files`, it also sets `COMPOSE_FILE` to those paths (it
 replaces a `COMPOSE_FILE` that you already have). The exit code is the
 command's code. A command that is not found exits with 127. On Linux,
-`stack run` fails because the Keychain backend is macOS-only.
+`stack run` fails when the manifest has Keychain refs, because the Keychain
+backend is macOS-only; a manifest with only `op://` refs runs there.
 
 Rules:
 

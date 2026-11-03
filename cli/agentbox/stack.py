@@ -22,6 +22,10 @@ from .delivery import item_key, webhook_item
 from .paths import Config
 from .profile import ref_ok, secret_name_problem
 
+# A secret with one of these names would steer the docker client or compose
+# (COMPOSE_FILE, DOCKER_HOST, ...) in the command `stack run` execs (PLAN §2.11).
+STACK_RESERVED_RE = re.compile(r"(?i)(COMPOSE|DOCKER)_.*")
+
 MANIFEST = "agentbox-stack.toml"
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 ENV_PREFIX = "AGENTBOX_SECRET_"
@@ -132,6 +136,9 @@ def load(directory: str | Path, cfg: Config) -> Stack:
         key = f"secrets.{sname}"
         if msg := secret_name_problem(sname):
             bad(key, msg)
+            continue
+        if STACK_RESERVED_RE.fullmatch(sname):
+            bad(key, f"{sname} is a reserved name (it steers docker and compose)")
             continue
         if not isinstance(sv, dict):
             bad(key, 'must be a table: NAME = {} or NAME = { ref = "..." }')

@@ -105,6 +105,8 @@ def test_stack_name_accepts_limits(env):
         ("1BAD = {}", "invalid secret name"),
         ("PATH = {}", "reserved"),
         ("AGENTBOX_X = {}", "reserved"),
+        ("COMPOSE_FILE = {}", "reserved"),
+        ("docker_host = {}", "reserved"),
         ("https_proxy = {}", "reserved"),
         ("GIT_SSH_COMMAND = {}", "reserved"),
         ('X = "shared"', "must be a table"),

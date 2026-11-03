@@ -46,6 +46,7 @@ from . import (
     report_outputs,
     schedule,
     secretstore,
+    stack,
     term,
     updatelock,
 )
@@ -755,9 +756,21 @@ class SecretTarget:
     where: str  # "shared" or the profile name
 
 
-def secret_target(shared: bool, first: str, second: str | None) -> SecretTarget:
-    """`[--shared | <profile>] NAME` -> where the value lives."""
+def secret_target(
+    shared: bool, first: str, second: str | None, stack_name: str | None = None
+) -> SecretTarget:
+    """`[--shared | --stack <name> | <profile>] NAME` -> where the value lives."""
     cfg = paths.load_config()
+    if stack_name is not None:
+        if shared or second is not None:
+            raise CliError("give one of --shared, --stack, or a profile")
+        if msg := stack.name_problem(stack_name):
+            raise CliError(msg)
+        if msg := secret_name_problem(first):
+            raise CliError(msg)
+        return SecretTarget(
+            first, stack.default_ref(cfg, stack_name, first), f"stack {stack_name}"
+        )
     if shared:
         if second is not None:
             raise CliError("give either --shared or a profile, not both")
@@ -805,7 +818,7 @@ def read_value(prompt: str, from_stdin: bool) -> str:
 
 
 def cmd_secret_set(args) -> int:
-    t = secret_target(args.shared, args.first, args.second)
+    t = secret_target(args.shared, args.first, args.second, args.stack)
     value = read_value(f"{t.name} (input hidden): ", args.stdin)
     host_only = args.shared and t.name == paths.load_config().notify_webhook_secret
     if host_only and (msg := notify.webhook_problem(value)):
@@ -818,7 +831,7 @@ def cmd_secret_set(args) -> int:
 
 
 def cmd_secret_rm(args) -> int:
-    t = secret_target(args.shared, args.first, args.second)
+    t = secret_target(args.shared, args.first, args.second, args.stack)
     if not secretstore.delete(t.ref):
         raise CliError(f"{t.name}: not found at {t.ref}")
     print(f"{t.name}: removed ({t.where}, {t.ref})")
@@ -851,6 +864,15 @@ def secret_rows(prof, cfg) -> list[tuple[str, str, str, str, str]]:
 
 def cmd_secret_ls(args) -> int:
     cfg = paths.load_config()
+    if args.stack is not None:
+        if args.shared or args.profile:
+            raise CliError("give one of --shared, --stack, or a profile")
+        if msg := stack.name_problem(args.stack):
+            raise CliError(msg)
+        print(f"{'NAME':<32} {'STATUS':<8} REF")
+        for n, ref in stack.list_items(cfg, args.stack):
+            print(f"{n:<32} {'present':<8} {ref}")
+        return 0
     if args.shared:
         if args.profile:
             raise CliError("give either --shared or a profile, not both")
@@ -880,6 +902,37 @@ def cmd_secret_ls(args) -> int:
     for r in secret_rows(prof, cfg):
         print(f"{r[0]:<32} {r[1]:<8} {r[2]:<10} {r[3]:<24} {r[4]}")
     return 0
+
+
+# ---------------------------------------------------------------- stack secrets
+def load_stack(args) -> stack.Stack:
+    try:
+        return stack.load(args.dir or os.getcwd(), paths.load_config())
+    except stack.StackError as e:
+        raise CliError(str(e)) from None
+
+
+def cmd_stack_ls(args) -> int:
+    st = load_stack(args)
+    try:
+        table = stack.rows(st)
+    except stack.StackError as e:
+        raise CliError(str(e)) from None
+    w = max([len(r[1]) for r in table] + [3])
+    print(f"{'NAME':<32} {'REF':<{w}} STATUS")
+    for n, ref, status in table:
+        print(f"{n:<32} {ref:<{w}} {status}")
+    return 0
+
+
+def cmd_stack_run(args) -> int:
+    if not args.rest:
+        raise CliError("stack run needs a command after `--`: agentbox stack run -- <command...>")
+    st = load_stack(args)
+    try:
+        return stack.run(st, args.rest, err=err)
+    except stack.StackError as e:
+        raise CliError(str(e)) from None
 
 
 # ---------------------------------------------------------------- setup, login
@@ -1538,11 +1591,13 @@ def build_parser() -> argparse.ArgumentParser:
     ssub = p.add_subparsers(dest="secret_command", metavar="<set|ls|rm>")
     ssub.required = True
     for cmd, fn, hlp in (
-        ("set", cmd_secret_set, "store a secret: set [--shared | <profile>] NAME [--stdin]"),
-        ("rm", cmd_secret_rm, "delete a secret: rm [--shared | <profile>] NAME"),
+        ("set", cmd_secret_set,
+         "store a secret: set [--shared | --stack NAME | <profile>] NAME [--stdin]"),
+        ("rm", cmd_secret_rm, "delete a secret: rm [--shared | --stack NAME | <profile>] NAME"),
     ):
         q = ssub.add_parser(cmd, help=hlp)
         q.add_argument("--shared", action="store_true", help="shared scope (agentbox/_shared)")
+        q.add_argument("--stack", metavar="NAME", help="stack scope (agentbox/_stack/NAME)")
         q.add_argument("first", metavar="profile|NAME")
         q.add_argument("second", nargs="?", metavar="NAME")
         if cmd == "set":
@@ -1552,8 +1607,19 @@ def build_parser() -> argparse.ArgumentParser:
         q.set_defaults(func=fn)
     q = ssub.add_parser("ls", help="names, scope, present/missing, targets (never values)")
     q.add_argument("--shared", action="store_true")
+    q.add_argument("--stack", metavar="NAME", help="items present under agentbox/_stack/NAME")
     q.add_argument("profile", nargs="?")
     q.set_defaults(func=cmd_secret_ls)
+
+    p = sub.add_parser("stack", help="secrets for a plain Compose stack: ls / run")
+    ssub = p.add_subparsers(dest="stack_command", metavar="<ls|run>")
+    ssub.required = True
+    q = ssub.add_parser("ls", help="manifest secrets: name, ref, present/missing (never values)")
+    q.add_argument("-C", dest="dir", metavar="DIR", help="stack directory (default: current)")
+    q.set_defaults(func=cmd_stack_ls)
+    q = ssub.add_parser("run", help="run a command with the stack secrets: run [-C DIR] -- cmd...")
+    q.add_argument("-C", dest="dir", metavar="DIR", help="stack directory (default: current)")
+    q.set_defaults(func=cmd_stack_run)
 
     p = sub.add_parser("setup", help="first run: Docker, images, config, Claude token, doctor")
     p.add_argument("--skip-token", action="store_true", help="do not ask for the Claude token")
@@ -1664,8 +1730,8 @@ def main(argv: list[str] | None = None) -> int:
         i = argv.index("--")
         argv, rest = argv[:i], argv[i + 1 :]
     args = build_parser().parse_args(argv)
-    if rest and args.func not in (cmd_shell, cmd_agent):
-        err("`--` arguments are only for shell, claude, codex, pi")
+    if rest and args.func not in (cmd_shell, cmd_agent, cmd_stack_run):
+        err("`--` arguments are only for shell, claude, codex, pi, stack run")
         return 2
     args.rest = rest
     try:

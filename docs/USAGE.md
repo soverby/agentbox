@@ -93,6 +93,9 @@ If a step fails, read [Troubleshooting](#troubleshooting).
 | `agentbox run <profile> --agent A --prompt-file F [--model M] [--timeout T]` | Headless agent run. |
 | `agentbox run <profile> --cmd-file F [--timeout T]` | Headless command job: a shell script, no agent. |
 | `agentbox login <profile> codex\|pi` | Subscription login in the box. |
+| `agentbox secret set\|rm\|ls --stack <name> [NAME]` | Secrets of a plain Compose stack (read [Secrets for a plain Compose stack](#secrets-for-a-plain-compose-stack)). |
+| `agentbox stack ls [-C DIR]` | List the manifest secrets of a stack: name, ref, `present` or `missing`. |
+| `agentbox stack run [-C DIR] -- <command...>` | Run a command with the stack secrets in its environment only. |
 | `agentbox up [profile] [--accept-mount-change]` | Start the box and keep it up. |
 | `agentbox down [profile]` | Stop the box. The home volume stays. |
 | `agentbox down -v [profile]` | Full reset: also remove the home volume and the gateway OAuth volume. You must log in to Codex and Pi again (and `mcp login` again if a provider rotated its refresh token). |
@@ -511,6 +514,87 @@ A missing secret does not stop `up`. The CLI prints a warning with the fix
 command, and the box starts without that secret. A change to secrets
 recreates the target container at the next `up`. If a session uses the box,
 the change waits until the sessions end or you run `agentbox down`.
+
+### Secrets for a plain Compose stack
+
+Other projects on the host can run a plain Docker Compose stack (not a box)
+that needs an API key. The key stays in the macOS Keychain. It is never in
+`.env` or in any file. `agentbox stack` delivers it.
+
+Step 1. Add `agentbox-stack.toml` to the project directory and track it in
+git. It holds names only.
+
+```toml
+[stack]
+name = "finance"                 # Keychain scope agentbox/_stack/finance/<NAME>
+compose_files = ["compose.yaml", "compose.secrets.yaml"]   # optional
+[secrets]
+MASSIVE_API_KEY = {}             # default location
+FRED_API_KEY = { ref = "keychain:fin/FRED_API_KEY" }   # explicit ref
+```
+
+`name` uses `a-z`, `0-9`, and `-` (at most 32 characters). Secret names and
+refs follow the same rules as profile secrets, so reserved names are
+refused. A ref is `keychain:<service>`, `op://<vault>/<item>/<field>` (the
+current `op` session), or `env:<VAR>`. The notification webhook cannot be a
+stack secret. `compose_files` lists relative paths. Each file must exist
+inside the project directory.
+
+Step 2. Store each value.
+
+```sh
+agentbox secret set --stack finance MASSIVE_API_KEY      # hidden prompt
+printf '%s\n' "$VALUE" | agentbox secret set --stack finance MASSIVE_API_KEY --stdin
+agentbox secret ls --stack finance                       # items in the store
+agentbox secret rm --stack finance MASSIVE_API_KEY
+agentbox stack ls                                        # manifest secrets here
+```
+
+`secret ls --stack` shows the items that exist in the store. `stack ls`
+shows the secrets that the manifest names, with `present` or `missing`.
+Neither shows a value.
+
+Step 3. Write the secret wiring as an overlay file of the project, for
+example `compose.secrets.yaml`. Keep it static and keep it out of the base
+file.
+
+```yaml
+secrets:
+  MASSIVE_API_KEY:
+    environment: AGENTBOX_SECRET_MASSIVE_API_KEY
+services:
+  api:
+    secrets: [MASSIVE_API_KEY]
+```
+
+Step 4. Start the stack through `stack run`.
+
+```sh
+agentbox stack run -- docker compose up -d --build
+```
+
+`stack run` reads every manifest secret. If one is missing, it prints the
+names and exits with 2 before the command starts. Otherwise it runs the
+command in the project directory, without a shell, with your environment
+plus `AGENTBOX_SECRET_<NAME>` and `<NAME>` for each manifest secret. When the
+manifest has `compose_files`, it also sets `COMPOSE_FILE` to those paths (it
+replaces a `COMPOSE_FILE` that you already have). The exit code is the
+command's code. A command that is not found exits with 127. On Linux,
+`stack run` fails because the Keychain backend is macOS-only.
+
+Rules:
+
+- Every `docker compose up` of the stack goes through `stack run` (use a
+  Makefile target). Compose copies the value into the container at create
+  time, so a recreate needs the environment again. A restart (`restart:`
+  policy, reboot, `docker compose restart`) keeps it. `ps`, `exec`, `logs`,
+  and `down` need nothing.
+- A plain `docker compose up` with the base file alone still works. It
+  starts the stack without the secret. The application must handle that.
+  The next `stack run` recreates the service with the secret.
+- The application reads `/run/secrets/<NAME>` first, then the environment
+  variable `<NAME>` (host tests, CI). A host command that `stack run` starts
+  reads the plain variable `<NAME>`.
 
 ## Logins
 

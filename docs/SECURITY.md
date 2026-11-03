@@ -240,6 +240,13 @@ Enforced in: `cli/agentbox/compose.py` (services, networks, fixed IPs),
   (`PATH`, `LD_*`, `BASH_ENV`, `NODE_*`, `GIT_*`, TLS CA overrides, proxy
   variables, and others). `with-secrets` and the router and gateway start
   scripts refuse them again when they export.
+- Stack secrets (`agentbox stack`, for a plain Compose stack that is not a
+  box) are host side. `stack run` reads them from the Keychain and puts them
+  only in the environment of the command that you name, with no shell. They
+  are never a file, never in argv, and never in output; errors are scrubbed
+  of the value. The scope `agentbox/_stack/<name>` is separate from every
+  profile and from `_shared`, and the notification webhook is refused. No box
+  and no new network path is involved.
 - Per-box random tokens (router master key, `MCP_GATEWAY_TOKEN`) and the
   HMAC key for the secret-set label are 0600 files in the state directory.
   The tokens rotate at `down`.
@@ -249,7 +256,7 @@ Enforced in: `cli/agentbox/compose.py` (services, networks, fixed IPs),
   `CLAUDE_CODE_OAUTH_TOKEN`, so the subscription token does not reach the
   gate or the router.
 - Enforced in: `cli/agentbox/profile.py` (`_parse_secrets`, reserved
-  names), `cli/agentbox/delivery.py`, `cli/agentbox/secretstore.py`,
+  names), `cli/agentbox/delivery.py`, `cli/agentbox/secretstore.py`, `cli/agentbox/stack.py`,
   `images/agent/with-secrets`, `images/router/entrypoint.sh`,
   `images/mcp-gateway/entrypoint.sh`, `cli/agentbox/launch.py`.
 - Proved by: doctor 11 (only agent-targeted secrets, root-owned files),

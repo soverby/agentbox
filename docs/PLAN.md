@@ -1362,6 +1362,8 @@ the existing Keychain backend, for any directory with a manifest.
   `secret_name_problem` and `ref_ok`; `env:` refs are allowed (tests);
   `op://` refs use the ambient `op` session (no service-account item). A
   manifest with no `[secrets]` is valid and delivers nothing.
+  `compose_files`: a list of one or more relative paths; each must exist
+  under DIR (not above it).
 - Scope `_stack/<name>`: items `agentbox/_stack/<name>/<NAME>`, owned
   (base64 envelope, §2.4). It is distinct from every profile scope and from
   `_shared`; a stack cannot read a profile's or the shared items by default
@@ -1384,23 +1386,33 @@ the existing Keychain backend, for any directory with a manifest.
     host command such as `uv run fin ...`, whose code reads the plain name). The CLI exits with the command's exit code.
     A command that is not found exits 127. The values are never in argv, in
     a file, or in any output; errors are scrubbed (§2.4).
-- The stack's `compose.yaml` is the project's, written by hand, static:
+- The secret wiring is a Compose overlay file of the project, written by
+  hand, static, for example `compose.secrets.yaml`:
 
   ```yaml
   secrets:
     MASSIVE_API_KEY:
       environment: AGENTBOX_SECRET_MASSIVE_API_KEY
   services:
-    worker:
+    api:
       secrets: [MASSIVE_API_KEY]
   ```
 
-  Compose copies the value into the container at create time as
-  `/run/secrets/<NAME>` (root 0444; readable by a non-root service user).
-  A restart (`restart:` policy, reboot) keeps it; only a recreate needs the
-  environment again, so every `docker compose up` of the stack goes through
-  `stack run` (the project's Makefile target). Other compose verbs (`ps`,
-  `exec`, `logs`, `down`) need nothing.
+  The manifest names the files: `[stack] compose_files = ["compose.yaml",
+  "compose.secrets.yaml"]` (optional). `stack run` sets `COMPOSE_FILE` to
+  those paths (joined with the platform path separator, relative to DIR);
+  the manifest wins over an inherited `COMPOSE_FILE`. Why an overlay: with
+  an `environment:` secret source, `docker compose up`, `run` and `create`
+  fail when the variable is unset (Compose 5.5: `environment variable ...
+  required by secret ... is not set`), after the container is created. A
+  plain `docker compose up` with the base file alone therefore still works,
+  without the secret, and the application degrades on its own terms; the
+  Makefile `up` target goes through `stack run`. Compose copies the value
+  into the container at create time as `/run/secrets/<NAME>` (root 0444;
+  readable by a non-root service user). A restart (`restart:` policy,
+  reboot) keeps it. A recreate with the base file alone removes it, and the
+  next `stack run` recreates the service again (config hash). Other compose
+  verbs (`ps`, `exec`, `logs`, `down`) need nothing.
 - The application reads `/run/secrets/<NAME>` first, then the environment
   variable `<NAME>` (host-side tests, CI). That part is the project's.
 - Nothing is written to host disk: no gitignored secret directory, no
@@ -1521,7 +1533,7 @@ rounds, then escalate. Coordinator signs off.
 | P8 | SECURITY.md, USAGE.md (quick start first), security review pass | Independent review finds no BLOCKER; a new user reaches a first Claude session with the quick start alone |
 | p1 | Python line and patch updates (§2.9) | Unit: line filter of the python.org list; `value_problem` for the three keys; probe JSON parsing (`[]` = absent); result classification and post dedupe; partial rollback keeps other `versions.env` lines; update lock and the fire/`up` interlock; the scratch doctor starts its box while the lock is held. Live (marked): the lock check fails a cp-less lock by name offline and passes a current lock; one real `--python-patch` run applies a patch, posts to Slack, and doctor 22 sees the job |
 | p2 | Image pruning (§2.10) | Unit: managed-tag filter; keep rules (current, one previous, derived of both, sidecars, any container); `docker image rm` without `-f` and a refusal is `kept_busy`; disk measurement (`df` output parsing, failure = `null`); prune runs after each apply and on every patch run, not after a `failed` result; the rollback removes only the candidate tag (computed after the build) and the previous hash tag stays; a failed `ps -a` removes nothing; freed = drop in Docker disk used bytes; `prune.json`; record, applied post suffix, fleet report line. Live (marked): `update --prune --dry-run` lists the superseded tags; `update --prune` removes them, keeps every box image, and reports freed space |
-| s1 | Stack secrets (§2.11) | Unit: manifest parse (name rule, secret name and ref validation, reserved names, webhook refusal, empty `[secrets]`); `secret set/rm/ls --stack` use scope `_stack/<name>`; `stack ls` rows; `stack run` exits 2 with the missing names and runs nothing when one is missing, execs with exactly `AGENTBOX_SECRET_<NAME>` and `<NAME>` for the manifest names plus the inherited env, passes the exit code through, 127 when not found; no value in any output (scrub). Live (marked): `agentbox stack run -- docker compose up -d` on a stack with one env-source secret; `/run/secrets/<NAME>` in the container holds the value; `docker inspect` does not; `docker compose restart` keeps it. |
+| s1 | Stack secrets (§2.11) | Unit: manifest parse (name rule, secret name and ref validation, reserved names, webhook refusal, empty `[secrets]`); `secret set/rm/ls --stack` use scope `_stack/<name>`; `stack ls` rows; `stack run` exits 2 with the missing names and runs nothing when one is missing, execs with exactly `AGENTBOX_SECRET_<NAME>` and `<NAME>` for the manifest names plus the inherited env, passes the exit code through, 127 when not found; sets `COMPOSE_FILE` from `compose_files` (joined with `os.pathsep`, paths under DIR) and leaves it alone when the manifest has none; no value in any output (scrub). Live (marked): `agentbox stack run -- docker compose up -d` on a stack with one env-source secret; `/run/secrets/<NAME>` in the container holds the value; `docker inspect` does not; `docker compose restart` keeps it. |
 
 P1 and P2 can build in parallel; P3 needs P1+P2; P4–P6 need P3; P6b needs
 P6; P7 needs P3.

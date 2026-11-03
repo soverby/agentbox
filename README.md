@@ -40,6 +40,9 @@ one command proves it.
   models on Modal, from the same box.
 - **You want MCP tools without handing over the keys.** The agent calls
   tools through a gateway; the tokens stay in the gateway.
+- **You run plain Compose stacks that need API keys.** `agentbox stack run`
+  gives a stack its Keychain secrets at start time, with no `.env` and no
+  secret file on disk.
 
 ## Why use it?
 
@@ -111,6 +114,31 @@ agentbox claude
 
 Read [docs/USAGE.md](docs/USAGE.md) for each step and for all other tasks.
 
+## Commands at a glance
+
+| Command | What it does |
+| --- | --- |
+| `agentbox setup` | First run: Docker check, image build, Claude token, self-test. |
+| `agentbox init <name> --mount <dir> [--open]` | Write a new profile. |
+| `agentbox claude\|codex\|pi [profile] [-- args]` | Interactive agent session in the box. |
+| `agentbox shell [profile] [-- cmd]` | Bash, or one command, in the box. |
+| `agentbox run <profile> --agent A --prompt-file F` | Headless agent run; transcript and exit code recorded. |
+| `agentbox run <profile> --cmd-file F` | Headless command job: a shell script, no agent. |
+| `agentbox up\|down\|ls` | Start, stop, list boxes. `down -v` resets the box home. |
+| `agentbox allow [profile] <domain>` / `denied` | Fix a blocked domain without a restart; see what was blocked. |
+| `agentbox secret set\|rm\|ls [--shared \| profile] NAME` | Box secrets in the Keychain. Never values. |
+| `agentbox secret set\|rm\|ls --stack <name> NAME` | Secrets of a plain Compose stack. |
+| `agentbox stack ls\|run [-C DIR] [-- command]` | List a stack's secrets; run a command with them in its environment only. |
+| `agentbox login <profile> codex\|pi` | Subscription login in the box. |
+| `agentbox mcp login\|status\|logout` | OAuth for MCP servers; tokens stay in the gateway. |
+| `agentbox schedule add\|ls\|rm\|edit\|run-now` | Scheduled headless runs from the host. |
+| `agentbox schedule report [--install]` | Fleet report: what was due, what ran, idle boxes. |
+| `agentbox doctor [profile]` | Full isolation self-test. |
+| `agentbox update [--check\|--python-patch\|--prune]` | Update pins, rebuild, self-test; Python patches; image pruning. |
+
+[CHEATSHEET.pdf](CHEATSHEET.pdf) has these commands with the profile keys
+and file paths on two pages. [docs/USAGE.md](docs/USAGE.md) has every option.
+
 ## Example: a scheduled daily news brief
 
 [examples/news-brief](examples/news-brief/README.md) is a complete project
@@ -149,6 +177,7 @@ allowlist, headless runs, scheduling, and `agentbox doctor`, step by step.
 
 ## Links
 
+- [CHEATSHEET.pdf](CHEATSHEET.pdf): commands, profile keys, and paths on two pages.
 - [docs/USAGE.md](docs/USAGE.md): install, profiles, and all commands.
 - [docs/SECURITY.md](docs/SECURITY.md): threat model and residual risks.
 - [docs/PLAN.md](docs/PLAN.md): design and phase plan.

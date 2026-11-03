@@ -111,7 +111,7 @@ def test_stack_name_accepts_limits(env):
         ("GIT_SSH_COMMAND = {}", "reserved"),
         ('X = "shared"', "must be a table"),
         ('X = { ref = "bogus" }', "must be keychain"),
-        ('X = { ref = 5 }', "must be keychain"),
+        ("X = { ref = 5 }", "must be keychain"),
         ('X = { ref = "env:A", to = "agent" }', "unknown key"),
     ],
 )
@@ -132,8 +132,13 @@ def test_manifest_errors_listed_together(env):
 
 
 def test_manifest_shape_refusals(env):
-    for body in ("", '[secrets]\nX = {}\n', '[stack]\nname = "x"\nextra = 1\n',
-                 '[stack]\nname = "x"\n[other]\n', "not toml ["):
+    for body in (
+        "",
+        "[secrets]\nX = {}\n",
+        '[stack]\nname = "x"\nextra = 1\n',
+        '[stack]\nname = "x"\n[other]\n',
+        "not toml [",
+    ):
         (env / "agentbox-stack.toml").write_text(body)
         with pytest.raises(stack.StackError):
             load(env)
@@ -144,8 +149,13 @@ def test_manifest_shape_refusals(env):
 
 
 def test_webhook_refusal_by_item_key(env):
-    paths.write_config({"secret_backend": "env", "secret_prefix": "agentbox-test-s",
-                        "notify_webhook_secret": "HOOK"})
+    paths.write_config(
+        {
+            "secret_backend": "env",
+            "secret_prefix": "agentbox-test-s",
+            "notify_webhook_secret": "HOOK",
+        }
+    )
     hook = secretstore.default_ref(paths.load_config(), "_shared", "HOOK")
     (env / "agentbox-stack.toml").write_text(
         f'[stack]\nname = "x"\n[secrets]\nSNEAKY = {{ ref = "{hook}" }}\nOK = {{}}\n'
@@ -158,8 +168,9 @@ def test_webhook_refusal_by_item_key(env):
 
 
 def test_webhook_refusal_keychain_forms(env):
-    paths.write_config({"secret_backend": "keychain", "secret_prefix": "agentbox",
-                        "notify_webhook_secret": "HOOK"})
+    paths.write_config(
+        {"secret_backend": "keychain", "secret_prefix": "agentbox", "notify_webhook_secret": "HOOK"}
+    )
     (env / "agentbox-stack.toml").write_text(
         '[stack]\nname = "x"\n[secrets]\nA = { ref = "keychain:agentbox/_shared/HOOK" }\n'
     )
@@ -184,9 +195,9 @@ def test_compose_files(env):
         ('["missing.yaml"]', "no such file"),
         ('["../outside.yaml"]', "not above"),
         ('["/etc/hosts"]', "relative"),
-        ('[]', "one or more"),
+        ("[]", "one or more"),
         ('"compose.yaml"', "one or more"),
-        ('[1]', "one or more"),
+        ("[1]", "one or more"),
         ('["sub/../../outside.yaml"]', "not above"),
         ('["."]', "no such file"),
     ],
@@ -205,9 +216,7 @@ def test_compose_files_symlink_escape(env):
     d.mkdir()
     (env / "outside.yaml").write_text("x: 1\n")
     (d / "link.yaml").symlink_to(env / "outside.yaml")
-    (d / "agentbox-stack.toml").write_text(
-        '[stack]\nname = "x"\ncompose_files = ["link.yaml"]\n'
-    )
+    (d / "agentbox-stack.toml").write_text('[stack]\nname = "x"\ncompose_files = ["link.yaml"]\n')
     with pytest.raises(stack.StackError, match="not above"):
         load(d)
 
@@ -269,8 +278,9 @@ def test_keychain_ls_parses_dump(env, monkeypatch, capsys):
         '    "acct"<blob>="agentbox"\n    "svce"<blob>="agentbox/_stack/finance/A_KEY"\n'
     )
     monkeypatch.setattr(secretstore, "keychain_available", lambda: True)
-    monkeypatch.setattr(stack.subprocess, "run",
-                        lambda a, **k: subprocess.CompletedProcess(a, 0, dump, ""))
+    monkeypatch.setattr(
+        stack.subprocess, "run", lambda a, **k: subprocess.CompletedProcess(a, 0, dump, "")
+    )
     assert cli.main(["secret", "ls", "--stack", "finance"]) == 0
     names = [ln.split()[0] for ln in capsys.readouterr().out.splitlines()[1:]]
     assert names == ["A_KEY", "B_KEY"]
@@ -340,8 +350,12 @@ def test_run_execs_with_env(sdir, env, execs, monkeypatch):
         assert e["KEEP_ME"] == "inherited"
         assert "COMPOSE_FILE" not in e
         extra = set(e) - set(os.environ)
-        assert extra == {"AGENTBOX_SECRET_MASSIVE_API_KEY", "MASSIVE_API_KEY",
-                         "AGENTBOX_SECRET_FRED_API_KEY", "FRED_API_KEY"}
+        assert extra == {
+            "AGENTBOX_SECRET_MASSIVE_API_KEY",
+            "MASSIVE_API_KEY",
+            "AGENTBOX_SECRET_FRED_API_KEY",
+            "FRED_API_KEY",
+        }
         assert all(V1 not in a and V2 not in a for a in c["argv"])
     finally:
         os.chdir(cwd0)
@@ -429,18 +443,26 @@ def test_run_keychain_only_on_mac(sdir, env, execs, monkeypatch, capsys):
 
 # Real subprocess: exit code passthrough, 127, no value in output.
 def agentbox(env_dir, args, **extra):
-    e = {**os.environ, "PYTHONPATH": CLI_DIR, "AGENTBOX_CONFIG_HOME": str(env_dir / "cfg"),
-         "AGENTBOX_STATE_HOME": str(env_dir / "state"),
-         secretstore.ENV_STORE: str(env_dir / "store.json"), **extra}
-    return subprocess.run([sys.executable, "-m", "agentbox.cli", *args], env=e,
-                          capture_output=True, text=True)
+    e = {
+        **os.environ,
+        "PYTHONPATH": CLI_DIR,
+        "AGENTBOX_CONFIG_HOME": str(env_dir / "cfg"),
+        "AGENTBOX_STATE_HOME": str(env_dir / "state"),
+        secretstore.ENV_STORE: str(env_dir / "store.json"),
+        **extra,
+    }
+    return subprocess.run(
+        [sys.executable, "-m", "agentbox.cli", *args], env=e, capture_output=True, text=True
+    )
 
 
 def test_real_exit_code_127_and_env(sdir, env):
     fill(env)
-    code = ("import os,sys;"
-            "sys.stdout.write(str(os.environ['MASSIVE_API_KEY']==os.environ"
-            "['AGENTBOX_SECRET_MASSIVE_API_KEY']) + ' ' + os.getcwd());sys.exit(7)")
+    code = (
+        "import os,sys;"
+        "sys.stdout.write(str(os.environ['MASSIVE_API_KEY']==os.environ"
+        "['AGENTBOX_SECRET_MASSIVE_API_KEY']) + ' ' + os.getcwd());sys.exit(7)"
+    )
     r = agentbox(env, ["stack", "run", "-C", str(sdir), "--", sys.executable, "-c", code])
     assert r.returncode == 7
     assert r.stdout == f"True {sdir.resolve()}"

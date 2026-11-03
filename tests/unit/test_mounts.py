@@ -203,7 +203,6 @@ def test_host_code_paths_refused_rw_only(home):
 
 
 def test_default_code_paths_include_interpreter(monkeypatch, tmp_path):
-
     from agentbox import profile
 
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))

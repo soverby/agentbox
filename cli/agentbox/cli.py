@@ -768,9 +768,7 @@ def secret_target(
             raise CliError(msg)
         if msg := secret_name_problem(first):
             raise CliError(msg)
-        return SecretTarget(
-            first, stack.default_ref(cfg, stack_name, first), f"stack {stack_name}"
-        )
+        return SecretTarget(first, stack.default_ref(cfg, stack_name, first), f"stack {stack_name}")
     if shared:
         if second is not None:
             raise CliError("give either --shared or a profile, not both")
@@ -1591,8 +1589,11 @@ def build_parser() -> argparse.ArgumentParser:
     ssub = p.add_subparsers(dest="secret_command", metavar="<set|ls|rm>")
     ssub.required = True
     for cmd, fn, hlp in (
-        ("set", cmd_secret_set,
-         "store a secret: set [--shared | --stack NAME | <profile>] NAME [--stdin]"),
+        (
+            "set",
+            cmd_secret_set,
+            "store a secret: set [--shared | --stack NAME | <profile>] NAME [--stdin]",
+        ),
         ("rm", cmd_secret_rm, "delete a secret: rm [--shared | --stack NAME | <profile>] NAME"),
     ):
         q = ssub.add_parser(cmd, help=hlp)

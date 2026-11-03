@@ -298,6 +298,8 @@ in that directory.
 | `agentbox update --python-patch [--install [--at HH:MM] \| --uninstall]` | Python patch update only, for the daily host job (§2.9). |
 | `agentbox update --python-line X.Y` | Move Python to another line, with the lock check (§2.9). |
 | `agentbox update --prune [--dry-run]` | Remove superseded agentbox images and old build cache (§2.10). Every update also does this. |
+| `agentbox secret set/rm --stack <name> <NAME>` | Secrets of a plain Compose stack, scope `_stack/<name>` (§2.11). |
+| `agentbox stack ls/run [-C DIR] [-- command]` | List the manifest secrets of a stack; run a command (for example `docker compose up -d`) with them in its environment only (§2.11). |
 | `agentbox doctor [profile]` | Full isolation self-test (§4). |
 
 Agent launch flags set by the CLI (the box is the external sandbox):
@@ -1334,13 +1336,89 @@ build cache filled it (64 GB) and another stack's Postgres did not start
   until the next run (one agent and derived generation is about 2.4 GB).
   At the 2026-10 rate (23 GB in 35 days) one run a day is enough.
 
+### 2.11 Stack secrets (Keychain secrets for plain Compose stacks)
+
+Other projects on the host run plain Docker Compose stacks (not boxes) that
+need API keys. The owner's rule: the key stays in the macOS Keychain, never
+in `.env` or any file. First user: the finance stack and its Massive
+(Polygon) market-data key (containerized-010, finance-030). The box
+`[secrets]` mechanism does not apply (it is bound to the box Compose project
+and its networks), but its delivery path does: Compose `secrets:` with an
+`environment:` source, the value present only in the environment of the
+`docker compose` process (§2.4). So `agentbox stack` is that delivery, with
+the existing Keychain backend, for any directory with a manifest.
+
+- Manifest: `<dir>/agentbox-stack.toml`, tracked in git, names only.
+
+  ```toml
+  [stack]
+  name = "finance"                 # scope: Keychain agentbox/_stack/finance/<NAME>
+  [secrets]
+  MASSIVE_API_KEY = {}             # default ref
+  FRED_API_KEY = { ref = "keychain:fin/FRED_API_KEY" }   # explicit ref, raw item
+  ```
+
+  `name`: `[a-z0-9][a-z0-9-]{0,31}`. Secret names and refs follow §2.4:
+  `secret_name_problem` and `ref_ok`; `env:` refs are allowed (tests);
+  `op://` refs use the ambient `op` session (no service-account item). A
+  manifest with no `[secrets]` is valid and delivers nothing.
+- Scope `_stack/<name>`: items `agentbox/_stack/<name>/<NAME>`, owned
+  (base64 envelope, §2.4). It is distinct from every profile scope and from
+  `_shared`; a stack cannot read a profile's or the shared items by default
+  ref. The reserved-name list of §2.4 applies to the manifest, and
+  `notify_webhook_secret` is refused by the same `collect` rule (compared by
+  item key).
+- Commands (§2.3 table):
+  - `agentbox secret set|rm --stack <name> <NAME> [--stdin]`: the stack
+    scope for the existing secret commands. `secret ls --stack <name>`
+    lists the names of every manifest that names that stack is not possible
+    (manifests live in project dirs), so `secret ls --stack` lists only the
+    items present in the store under that scope.
+  - `agentbox stack ls [-C DIR]`: one row per manifest secret: name, ref,
+    `present` or `missing`. No values.
+  - `agentbox stack run [-C DIR] -- <command...>`: fetch every manifest
+    secret; if any is missing or unreadable, print the missing names and
+    exit 2 before the command starts. Otherwise exec the command (no shell)
+    in DIR with the inherited environment plus `AGENTBOX_SECRET_<NAME>` for
+    exactly the manifest names. The CLI exits with the command's exit code.
+    A command that is not found exits 127. The values are never in argv, in
+    a file, or in any output; errors are scrubbed (§2.4).
+- The stack's `compose.yaml` is the project's, written by hand, static:
+
+  ```yaml
+  secrets:
+    MASSIVE_API_KEY:
+      environment: AGENTBOX_SECRET_MASSIVE_API_KEY
+  services:
+    worker:
+      secrets: [MASSIVE_API_KEY]
+  ```
+
+  Compose copies the value into the container at create time as
+  `/run/secrets/<NAME>` (root 0444; readable by a non-root service user).
+  A restart (`restart:` policy, reboot) keeps it; only a recreate needs the
+  environment again, so every `docker compose up` of the stack goes through
+  `stack run` (the project's Makefile target). Other compose verbs (`ps`,
+  `exec`, `logs`, `down`) need nothing.
+- The application reads `/run/secrets/<NAME>` first, then the environment
+  variable `<NAME>` (host-side tests, CI). That part is the project's.
+- Nothing is written to host disk: no gitignored secret directory, no
+  backup exclusion, no cleanup on failure.
+- Not in scope: a generated compose file, per-service targeting (the
+  project's compose file lists which services get which secret), `.env`
+  migration of a project's other variables, Linux (the Keychain backend is
+  macOS-only and `stack run` says so).
+- Isolation: none for boxes. Host-side only; no new network path; the
+  secret values go only to the processes the owner names on the command
+  line.
+
 ## 3. Repository layout
 
 ```text
 cli/agentbox/          host CLI (stdlib), pyproject.toml
                        fleet.py (§2.8 report facts), report_outputs.py (§2.8 outputs)
                        firehook.py (§2.7 fire hook), pyupdate.py and updatelock.py (§2.9)
-                       prune.py (§2.10 image pruning)
+                       prune.py (§2.10 image pruning), stack.py (§2.11 stack secrets)
 images/agent/          Dockerfile, entrypoint, with-secrets, managed-mcp.json, versions.env
 images/egress/         squid.conf template
 images/mcp-gateway/    gateway service, entrypoint
@@ -1442,6 +1520,7 @@ rounds, then escalate. Coordinator signs off.
 | P8 | SECURITY.md, USAGE.md (quick start first), security review pass | Independent review finds no BLOCKER; a new user reaches a first Claude session with the quick start alone |
 | p1 | Python line and patch updates (§2.9) | Unit: line filter of the python.org list; `value_problem` for the three keys; probe JSON parsing (`[]` = absent); result classification and post dedupe; partial rollback keeps other `versions.env` lines; update lock and the fire/`up` interlock; the scratch doctor starts its box while the lock is held. Live (marked): the lock check fails a cp-less lock by name offline and passes a current lock; one real `--python-patch` run applies a patch, posts to Slack, and doctor 22 sees the job |
 | p2 | Image pruning (§2.10) | Unit: managed-tag filter; keep rules (current, one previous, derived of both, sidecars, any container); `docker image rm` without `-f` and a refusal is `kept_busy`; disk measurement (`df` output parsing, failure = `null`); prune runs after each apply and on every patch run, not after a `failed` result; the rollback removes only the candidate tag (computed after the build) and the previous hash tag stays; a failed `ps -a` removes nothing; freed = drop in Docker disk used bytes; `prune.json`; record, applied post suffix, fleet report line. Live (marked): `update --prune --dry-run` lists the superseded tags; `update --prune` removes them, keeps every box image, and reports freed space |
+| s1 | Stack secrets (§2.11) | Unit: manifest parse (name rule, secret name and ref validation, reserved names, webhook refusal, empty `[secrets]`); `secret set/rm/ls --stack` use scope `_stack/<name>`; `stack ls` rows; `stack run` exits 2 with the missing names and runs nothing when one is missing, execs with exactly `AGENTBOX_SECRET_<NAME>` for the manifest names plus the inherited env, passes the exit code through, 127 when not found; no value in any output (scrub). Live (marked): `agentbox stack run -- docker compose up -d` on a stack with one env-source secret; `/run/secrets/<NAME>` in the container holds the value; `docker inspect` does not; `docker compose restart` keeps it. |
 
 P1 and P2 can build in parallel; P3 needs P1+P2; P4–P6 need P3; P6b needs
 P6; P7 needs P3.
@@ -1518,6 +1597,7 @@ P6; P7 needs P3.
 - f1: fleet report (`schedule report`, §2.8): due fires from the live schedules, rule causes, idle boxes, job copy drift, output plugins, optional investigator box. §2.7: `trigger` in fire rows, `source` in `job.json`. Host-side and read-only; the investigator is a normal box with one empty ro folder (user-made, outside the denylist) and the anthropic preset only; doctor 22 checks it.
 - h1: fire hook (`fire_command`, §2.7): a host command gets each fire's outcome as JSON on stdin, for external triage. Host-side, owner-configured, no box change, no new network path; agentbox adds no secret to the payload (`detail` and `message` are unscrubbed box output, §2.7).
 - p1: Python line and patch updates (§2.9, §2.1, §2.3): `PYTHON_LINE`, daily `update --python-patch` host job with Slack posts, uv coupling, `--python-line` with an offline lock check. After the 1.1.1 regression (3.15). Host-side; no box isolation change.
+- s1: stack secrets (§2.11, §2.3): `agentbox stack ls|run` and `secret --stack`: Keychain secrets for plain Compose stacks on the host, delivered through Compose `environment:` secrets, never a file. For containerized-010 (finance-030). Host-side; no box isolation change.
 - p2: image pruning (§2.10, §2.3, §2.8, §2.9): every update and the daily patch job remove superseded agentbox images (keep current and one previous, and any image a container uses) and build cache unused for 24 h; `update --prune`; freed space in the record, the applied post and the fleet report. After the 2026-10-28 full Docker disk (containerized-006). Host-side; no box isolation change.
 
 ## 9. Usability balance (architect, post-review)
